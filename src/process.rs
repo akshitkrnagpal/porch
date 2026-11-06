@@ -510,18 +510,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovers_python_http_listener_for_state_user() {
+    async fn discovers_python_tcp_listener_for_state_user() {
         let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = reserve.local_addr().unwrap().port();
         drop(reserve);
         let mut command = Command::new("python3");
         command
             .args([
-                "-m",
-                "http.server",
+                "-c",
+                "import socket,sys,time; s=socket.socket(); s.bind(('127.0.0.1',int(sys.argv[1]))); s.listen(); time.sleep(60)",
                 &port.to_string(),
-                "--bind",
-                "127.0.0.1",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -548,7 +546,7 @@ mod tests {
             drop(guard);
             let output = child.wait_with_output().await.unwrap();
             panic!(
-                "Python HTTP server failed to bind: {ready:?}; stderr: {}",
+                "Python TCP listener failed to bind: {ready:?}; stderr: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
