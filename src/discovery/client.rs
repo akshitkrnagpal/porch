@@ -546,6 +546,7 @@ fn browse_lan(mut cache: CandidateCache) -> Result<CandidateCache> {
                         endpoint,
                         source: Source::Lan,
                         last_seen: now(),
+                        node: None,
                     })
                     .collect();
                 cache.insert(info.get_fullname().into(), candidates);
@@ -586,6 +587,12 @@ pub fn tailscale_candidates(bytes: &[u8], timestamp: u64) -> Result<Vec<Candidat
             {
                 continue;
             }
+            let node = p
+                .get("ID")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty() && id.len() <= 128)
+                .unwrap_or(key.as_str())
+                .to_owned();
             let name = p
                 .get("HostName")
                 .and_then(|v| v.as_str())
@@ -616,6 +623,7 @@ pub fn tailscale_candidates(bytes: &[u8], timestamp: u64) -> Result<Vec<Candidat
                                 endpoint,
                                 source: Source::Tailscale,
                                 last_seen: timestamp,
+                                node: Some(node.clone()),
                             });
                         }
                     }
@@ -825,6 +833,7 @@ pub async fn snapshot(refresh: bool) -> Result<Snapshot> {
             Ok(())
         })?;
     }
+    let candidates = unpaired_candidates(candidates, &results);
     Ok(Snapshot {
         version: PROTOCOL_VERSION,
         local,
@@ -832,6 +841,39 @@ pub async fn snapshot(refresh: bool) -> Result<Snapshot> {
         candidates,
         warnings,
     })
+}
+fn endpoint_ip(endpoint: &str) -> Option<IpAddr> {
+    match Url::parse(endpoint).ok()?.host()? {
+        url::Host::Ipv4(ip) => Some(ip.into()),
+        url::Host::Ipv6(ip) => Some(ip.into()),
+        url::Host::Domain(_) => None,
+    }
+}
+/// "Discovered machines" lists only machines that still need pairing. A paired
+/// machine is recognised by its authenticated id (mDNS) or by its address. A
+/// Tailscale hint guesses the default port, so match on the IP alone: a peer
+/// paired on another port must not reappear as a second, unpaired machine.
+/// Every address of a matched Tailscale node is hidden with it.
+pub(super) fn unpaired_candidates(
+    candidates: Vec<Candidate>,
+    peers: &[PeerCatalog],
+) -> Vec<Candidate> {
+    let paired = |c: &Candidate| {
+        let ip = endpoint_ip(&c.endpoint);
+        peers.iter().any(|p| {
+            c.machine_id.as_ref() == Some(&p.machine.id)
+                || (ip.is_some() && endpoint_ip(&p.endpoint) == ip)
+        })
+    };
+    let paired_nodes: Vec<String> = candidates
+        .iter()
+        .filter(|c| paired(c))
+        .filter_map(|c| c.node.clone())
+        .collect();
+    candidates
+        .into_iter()
+        .filter(|c| !paired(c) && !c.node.as_ref().is_some_and(|n| paired_nodes.contains(n)))
+        .collect()
 }
 
 #[derive(Clone)]

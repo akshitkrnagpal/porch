@@ -58,6 +58,10 @@ pub struct Candidate {
     pub endpoint: String,
     pub source: Source,
     pub last_seen: u64,
+    /// Tailscale node that reported this address, so every address of one node
+    /// can be hidden together once that machine is paired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Peer {

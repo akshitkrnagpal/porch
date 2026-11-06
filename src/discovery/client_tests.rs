@@ -131,6 +131,7 @@ fn tailscale_adapter_filters_offline_self_unroutable_and_backend() {
         .iter()
         .all(|c| c.name == "Linux" && c.last_seen == 42 && c.source == Source::Tailscale));
     assert_eq!(all[0].endpoint, "https://100.92.2.3:7463/");
+    assert!(all.iter().all(|c| c.node.as_deref() == Some("other")));
     assert!(
         tailscale_candidates(br#"{"BackendState":"Stopped","Peer":{}}"#, 42)
             .unwrap()
@@ -146,6 +147,7 @@ fn goodbye_and_stale_expiry_remove_candidates_without_retaining_apps() {
         endpoint: "https://192.168.0.3:7463/".into(),
         source: Source::Lan,
         last_seen: 100,
+        node: None,
     };
     let mut cache = CandidateCache::default();
     cache.insert("b._porch._tcp.local.".into(), vec![c.clone()]);
@@ -227,6 +229,7 @@ async fn authenticated_lan_and_tailnet_hints_collapse_to_one_machine_catalog() {
             endpoint: peer.endpoint.clone(),
             source: Source::Lan,
             last_seen: now(),
+            node: None,
         },
         Candidate {
             machine_id: None,
@@ -234,6 +237,7 @@ async fn authenticated_lan_and_tailnet_hints_collapse_to_one_machine_catalog() {
             endpoint: peer.endpoint.clone(),
             source: Source::Tailscale,
             last_seen: now(),
+            node: Some("node-b".into()),
         },
     ];
     let result = query_peer(peer, &candidates).await;
@@ -571,4 +575,71 @@ fn slugs_are_readable_unique_and_stable() {
     assign_slugs(&mut rest);
     assert_eq!(rest[0].slug, "mac-mini-2");
     assert_eq!(rest[1].slug, "mac-mini");
+}
+#[test]
+fn paired_machines_are_not_listed_again_as_discovered() {
+    let peer = |id: &str, endpoint: &str| PeerCatalog {
+        machine: Machine {
+            id: id.into(),
+            name: id.into(),
+        },
+        slug: id.into(),
+        endpoint: endpoint.into(),
+        sources: vec![Source::Explicit],
+        last_seen: 0,
+        catalog: None,
+        error: None,
+    };
+    let candidate =
+        |id: Option<&str>, endpoint: &str, source: Source, node: Option<&str>| Candidate {
+            machine_id: id.map(Into::into),
+            name: "hint".into(),
+            endpoint: endpoint.into(),
+            source,
+            last_seen: 0,
+            node: node.map(Into::into),
+        };
+    // Paired on a custom port via its tailnet IPv4; Tailscale hints guess 7463
+    // on both of that node's addresses.
+    let peers = vec![peer("mini", "https://100.101.77.128:1356/")];
+    let all = vec![
+        candidate(
+            None,
+            "https://100.101.77.128:7463/",
+            Source::Tailscale,
+            Some("n1"),
+        ),
+        candidate(
+            None,
+            "https://[fd7a:115c:a1e0::eb34:4d80]:7463/",
+            Source::Tailscale,
+            Some("n1"),
+        ),
+        candidate(
+            Some("mini"),
+            "https://192.168.1.165:1356/",
+            Source::Lan,
+            None,
+        ),
+        candidate(
+            None,
+            "https://100.92.2.3:7463/",
+            Source::Tailscale,
+            Some("n2"),
+        ),
+        candidate(
+            Some("other"),
+            "https://192.168.1.20:7463/",
+            Source::Lan,
+            None,
+        ),
+    ];
+    let left: Vec<_> = unpaired_candidates(all, &peers)
+        .into_iter()
+        .map(|c| c.endpoint)
+        .collect();
+    assert_eq!(
+        left,
+        ["https://100.92.2.3:7463/", "https://192.168.1.20:7463/"]
+    );
 }

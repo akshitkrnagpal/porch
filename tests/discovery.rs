@@ -614,3 +614,138 @@ async fn five_wrong_codes_close_pairing_for_everyone() {
         t.abort();
     }
 }
+/// A fake launchctl that actually runs the generated LaunchAgent, so the test
+/// proves the plist starts a working agent, not just that a file was written.
+#[cfg(unix)]
+fn fake_launchctl(bin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = r#"#!/usr/bin/env python3
+import os, plistlib, signal, subprocess, sys
+log = os.environ["FAKE_LAUNCHCTL_LOG"]
+pidfile = log + ".pid"
+with open(log, "a") as f:
+    f.write(" ".join(sys.argv[1:]) + "\n")
+a = sys.argv[1:]
+if a[0] == "bootstrap":
+    with open(a[2], "rb") as f:
+        job = plistlib.load(f)
+    env = dict(os.environ, **job.get("EnvironmentVariables", {}))
+    out = open(job["StandardErrorPath"], "a")
+    p = subprocess.Popen(job["ProgramArguments"], env=env, stdin=subprocess.DEVNULL,
+                         stdout=out, stderr=out, start_new_session=True)
+    open(pidfile, "w").write(str(p.pid))
+elif a[0] == "bootout":
+    try:
+        os.kill(int(open(pidfile).read()), signal.SIGTERM)
+        os.remove(pidfile)
+    except (FileNotFoundError, ProcessLookupError, ValueError):
+        sys.exit(3)
+"#;
+    std::fs::create_dir_all(bin).unwrap();
+    let path = bin.join("launchctl");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn autostart_hands_sharing_to_a_login_agent_and_disable_keeps_it_running() {
+    let root = std::env::temp_dir().join(format!("porch-autostart-{}", std::process::id()));
+    let node = root.join("node");
+    let bin = root.join("bin");
+    let plist = root.join("LaunchAgents/dev.porch.discovery.plist");
+    let _cleanup = Nodes(vec![node.clone()]);
+    fake_launchctl(&bin);
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_porch"))
+            .args(args)
+            .env("PORCH_STATE_DIR", &node)
+            .env("PORCH_SYNC_HOSTS", "0")
+            .env("PORCH_SERVICE_PLATFORM", "macos")
+            .env("PORCH_DISCOVERY_AUTOSTART_FILE", &plist)
+            .env("FAKE_LAUNCHCTL_LOG", root.join("launchctl.log"))
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr),
+        )
+    };
+    let pid = || std::fs::read_to_string(node.join("discovery.ready")).unwrap_or_default();
+
+    // Sharing must be on first; nothing is written otherwise.
+    let (ok, out) = run(&["discovery", "autostart", "enable"]);
+    assert!(!ok && out.contains("sharing is off"), "{out}");
+    assert!(!plist.exists());
+
+    let port = free_port().to_string();
+    let (ok, out) = run(&[
+        "discovery",
+        "enable",
+        "--bind",
+        "127.0.0.1",
+        "--port",
+        &port,
+        "--no-advertise",
+    ]);
+    assert!(ok, "{out}");
+    let manual = pid();
+    assert!(!manual.is_empty());
+    assert!(run(&["discovery", "status"])
+        .1
+        .contains("Start at login: off"));
+
+    // Enable: the hand-started agent is replaced by the launchd-run one.
+    let (ok, out) = run(&["discovery", "autostart", "enable"]);
+    assert!(ok && out.contains("now starts at login"), "{out}");
+    let body = std::fs::read_to_string(&plist).unwrap();
+    assert!(body.contains("<string>serve</string><string>--autostart</string>"));
+    let supervised = pid();
+    assert!(!supervised.is_empty() && supervised != manual);
+    let (_, status) = run(&["discovery", "status"]);
+    assert!(
+        status.contains("running") && status.contains("Start at login: on"),
+        "{status}"
+    );
+    assert_eq!(
+        run(&["discovery", "autostart", "status"]).1.trim(),
+        "enabled"
+    );
+
+    // A second login-time start while the agent runs exits cleanly (no fail loop).
+    let (ok, out) = run(&["discovery", "serve", "--autostart"]);
+    assert!(ok && out.contains("already running"), "{out}");
+
+    // Another state directory neither sees nor removes this startup file.
+    let other = root.join("other");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_porch"))
+        .args(["discovery", "disable"])
+        .env("PORCH_STATE_DIR", &other)
+        .env("PORCH_SERVICE_PLATFORM", "macos")
+        .env("PORCH_DISCOVERY_AUTOSTART_FILE", &plist)
+        .env("FAKE_LAUNCHCTL_LOG", root.join("launchctl.log"))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(plist.exists());
+
+    // Disable login startup: the file goes, sharing stays on with a new agent.
+    let (ok, out) = run(&["discovery", "autostart", "disable"]);
+    assert!(ok && out.contains("Sharing is unchanged"), "{out}");
+    assert!(!plist.exists());
+    let after = pid();
+    assert!(!after.is_empty() && after != supervised);
+    assert!(run(&["discovery", "status"]).1.contains("running"));
+
+    // Turning sharing off also removes login startup.
+    assert!(run(&["discovery", "autostart", "enable"]).0);
+    assert!(plist.exists());
+    assert!(run(&["discovery", "disable"]).0);
+    assert!(!plist.exists());
+    let (ok, out) = run(&["discovery", "serve", "--autostart"]);
+    assert!(ok && out.contains("disabled"), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
+}

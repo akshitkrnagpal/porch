@@ -91,9 +91,12 @@ porch discovery revoke      # invalidate every client credential and outstanding
 porch peers remove ID       # forget trust locally only
 porch discovery disconnect  # stop path-app relays, leaving apps/proxy running
 porch discovery disable     # stop sharing; apps/proxy keep running
+porch discovery autostart enable|disable|status  # keep sharing across restarts
 ```
 
-Disable keeps the machine identity, certificate and pairings, so re-enabling does not silently change trust. Revoke rejects later requests and new WebSocket handshakes. Already-started streams can continue until they close. Disable the agent to terminate active transports as well, and Revoke before re-enabling if access must stay revoked. The discovery agent is a separate user process; it is not automatically re-enabled at login (run `porch pair` or `porch discovery enable` again after a reboot). Changing network interfaces requires reconfiguring the bound address.
+Disable keeps the machine identity, certificate and pairings, so re-enabling does not silently change trust. Revoke rejects later requests and new WebSocket handshakes. Already-started streams can continue until they close. Disable the agent to terminate active transports as well, and Revoke before re-enabling if access must stay revoked. The discovery agent is a separate user process. By default it stops at logout or reboot. `porch discovery autostart enable` keeps sharing on across restarts: it installs a per-user LaunchAgent (`~/Library/LaunchAgents/dev.porch.discovery.plist`) on macOS or a systemd user unit (`~/.config/systemd/user/porch-discovery.service`) on Linux, with no sudo, and hands the running agent to it. If the bound address is not up yet at login (a Tailscale IP, for example), launchd or systemd retries every 30 seconds. It requires sharing to be on, and `porch discovery disable` removes it. `autostart disable` removes only login startup and leaves sharing running. `porch setup` turns it on when you choose both start at login and sharing. Changing network interfaces requires reconfiguring the bound address.
+
+`porch peers` lists paired machines once. A machine you are already paired with is not repeated under "Discovered machines", even when Tailscale reports it at the default port and you paired on another port or address of the same node.
 
 ## Wire protocol and evidence
 
