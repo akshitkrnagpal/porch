@@ -194,6 +194,8 @@ enum Commands {
     Doctor,
     Trust,
     Workspace,
+    /// Update porch to the latest release (or run `brew upgrade` for Homebrew installs).
+    SelfUpdate(crate::update::SelfUpdateArgs),
     #[command(external_subcommand)]
     Named(Vec<String>),
 }
@@ -273,6 +275,7 @@ pub async fn run() -> Result<i32> {
             return launch_extra(options, vec![], extra).await;
         }
         Some(Commands::Run(a)) => return launch(merge(options, a.options), a.command).await,
+        Some(Commands::SelfUpdate(a)) => return crate::update::run(a).await,
         Some(Commands::Named(mut args)) => {
             let name = args.remove(0);
             let a = App::parse_from(std::iter::once("porch".into()).chain(args));

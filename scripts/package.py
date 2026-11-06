@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build private CLI + native tray archives; never publish or install."""
+"""Build CLI + native tray release archives; never publish or install."""
 import argparse
 from pathlib import Path
 import plistlib
@@ -52,7 +52,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binaries', type=Path, default=ROOT / 'target/release')
     parser.add_argument('--output', type=Path, default=ROOT / 'dist')
-    parser.add_argument('--target', required=True, choices=['aarch64-apple-darwin', 'x86_64-unknown-linux-gnu'])
+    parser.add_argument('--target', required=True, choices=['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-unknown-linux-gnu'])
     args = parser.parse_args()
     version = next(line.split('"')[1] for line in (ROOT / 'Cargo.toml').read_text().splitlines() if line.startswith('version ='))
     for name in ['porch', 'porch-tray']:

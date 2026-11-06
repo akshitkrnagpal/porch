@@ -1,9 +1,11 @@
 # Porch CLI and native menu
 
 The archive contains `porch`, `porch-tray`, `porch-login`, and `install.py`. The
-macOS ARM64 archive also includes `Porch.app`. Linux x86_64 uses a GTK 3 /
-AppIndicator tray. Windows is deferred. Artifacts are private GitHub Actions
-artifacts, not signed/notarized public releases.
+macOS archives (`aarch64-apple-darwin`, `x86_64-apple-darwin`) also include
+`Porch.app`. Linux x86_64 uses a GTK 3 / AppIndicator tray. Windows is deferred.
+Archives are attached to tagged GitHub Releases with a `SHA256SUMS` file; they
+are not signed or notarized. `homebrew/porch.rb` is the Homebrew formula
+template rendered by `scripts/render_formula.py` for each release.
 
 For LAN/Tailscale enrollment, security, and the wire protocol, see the
 [two-machine guide](docs/discovery.md) included in the archive (or
@@ -15,11 +17,15 @@ Extract the archive, enter its directory, then run:
 
 ```sh
 python3 install.py
+# Or, without extracting first:
+python3 install.py --archive porch-VERSION-TARGET.tar.gz
 ```
 
 This installs binaries in `~/.local/bin`, using a temporary file, fsync, and
 rename rather than truncating a running executable. On macOS it also installs
-`~/Applications/Porch.app`. Add `~/.local/bin` to PATH if needed. Existing apps,
+`~/Applications/Porch.app`. If `~/.local/bin` is not on PATH, the installer
+prints the exact `export PATH=...` line to add. Later updates: `porch
+self-update`. Existing apps,
 proxy sessions, discovery sharing, trust stores, hosts files, and login startup
 are unchanged. `--cli-only` installs just the headless CLI; `--prefix PATH` and
 `--app-dir PATH` select user-controlled destinations.
@@ -97,13 +103,14 @@ environment or by launching the tray manually.
 cargo build --release --bin porch
 cargo build --release --features tray --bin porch-tray
 python3 scripts/package.py --target aarch64-apple-darwin
-# On Linux: --target x86_64-unknown-linux-gnu
+# Intel Mac: --target x86_64-apple-darwin; Linux: --target x86_64-unknown-linux-gnu
 ```
 
 The package script creates `dist/porch-VERSION-TARGET.tar.gz`, and on macOS also
 `dist/Porch.app`. Cross-target builds can use `--binaries target/TARGET/release`.
 The CI tray job compiles each native platform, checks menu model/actions, and
-runs a Linux no-DISPLAY fallback. The release-artifact workflow packages both
-binaries without creating a GitHub Release. Physical Linux desktop visibility,
+runs a Linux no-DISPLAY fallback. The release workflow publishes a GitHub
+Release only for a pushed `v*` tag matching `Cargo.toml`; a manual run only
+uploads workflow artifacts. Physical Linux desktop visibility,
 macOS rendered menu interaction, and login startup behavior require native GUI
 verification; compilation/model tests alone do not establish those observations.

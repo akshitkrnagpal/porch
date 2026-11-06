@@ -7,6 +7,7 @@ pub mod proxy;
 pub mod sockets;
 pub mod state;
 pub mod tls;
+pub mod update;
 
 pub mod discovery;
 #[cfg(feature = "tray")]

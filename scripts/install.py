@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Install Porch in user directories with atomic executable replacement.
 
-No hosts, trust stores, running daemons, sharing, or login startup are changed.
+Run it from an extracted release directory, or point it at a release tarball:
+
+  python3 install.py                                   # from an extracted archive
+  python3 install.py --archive porch-0.3.0-aarch64-apple-darwin.tar.gz
+
+Binaries go to ~/.local/bin (created if needed); on macOS Porch.app goes to
+~/Applications. No hosts, trust stores, running daemons, sharing, or login
+startup are changed.
 """
 import argparse
 import os
@@ -58,10 +65,51 @@ def install_app(source, destination):
         shutil.rmtree(temporary.parent, ignore_errors=True)
 
 
+def extract_archive(archive, destination):
+    """Extract a release tarball safely and return its package directory."""
+    import tarfile
+    with tarfile.open(archive, 'r:gz') as tar:
+        members = tar.getmembers()
+        root = destination.resolve()
+        for member in members:
+            target = (destination / member.name).resolve()
+            if root != target and root not in target.parents:
+                raise RuntimeError(f'unsafe path in archive: {member.name}')
+            if member.issym() or member.islnk():
+                link = (target.parent / member.linkname).resolve()
+                if root != link and root not in link.parents:
+                    raise RuntimeError(f'unsafe link in archive: {member.name}')
+            elif not (member.isfile() or member.isdir()):
+                raise RuntimeError(f'unsupported entry in archive: {member.name}')
+        if hasattr(tarfile, 'data_filter'):
+            tar.extractall(destination, filter='data')
+        else:
+            tar.extractall(destination)
+    packages = [path for path in destination.iterdir() if (path / 'porch').is_file()]
+    if len(packages) != 1:
+        raise RuntimeError(f'{archive} is not a Porch release archive')
+    return packages[0]
+
+
+def path_hint(bin_dir, path=None):
+    """Return the exact line to add to a shell profile, or None if on PATH."""
+    path = os.environ.get('PATH', '') if path is None else path
+    resolved = os.path.realpath(bin_dir)
+    if any(entry and os.path.realpath(os.path.expanduser(entry)) == resolved for entry in path.split(os.pathsep)):
+        return None
+    home = str(Path.home())
+    shown = str(bin_dir)
+    if shown == home or shown.startswith(home + os.sep):
+        shown = '$HOME' + shown[len(home):]
+    return f'export PATH="{shown}:$PATH"'
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parent,
                         help='extracted package directory (or target/release)')
+    parser.add_argument('--archive', type=Path,
+                        help='release tarball (porch-VERSION-TARGET.tar.gz) to install from')
     parser.add_argument('--prefix', type=Path, default=Path.home() / '.local',
                         help='binary install prefix; default ~/.local')
     parser.add_argument('--app-dir', type=Path, default=Path.home() / 'Applications',
@@ -69,6 +117,18 @@ def main():
     parser.add_argument('--no-app', action='store_true', help='install binaries only')
     parser.add_argument('--cli-only', action='store_true', help='omit optional desktop components')
     args = parser.parse_args()
+    if args.archive:
+        with tempfile.TemporaryDirectory(prefix='porch-install-') as temporary:
+            try:
+                args.source = extract_archive(args.archive, Path(temporary))
+            except (OSError, RuntimeError) as error:
+                parser.error(str(error))
+            install(parser, args)
+    else:
+        install(parser, args)
+
+
+def install(parser, args):
     source = args.source.resolve()
     for name in ['porch'] + ([] if args.cli_only else ['porch-tray']):
         binary = source / name
@@ -90,7 +150,11 @@ def main():
         print(f'Installed {destination}')
         print(f'Launch explicitly: open "{destination}"')
     print('Running apps and proxies are unchanged. Sharing and login startup remain unchanged.')
-    print(f'Add {args.prefix / "bin"} to PATH if needed.')
+    hint = path_hint(args.prefix / 'bin')
+    if hint:
+        print(f'{args.prefix / "bin"} is not on your PATH. Add this line to your shell profile')
+        print('(~/.zshrc, ~/.bashrc, or ~/.profile), then open a new terminal:')
+        print(f'  {hint}')
 
 
 if __name__ == '__main__':
