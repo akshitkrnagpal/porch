@@ -37,7 +37,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: cargo test --release --target ${{ matrix.target }} --all-targets
+      - run: cargo test --no-fail-fast --release --target ${{ matrix.target }} --all-targets
       - run: cargo build --release --target ${{ matrix.target }} --bin porch
       - uses: actions/upload-artifact@v4
         with:
