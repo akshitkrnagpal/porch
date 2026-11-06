@@ -1320,7 +1320,12 @@ pub fn prune_shares(force: bool) -> Result<()> {
                 }
                 #[cfg(windows)]
                 {
-                    let _ = exec("taskkill", &["/PID", &tunnel.pid.to_string(), "/T", "/F"]);
+                    let pid = tunnel.pid.to_string();
+                    let mut args = vec!["/PID", &pid, "/T"];
+                    if force {
+                        args.push("/F");
+                    }
+                    let _ = exec("taskkill", &args);
                 }
             }
         }
@@ -2012,7 +2017,12 @@ async fn stop_compose(child: &mut tokio::process::Child, signal: i32) {
     }
     #[cfg(windows)]
     if let Some(pid) = child.id() {
-        let _ = exec("taskkill", &["/PID", &pid.to_string(), "/T"]);
+        let pid = pid.to_string();
+        let mut args = vec!["/PID", &pid, "/T"];
+        if signal == 9 {
+            args.push("/F");
+        }
+        let _ = exec("taskkill", &args);
     }
     if tokio::time::timeout(Duration::from_secs(5), child.wait())
         .await

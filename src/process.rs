@@ -250,7 +250,7 @@ fn lsof_owner(output: &str, uid: u32) -> Option<u32> {
     None
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn linux_tcp_inodes(table: &str, port: u16, uid: u32) -> std::collections::BTreeSet<String> {
     table
         .lines()

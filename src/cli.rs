@@ -722,14 +722,14 @@ async fn ensure_proxy() -> Result<ProxySettings> {
     state::proxy_settings()
 }
 async fn stop_proxy() -> Result<()> {
-    let startup = startup_lock().await?;
+    let _startup = startup_lock().await?;
     if let Some(i) = proxy_identity() {
         if state::matches(&i) {
             #[cfg(unix)]
             if unsafe { libc::kill(i.pid as i32, 15) } != 0
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
             {
-                drop(startup);
+                drop(_startup);
                 let code = elevate(&["proxy".into(), "stop".into()]).await?;
                 if code != 0 {
                     bail!("elevated proxy stop exited {code}")
