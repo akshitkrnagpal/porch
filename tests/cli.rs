@@ -1,71 +1,133 @@
 use std::{
     path::PathBuf,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    time::{Duration, Instant},
 };
-struct Sandbox(PathBuf);
+struct Sandbox {
+    root: PathBuf,
+    port: u16,
+}
 impl Sandbox {
     fn new() -> Self {
-        let p = std::env::temp_dir().join(format!(
-            "porch-cli-{}-{}",
+        let root = std::env::temp_dir().join(format!(
+            "porch-cli-{}-{}-{}",
             std::process::id(),
+            {
+                static NEXT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&p).unwrap();
-        Self(p)
+        std::fs::create_dir_all(&root).unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Self {
+            root,
+            port: l.local_addr().unwrap().port(),
+        }
+    }
+    fn command(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_porch"));
+        c.args(args)
+            .current_dir(&self.root)
+            .env("PORCH_STATE_DIR", self.root.join("state"))
+            .env("PORCH_PORT", self.port.to_string())
+            .env("PORCH_HTTPS", "0")
+            .env("PORCH_SYNC_HOSTS", "0")
+            .env("PORCH_SKIP_TRUST", "1")
+            .env("CI", "1");
+        c
     }
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_porch"))
-            .args(args)
-            .env("PORCH_STATE_DIR", &self.0)
-            .output()
+        self.command(args).output().unwrap()
+    }
+    fn ok(&self, args: &[&str]) -> String {
+        let o = self.run(args);
+        assert!(
+            o.status.success(),
+            "{args:?} in {}: {}",
+            self.root.display(),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8(o.stdout).unwrap()
+    }
+    fn state(&self) -> serde_json::Value {
+        serde_json::from_slice(
+            &std::fs::read(self.root.join("state/state.json"))
+                .unwrap_or_else(|_| b"{\"routes\":[]}".to_vec()),
+        )
+        .unwrap()
+    }
+    fn wait_route(&self, name: &str) {
+        let d = Instant::now() + Duration::from_secs(15);
+        while !self.state()["routes"]
+            .as_array()
             .unwrap()
+            .iter()
+            .any(|r| r["name"] == name)
+        {
+            assert!(Instant::now() < d, "route never appeared: {name}");
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+    fn write_server(&self) {
+        std::fs::write(
+            self.root.join("server.py"),
+            r#"import os,json,http.server
+open('child-env.json','w').write(json.dumps(dict(os.environ)))
+class Server(http.server.BaseHTTPRequestHandler):
+ def do_GET(self):
+  self.send_response(200);self.end_headers();self.wfile.write(os.environ['PORTLESS_URL'].encode())
+ def log_message(self,*args):pass
+http.server.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),Server).serve_forever()
+"#,
+        )
+        .unwrap();
     }
 }
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = self.command(&["proxy", "stop"]).output();
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 #[test]
-fn alias_round_trip_and_replacement_are_persistent() {
+fn aliases_public_urls_scoping_force_and_json() {
     let s = Sandbox::new();
-    for target in ["http://127.0.0.1:43121", "http://127.0.0.1:43122"] {
-        assert!(s.run(&["alias", "demo", target]).status.success());
-        let o = s.run(&["get", "demo"]);
-        assert!(o.status.success());
-        assert_eq!(String::from_utf8(o.stdout).unwrap().trim(), target);
-    }
-    let o = s.run(&["list"]);
-    assert!(o.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(v["routes"].as_array().unwrap().len(), 1);
-    assert!(s.run(&["remove", "demo"]).status.success());
-    assert!(!s.run(&["get", "demo"]).status.success());
-}
-#[test]
-fn rejected_alias_preserves_existing_state() {
-    let s = Sandbox::new();
-    assert!(s
-        .run(&["alias", "valid", "http://127.0.0.1:43121"])
-        .status
-        .success());
-    assert!(!s
-        .run(&["alias", "bad/name", "http://127.0.0.1:43122"])
-        .status
-        .success());
-    assert!(!s
-        .run(&["alias", "valid", "invalid target"])
-        .status
-        .success());
+    s.ok(&["alias", "api.demo", "43121"]);
     assert_eq!(
-        String::from_utf8(s.run(&["get", "valid"]).stdout)
-            .unwrap()
-            .trim(),
-        "http://127.0.0.1:43121"
+        s.ok(&["get", "api.demo", "--no-worktree"]).trim(),
+        format!("http://api.demo.localhost:{}", s.port)
     );
+    assert!(!s.run(&["alias", "api.demo", "43122"]).status.success());
+    s.ok(&["alias", "api.demo", "43122", "--force"]);
+    let v: serde_json::Value = serde_json::from_str(&s.ok(&["list", "--json"])).unwrap();
+    assert_eq!(v["routes"][0]["target"], "http://127.0.0.1:43122");
+    assert!(s.ok(&["list"]).contains("api.demo.localhost"));
+    s.ok(&["alias", "--remove", "api.demo"]);
+    assert_eq!(s.state()["routes"].as_array().unwrap().len(), 0);
+    assert!(s
+        .ok(&["get", "unregistered", "--no-worktree"])
+        .contains("unregistered.localhost"));
+}
+#[test]
+fn malformed_flags_and_names_fail_without_mutation() {
+    let s = Sandbox::new();
+    for a in [
+        vec!["run", "--app-port", "0", "echo"],
+        vec!["run", "--unknown", "echo"],
+        vec!["alias", "bad/name", "1234"],
+        vec!["alias", "-bad", "1234"],
+        vec!["alias", "good", "ftp://x"],
+        vec!["proxy", "start", "--port", "0"],
+        vec!["proxy", "start", "--cert", "missing"],
+    ] {
+        assert!(!s.run(&a).status.success(), "{a:?}");
+    }
+    assert_eq!(s.state()["routes"].as_array().unwrap().len(), 0);
 }
 #[test]
 fn concurrent_writers_preserve_every_route() {
@@ -73,9 +135,9 @@ fn concurrent_writers_preserve_every_route() {
     let mut children = Vec::new();
     for i in 0..24 {
         children.push(
-            Command::new(env!("CARGO_BIN_EXE_porch"))
-                .args(["alias", &format!("route{i}"), "http://127.0.0.1:1234"])
-                .env("PORCH_STATE_DIR", &s.0)
+            s.command(&["alias", &format!("route{i}"), "1234"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn()
                 .unwrap(),
         );
@@ -83,6 +145,332 @@ fn concurrent_writers_preserve_every_route() {
     for mut c in children {
         assert!(c.wait().unwrap().success());
     }
-    let v: serde_json::Value = serde_json::from_slice(&s.run(&["list"]).stdout).unwrap();
-    assert_eq!(v["routes"].as_array().unwrap().len(), 24);
+    assert_eq!(s.state()["routes"].as_array().unwrap().len(), 24);
+}
+#[test]
+fn real_autostart_launch_forward_env_signal_and_readiness() {
+    let s = Sandbox::new();
+    s.write_server();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let app_port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+    let mut child = s
+        .command(&[
+            "demo",
+            "--app-port",
+            &app_port,
+            "--",
+            "python3",
+            "server.py",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    s.wait_route("demo");
+    assert!(s.root.join("state/proxy.ready").is_file());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let d = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(r) = client
+                .get(format!("http://127.0.0.1:{}/", s.port))
+                .header("host", "demo.localhost")
+                .send()
+                .await
+            {
+                if r.status().is_success() {
+                    assert_eq!(
+                        r.text().await.unwrap(),
+                        format!("http://demo.localhost:{}", s.port)
+                    );
+                    break;
+                }
+            }
+            assert!(Instant::now() < d);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    });
+    let env: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(s.root.join("child-env.json")).unwrap()).unwrap();
+    assert_eq!(env["PORT"], app_port);
+    assert_eq!(env["HOST"], "127.0.0.1");
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    };
+    #[cfg(windows)]
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    #[cfg(unix)]
+    assert_eq!(status.code(), Some(143));
+    #[cfg(windows)]
+    {
+        let _ = status;
+        s.ok(&["prune", "--force"]);
+    }
+    assert!(s.state()["routes"].as_array().unwrap().is_empty());
+}
+#[test]
+fn bare_script_named_run_reserved_name_and_exit_code() {
+    let s = Sandbox::new();
+    std::fs::write(s.root.join("package.json"),r#"{"name":"fixture","scripts":{"dev":"node -e \"process.exit(23)\"","start":"node -e \"process.exit(17)\""},"portless":{"name":"configured"}}"#).unwrap();
+    assert_eq!(s.run(&[]).status.code(), Some(23));
+    assert_eq!(s.run(&["--script", "start"]).status.code(), Some(17));
+    assert_eq!(
+        s.run(&[
+            "run",
+            "--name",
+            "explicit",
+            "node",
+            "-e",
+            "process.exit(31)"
+        ])
+        .status
+        .code(),
+        Some(31)
+    );
+    assert_eq!(
+        s.run(&["--name", "proxy", "node", "-e", "process.exit(19)"])
+            .status
+            .code(),
+        Some(19)
+    );
+    assert!(s.state()["routes"].as_array().unwrap().is_empty());
+}
+#[test]
+fn bypass_does_not_start_proxy_or_inject_port() {
+    let s = Sandbox::new();
+    let o = s
+        .command(&[
+            "run",
+            "node",
+            "-e",
+            "console.log(process.env.PORTLESS_URL||'bypassed')",
+        ])
+        .env("PORTLESS", "0")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(String::from_utf8(o.stdout).unwrap().trim(), "bypassed");
+    assert!(!s.root.join("state/proxy.pid").exists());
+}
+#[test]
+fn daemon_remembers_settings_and_rejects_bind_failure() {
+    let s = Sandbox::new();
+    s.ok(&[
+        "proxy",
+        "start",
+        "--no-tls",
+        "--tld",
+        "localhost,test",
+        "--wildcard",
+    ]);
+    s.ok(&["proxy", "stop"]);
+    assert_eq!(s.ok(&["proxy", "status"]).trim(), "stopped");
+    s.ok(&["run", "node", "-e", "process.exit(0)"]);
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(s.root.join("state/proxy.json")).unwrap()).unwrap();
+    assert_eq!(v["tlds"], serde_json::json!(["localhost", "test"]));
+    assert_eq!(v["wildcard"], true);
+    s.ok(&["proxy", "stop"]);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", s.port)).unwrap();
+    assert!(!s.run(&["proxy", "start"]).status.success());
+    assert!(!s.root.join("state/proxy.ready").exists());
+    drop(listener);
+}
+#[cfg(unix)]
+#[test]
+fn orphan_prune_kills_child_group_and_preserves_static_alias() {
+    let s = Sandbox::new();
+    s.write_server();
+    s.ok(&["alias", "static", "12345"]);
+    let mut child = s
+        .command(&["orphan", "python3", "server.py"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    s.wait_route("orphan");
+    let d = Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Some(p) = s.state()["owners"]["orphan"]["child"].as_u64() {
+            break p as u32;
+        }
+        assert!(Instant::now() < d);
+        std::thread::sleep(Duration::from_millis(30));
+    };
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGKILL);
+    };
+    child.wait().unwrap();
+    s.ok(&["prune", "--force"]);
+    assert_eq!(s.state()["routes"].as_array().unwrap().len(), 1);
+    assert_eq!(s.state()["routes"][0]["name"], "static");
+    let d = Instant::now() + Duration::from_secs(5);
+    while porch::state::alive(pid) {
+        assert!(Instant::now() < d, "orphan child still alive");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn https_default_ca_environment_allows_node_to_call_another_app() {
+    let s = Sandbox::new();
+    let mut server=s.command(&["secure","node","-e","require('http').createServer((q,r)=>r.end('from-secure')).listen(process.env.PORT,'127.0.0.1')"])
+      .env_remove("PORCH_HTTPS").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    s.wait_route("secure");
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(s.root.join("state/proxy.json")).unwrap()).unwrap();
+    assert_eq!(settings["tls"], true);
+    let script=format!("const https=require('https');let n=0;function fetch(){{https.get({{hostname:'127.0.0.1',port:{},servername:'secure.localhost',headers:{{host:'secure.localhost'}}}},r=>{{let b='';r.on('data',c=>b+=c);r.on('end',()=>{{console.log(b);process.exit(b==='from-secure'?0:1)}})}}).on('error',e=>{{if(++n<50)setTimeout(fetch,30);else{{console.error(e);process.exit(1)}}}})}}fetch()",s.port);
+    let output = s
+        .command(&["client", "node", "-e", &script])
+        .env_remove("PORCH_HTTPS")
+        .output()
+        .unwrap();
+    unsafe {
+        libc::kill(server.id() as i32, libc::SIGTERM);
+    };
+    let _ = server.wait();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "from-secure"
+    );
+    assert!(s.state()["routes"].as_array().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_autostarts_reserve_distinct_ports_and_one_ready_daemon() {
+    let s = Sandbox::new();
+    let mut children = Vec::new();
+    for name in ["one", "two", "three"] {
+        children.push(
+            s.command(&[name, "node", "-e", "setInterval(()=>{},1000)"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for name in ["one", "two", "three"] {
+        s.wait_route(name);
+    }
+    let state = s.state();
+    let mut ports = state["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["target"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    ports.sort();
+    ports.dedup();
+    for mut child in children {
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGTERM);
+        };
+        let _ = child.wait();
+    }
+    assert_eq!(ports.len(), 3);
+    assert!(s.state()["routes"].as_array().unwrap().is_empty());
+    assert_eq!(s.ok(&["proxy", "status"]).trim(), "running");
+}
+#[test]
+fn global_reserved_name_bypass_and_unregistered_get_work() {
+    let s = Sandbox::new();
+    let out = s.run(&[
+        "--prefix",
+        "review",
+        "--name",
+        "list",
+        "node",
+        "-e",
+        "console.log(process.env.PORTLESS_URL)",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8(out.stdout)
+        .unwrap()
+        .contains("review.list.localhost"));
+    assert_eq!(
+        s.ok(&["get", "backend", "--no-worktree"]).trim(),
+        format!("http://backend.localhost:{}", s.port)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn self_daemonized_server_inherits_route_until_explicit_takeover() {
+    let s = Sandbox::new();
+    std::fs::write(
+        s.root.join("daemon.py"),
+        r#"import os,http.server
+pid=os.fork()
+if pid:os._exit(0)
+os.setsid()
+fd=os.open(os.devnull,os.O_RDWR)
+for target in (0,1,2):os.dup2(fd,target)
+open('daemon.pid','w').write(str(os.getpid()))
+class Server(http.server.BaseHTTPRequestHandler):
+ def do_GET(self):self.send_response(200);self.end_headers();self.wfile.write(b'daemon survived')
+ def log_message(self,*args):pass
+http.server.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),Server).serve_forever()
+"#,
+    )
+    .unwrap();
+    let out = s.run(&["daemon", "python3", "daemon.py"]);
+    let pid = std::fs::read_to_string(s.root.join("daemon.pid"))
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    // Explicit takeover is responsible for stopping the retained detached server.
+    let retained = s.state()["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["name"] == "daemon" && r["pid"] == pid);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let body = runtime.block_on(async {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{}", s.port))
+            .header("host", "daemon.localhost")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    });
+    let takeover = s.run(&["alias", "daemon", "12345", "--force"]);
+    if porch::state::alive(pid) {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(retained);
+    assert_eq!(body, "daemon survived");
+    assert!(
+        takeover.status.success(),
+        "{}",
+        String::from_utf8_lossy(&takeover.stderr)
+    );
 }

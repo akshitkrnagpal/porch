@@ -125,14 +125,17 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
     // Route listing uses the same persistent state as the proxy.
     if n == "list" && a.as_object().unwrap().is_empty() {
         let state = crate::state::load()?;
+        let settings = crate::state::proxy_settings()?;
         let routes: Vec<_> = state
             .routes
             .iter()
-            .map(|r| json!({"name":r.name,"target":r.target,"pid":r.pid}))
+            .filter(|r| crate::state::route_alive(&state,r))
+            .map(|r| json!({"name":r.name,"url":settings.url(&r.name),"target":r.target,"pid":r.pid,"urls":state.shares.get(&r.name)}))
             .collect();
         return Ok(tool_result(json!({"routes":routes}), false));
     }
     let mut argv: Vec<String> = match n {
+        "list" => vec!["list".into(), "--json".into()],
         "alias_add" => vec![
             "alias".into(),
             a["name"].as_str().unwrap().into(),

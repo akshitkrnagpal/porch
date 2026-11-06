@@ -13,18 +13,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
-      - name: Check implementation availability
-        id: implementation
-        shell: bash
-        run: |
-          if test -f Cargo.toml; then
-            echo 'ready=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'ready=false' >> "$GITHUB_OUTPUT"
-            echo '::notice::Bootstrap checkout: Cargo.toml is absent; Rust checks did not run.'
-          fi
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - run: cargo fmt --all -- --check
-        if: steps.implementation.outputs.ready == 'true'
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
-        if: steps.implementation.outputs.ready == 'true'
+      - run: cargo build --release

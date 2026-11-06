@@ -508,3 +508,841 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+// Node process.cwd() uses ordinary Windows paths, while Rust canonicalize
+// returns extended-length paths. Keep manifest keys in Node's representation.
+fn canonical_cwd(cwd: &Path) -> std::io::Result<PathBuf> {
+    let path = fs::canonicalize(cwd)?;
+    #[cfg(windows)]
+    {
+        let value = path.to_string_lossy();
+        if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{unc}")));
+        }
+        if let Some(local) = value.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(local));
+        }
+    }
+    Ok(path)
+}
+
+/// A fully resolved app invocation. The lifecycle owner reserves the port and starts it.
+#[derive(Debug, Clone)]
+pub struct LaunchPlan {
+    pub cwd: PathBuf,
+    pub name: String,
+    pub command: Vec<String>,
+    pub app_port: Option<u16>,
+    pub proxy: bool,
+}
+
+fn merge_config(base: &Value, leaf: &Value) -> Value {
+    let mut out = base.clone();
+    for (key, value) in leaf.as_object().into_iter().flatten() {
+        if key == "worktree" {
+            if !out[key].is_object() {
+                out[key] = json!({});
+            }
+            for (k, v) in value.as_object().into_iter().flatten() {
+                out[key][k] = v.clone();
+            }
+        } else {
+            out[key] = value.clone();
+        }
+    }
+    out
+}
+
+/// Resolve root app entries, leaf configuration and package overrides together.
+pub fn effective_config(cwd: &Path) -> Result<Value> {
+    let root = find_workspace_root(cwd).unwrap_or_else(|| cwd.to_owned());
+    let config = load(&root)?;
+    let root_app = resolve_app_config(&config, &root, cwd);
+    let leaf = if root != cwd { load(cwd)? } else { json!({}) };
+    let leaf = resolve_app_config(&leaf, cwd, cwd);
+    let mut out = merge_config(&root_app, &leaf);
+    // The package key is closest to the script, even when a root apps entry exists.
+    if let Some(pkg) = read_json(&cwd.join("package.json")).and_then(|v| v.get("portless").cloned())
+    {
+        let pkg = match pkg {
+            Value::String(s) if !s.trim().is_empty() => json!({"name":s.trim()}),
+            Value::String(_) | Value::Null => json!({}),
+            v => v,
+        };
+        validate_config(&pkg)?;
+        out = merge_config(&out, &resolve_app_config(&pkg, cwd, cwd));
+    }
+    validate_config(&out)?;
+    Ok(out)
+}
+
+pub fn configured_name(cwd: &Path, base: &str, prefix: Option<&str>) -> Result<String> {
+    let effective = effective_config(cwd)?;
+    let worktree = prefix.map(sanitize_for_hostname).or_else(|| {
+        detect_worktree_prefix(
+            cwd,
+            effective["worktree"]["prefix"]
+                .as_str()
+                .unwrap_or("last-segment"),
+        )
+    });
+    let base = base
+        .split('.')
+        .map(truncate_label)
+        .collect::<Vec<_>>()
+        .join(".");
+    let name = apply_worktree_prefix(
+        &base,
+        worktree.as_deref(),
+        effective["worktree"]["hostnameTemplate"].as_str(),
+    );
+    if name.len() > 253 || !name.split('.').all(|s| s.len() <= 63 && valid_label(s)) {
+        bail!("invalid hostname: {name}");
+    }
+    Ok(name.to_ascii_lowercase())
+}
+
+fn env_app_port() -> Result<Option<u16>> {
+    std::env::var("PORCH_APP_PORT")
+        .or_else(|_| std::env::var("PORTLESS_APP_PORT"))
+        .ok()
+        .map(|s| {
+            let p: u16 = s
+                .parse()
+                .context("APP_PORT must be an integer between 1 and 65535")?;
+            if p == 0 {
+                bail!("APP_PORT must be an integer between 1 and 65535");
+            }
+            Ok(p)
+        })
+        .transpose()
+}
+
+/// Resolve bare, inferred and named execution into actual package-manager commands.
+pub fn launch_plans(
+    cwd: &Path,
+    command: Option<Vec<String>>,
+    name: Option<&str>,
+    script: Option<&str>,
+    prefix: Option<&str>,
+) -> Result<Vec<LaunchPlan>> {
+    let cwd = canonical_cwd(cwd).with_context(|| format!("reading {}", cwd.display()))?;
+    let root = find_workspace_root(&cwd);
+    let config = effective_config(&cwd)?;
+    let env_port = env_app_port()?;
+    if command.is_none() && name.is_none() && root.as_deref() == Some(cwd.as_path()) {
+        let root_config = load(&cwd)?;
+        let default_script = script.or(root_config["script"].as_str()).unwrap_or("dev");
+        let packages = discover_workspace_packages(&cwd);
+        let project = workspace_project_name(&cwd, &packages)?;
+        let mut plans = Vec::new();
+        for pkg in &packages {
+            let mut app = effective_config(&pkg.dir)?;
+            // At a workspace root, name is the project domain. Only an apps
+            // entry or leaf config may rename one package.
+            if root_config.get("apps").is_none()
+                && root_config.get("name").is_some()
+                && resolve_app_config(&load(&pkg.dir)?, &pkg.dir, &pkg.dir)
+                    .get("name")
+                    .is_none()
+            {
+                app.as_object_mut().unwrap().remove("name");
+            }
+            let target_script = script.or(app["script"].as_str()).unwrap_or(default_script);
+            let Some(raw) = resolve_script_raw(target_script, &pkg.dir) else {
+                continue;
+            };
+            let inferred = pkg
+                .name
+                .as_deref()
+                .map(sanitize_for_hostname)
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| {
+                    sanitize_for_hostname(
+                        &pkg.dir
+                            .strip_prefix(&cwd)
+                            .unwrap_or(&pkg.dir)
+                            .to_string_lossy(),
+                    )
+                });
+            let inferred = if inferred == project {
+                inferred
+            } else {
+                format!("{inferred}.{project}")
+            };
+            let base = app["name"].as_str().unwrap_or(&inferred);
+            plans.push(LaunchPlan {
+                cwd: pkg.dir.clone(),
+                name: configured_name(&pkg.dir, base, prefix)?,
+                command: resolve_script_command(target_script, &pkg.dir)
+                    .context("workspace script disappeared")?,
+                app_port: env_port.or_else(|| app["appPort"].as_u64().map(|p| p as u16)),
+                proxy: app["proxy"]
+                    .as_bool()
+                    .unwrap_or_else(|| is_server_command(&split_command(&raw))),
+            });
+        }
+        if !plans.is_empty() {
+            plans.sort_by(|a, b| a.name.cmp(&b.name));
+            let mut seen = std::collections::BTreeSet::new();
+            for p in &plans {
+                if p.proxy && !seen.insert(&p.name) {
+                    bail!("duplicate workspace hostname: {}", p.name);
+                }
+            }
+            return Ok(plans);
+        }
+    }
+    let base = name
+        .map(str::to_owned)
+        .or_else(|| config["name"].as_str().map(str::to_owned))
+        .unwrap_or(infer_name(&cwd)?);
+    let script = script.or(config["script"].as_str()).unwrap_or("dev");
+    let command = match command {
+        Some(c) if !c.is_empty() => c,
+        _ => resolve_script_command(script, &cwd).with_context(|| {
+            format!(
+                "no \"{script}\" script in {}/package.json; provide a command",
+                cwd.display()
+            )
+        })?,
+    };
+    Ok(vec![LaunchPlan {
+        cwd: cwd.clone(),
+        name: configured_name(&cwd, &base, prefix)?,
+        command,
+        app_port: env_port.or_else(|| config["appPort"].as_u64().map(|p| p as u16)),
+        proxy: config["proxy"].as_bool().unwrap_or(true),
+    }])
+}
+
+pub fn split_command(raw: &str) -> Vec<String> {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    let mut current = String::new();
+    let mut out = Vec::new();
+    for c in raw.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+        } else if c == '\\' && !single {
+            escaped = true;
+        } else if c == '\'' && !double {
+            single = !single;
+        } else if c == '"' && !single {
+            double = !double;
+        } else if c.is_whitespace() && !single && !double {
+            if !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+pub fn is_server_command(args: &[String]) -> bool {
+    args.first().is_some_and(|c| {
+        ![
+            "tsup",
+            "tsc",
+            "esbuild",
+            "rollup",
+            "babel",
+            "swc",
+            "unbuild",
+            "pkgroll",
+            "ncc",
+            "microbundle",
+        ]
+        .contains(&basename(c))
+    })
+}
+fn basename(s: &str) -> &str {
+    s.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(s)
+        .trim_end_matches(".cmd")
+        .trim_end_matches(".exe")
+}
+fn framework(s: &str) -> bool {
+    [
+        "vite",
+        "vitepress",
+        "vp",
+        "react-router",
+        "rsbuild",
+        "astro",
+        "ng",
+        "react-native",
+        "expo",
+        "wrangler",
+    ]
+    .contains(&s)
+}
+
+#[derive(Debug)]
+struct Invocation {
+    name: String,
+    index: usize,
+    args: Vec<String>,
+    insert: usize,
+    separator: bool,
+    uncertain: bool,
+}
+fn framework_invocation(command: &[String]) -> Option<Invocation> {
+    let first = basename(command.first()?);
+    let (mut index, mut separator, mut needs_separator) = (0, false, false);
+    if !framework(first) {
+        if !["npx", "bunx", "pnpx", "yarn", "pnpm", "npm"].contains(&first) {
+            return None;
+        }
+        index = 1;
+        let value_flags: &[&str] = match first {
+            "npx" => &[
+                "-c",
+                "--call",
+                "-p",
+                "--package",
+                "-w",
+                "--workspace",
+                "--allow-scripts",
+            ],
+            "pnpx" => &["-p", "--package"],
+            "npm" => &["-c", "--call", "--package", "-w", "--workspace", "--prefix"],
+            _ => &[],
+        };
+        let skip = |index: &mut usize, separator: &mut bool| {
+            while let Some(arg) = command.get(*index).filter(|s| s.starts_with('-')) {
+                *index += 1;
+                if arg == "--" {
+                    *separator = true;
+                    break;
+                }
+                if !arg.contains('=') && value_flags.contains(&arg.as_str()) {
+                    *index += 1;
+                }
+            }
+        };
+        skip(&mut index, &mut separator);
+        if ["yarn", "pnpm", "npm"].contains(&first)
+            && command
+                .get(index)
+                .is_some_and(|s| ["dlx", "exec", "x"].contains(&s.as_str()))
+        {
+            index += 1;
+            skip(&mut index, &mut separator);
+        }
+        if !framework(basename(command.get(index)?)) {
+            return None;
+        }
+        needs_separator = first == "npm" && !separator;
+    }
+    let name = basename(command.get(index)?).to_owned();
+    let end = command
+        .iter()
+        .enumerate()
+        .skip(index + 1)
+        .find(|(_, s)| s.as_str() == "--")
+        .map(|(i, _)| i);
+    let insert = if needs_separator {
+        command.len()
+    } else {
+        end.unwrap_or(command.len())
+    };
+    let mut args = command[index + 1..end.unwrap_or(command.len())].to_vec();
+    let uncertain = needs_separator
+        && args
+            .windows(2)
+            .any(|a| a[0].starts_with('-') && !a[0].contains('=') && !a[1].starts_with('-'));
+    if needs_separator {
+        args.retain(|a| !a.starts_with('-'));
+        if let Some(e) = end {
+            args.extend_from_slice(&command[e + 1..]);
+        }
+    }
+    Some(Invocation {
+        name,
+        index,
+        args,
+        insert,
+        separator: needs_separator && end.is_none(),
+        uncertain,
+    })
+}
+
+fn server_invocation(inv: &Invocation) -> bool {
+    if inv.uncertain {
+        return false;
+    }
+    let value_flags: Option<&[&str]> = match inv.name.as_str() {
+        "vite" => Some(&[
+            "--assetsDir",
+            "--assetsInlineLimit",
+            "--base",
+            "--configLoader",
+            "--host",
+            "--manifest",
+            "--minify",
+            "--open",
+            "--outDir",
+            "--port",
+            "--sourcemap",
+            "--ssr",
+            "--ssrManifest",
+            "--target",
+            "-c",
+            "--config",
+            "-d",
+            "--debug",
+            "-f",
+            "--filter",
+            "-l",
+            "--logLevel",
+            "-m",
+            "--mode",
+        ]),
+        "rsbuild" => Some(&[
+            "--base",
+            "--config-loader",
+            "--dist-path",
+            "--env-dir",
+            "--env-mode",
+            "--environment",
+            "--host",
+            "--log-level",
+            "--output",
+            "--port",
+            "-c",
+            "--config",
+            "-m",
+            "--mode",
+            "-o",
+            "--open",
+            "-r",
+            "--root",
+        ]),
+        "astro" => Some(&[
+            "--base", "--config", "--host", "--mode", "--open", "--outDir", "--port", "--root",
+            "--site",
+        ]),
+        _ => None,
+    };
+    let mut i = 0;
+    let sub = loop {
+        let Some(a) = inv.args.get(i) else {
+            break None;
+        };
+        if a == "--" {
+            break None;
+        }
+        if !a.starts_with('-') {
+            break Some(a.as_str());
+        }
+        if !a.contains('=') {
+            match value_flags {
+                Some(flags) if flags.contains(&a.as_str()) => i += 1,
+                None => return false,
+                _ => {}
+            }
+        }
+        i += 1;
+    };
+    match inv.name.as_str() {
+        "vite" => sub.is_none_or(|s| !["build", "optimize"].contains(&s)),
+        "vitepress" => sub.is_none_or(|s| ["dev", "serve", "preview"].contains(&s)),
+        "rsbuild" => sub.is_none_or(|s| ["dev", "preview"].contains(&s)),
+        "vp" | "react-router" | "wrangler" => sub == Some("dev"),
+        "astro" => matches!(sub, Some("dev" | "preview")),
+        "ng" => matches!(sub, Some("serve" | "dev" | "s")),
+        "react-native" => sub == Some("start"),
+        "expo" => sub.is_none_or(|s| ["start", "serve"].contains(&s)),
+        _ => false,
+    }
+}
+fn has_option(args: &[String], flag: &str) -> bool {
+    args.iter()
+        .any(|a| a == flag || a.strip_prefix(flag).is_some_and(|s| s.starts_with('=')))
+}
+fn framework_flags(inv: &Invocation, port: u16, lan: bool) -> Vec<String> {
+    if !server_invocation(inv) {
+        return vec![];
+    }
+    let mut flags = Vec::new();
+    if !has_option(&inv.args, "--port") {
+        flags.extend(["--port".into(), port.to_string()]);
+        if ["vite", "vitepress", "vp", "react-router"].contains(&inv.name.as_str()) {
+            flags.push("--strictPort".into());
+        }
+    }
+    let host_flag = if inv.name == "wrangler" {
+        "--ip"
+    } else {
+        "--host"
+    };
+    let host_choice = has_option(&inv.args, host_flag)
+        || inv.name == "expo"
+            && ["--localhost", "--lan", "--tunnel"]
+                .iter()
+                .any(|f| has_option(&inv.args, f));
+    if !(host_choice || inv.name == "expo" && lan) {
+        flags.extend([
+            host_flag.into(),
+            if inv.name == "expo" {
+                "localhost"
+            } else {
+                "127.0.0.1"
+            }
+            .into(),
+        ]);
+    }
+    flags
+}
+fn unsafe_script(raw: &str) -> bool {
+    let (mut single, mut double, mut escaped, mut word_start) = (false, false, false, true);
+    let chars: Vec<_> = raw.chars().collect();
+    for (i, c) in chars.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            if c != '\n' && c != '\r' {
+                word_start = false;
+            }
+            continue;
+        }
+        if c == '\\' && !single {
+            escaped = true;
+            continue;
+        }
+        if c == '\'' && !double {
+            single = !single;
+            word_start = false;
+            continue;
+        }
+        if c == '"' && !single {
+            double = !double;
+            word_start = false;
+            continue;
+        }
+        if single || double {
+            continue;
+        }
+        if matches!(c, ';' | '\n' | '\r' | '|') || c == '#' && word_start {
+            return true;
+        }
+        if c == '&'
+            && !(i > 0
+                && chars[i - 1] == '>'
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|c| c.is_ascii_digit() || *c == '-'))
+        {
+            return true;
+        }
+        word_start = c == ' ' || c == '\t';
+    }
+    false
+}
+
+/// Adapt direct frameworks and package scripts without retokenizing shell scripts.
+pub fn adapt_command(
+    command: &[String],
+    cwd: &Path,
+    port: u16,
+    lan: bool,
+) -> Result<(Vec<String>, Option<String>)> {
+    if command.is_empty() {
+        bail!("empty command");
+    }
+    let mut out = command.to_vec();
+    let direct = framework_invocation(command);
+    let package = if command.len() >= 3
+        && ["npm", "pnpm", "yarn", "bun"].contains(&basename(&command[0]))
+        && command[1] == "run"
+        && !command[2].starts_with('-')
+    {
+        resolve_script_raw(&command[2], cwd)
+    } else {
+        None
+    };
+    let script_tokens = package.as_deref().map(split_command);
+    // Keep the framework identity even for compound scripts whose argv cannot be altered.
+    let resolved_name = direct.as_ref().map(|i| i.name.clone()).or_else(|| {
+        script_tokens
+            .as_deref()
+            .and_then(framework_invocation)
+            .map(|i| i.name)
+    });
+    if let Some(inv) = direct {
+        let flags = framework_flags(&inv, port, lan);
+        let mut inserted = Vec::new();
+        if inv.separator && !flags.is_empty() {
+            inserted.push("--".into());
+        }
+        inserted.extend(flags);
+        out.splice(inv.insert..inv.insert, inserted);
+    } else if let (Some(raw), Some(tokens)) = (package.as_deref(), script_tokens.as_deref()) {
+        if !unsafe_script(raw) {
+            if let Some(script_inv) = framework_invocation(tokens) {
+                if !tokens.iter().skip(script_inv.index + 1).any(|s| s == "--") {
+                    let mut probe = tokens.to_vec();
+                    probe.extend(
+                        command
+                            .iter()
+                            .skip(3)
+                            .filter(|s| s.as_str() != "--")
+                            .cloned(),
+                    );
+                    if let Some(inv) = framework_invocation(&probe) {
+                        let flags = framework_flags(&inv, port, lan);
+                        if !flags.is_empty() {
+                            if basename(&command[0]) == "npm" && !out.iter().any(|s| s == "--") {
+                                out.push("--".into());
+                            }
+                            out.extend(flags);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((
+        out,
+        if resolved_name.as_deref() == Some("expo") && lan {
+            None
+        } else {
+            Some("127.0.0.1".into())
+        },
+    ))
+}
+
+/// Package-local executables win, then parent workspace bins, then the inherited PATH.
+pub fn augmented_path(cwd: &Path) -> std::ffi::OsString {
+    let mut paths: Vec<PathBuf> = cwd
+        .ancestors()
+        .map(|p| p.join("node_modules/.bin"))
+        .collect();
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths).unwrap_or_default()
+}
+
+fn is_porch_wrapper(raw: &str) -> bool {
+    split_command(raw)
+        .first()
+        .is_some_and(|c| matches!(basename(c), "porch" | "portless"))
+}
+
+/// Turbo retains its own dependency graph and filters; the coordinator supplies app env via the loader.
+pub fn turbo_command(cwd: &Path, script: Option<&str>) -> Result<Option<Vec<String>>> {
+    if find_workspace_root(cwd).as_deref() != Some(cwd) {
+        return Ok(None);
+    }
+    let config = load(cwd)?;
+    if config["turbo"] == false
+        || !(cwd.join("turbo.json").is_file() || cwd.join("turbo.jsonc").is_file())
+    {
+        return Ok(None);
+    }
+    let script = script.or(config["script"].as_str()).unwrap_or("dev");
+    if resolve_script_raw(script, cwd).is_some_and(|raw| !is_porch_wrapper(&raw)) {
+        return Ok(resolve_script_command(script, cwd));
+    }
+    let pm = detect_package_manager(cwd);
+    Ok(Some(match pm.as_str() {
+        "npm" => vec!["npx".into(), "turbo".into(), "run".into(), script.into()],
+        "bun" => vec!["bunx".into(), "turbo".into(), "run".into(), script.into()],
+        _ => vec![
+            pm,
+            "exec".into(),
+            "turbo".into(),
+            "run".into(),
+            script.into(),
+        ],
+    }))
+}
+
+/// The Node preload chooses env by process.cwd(), preserving Turbo's graph and npm script hooks.
+pub fn write_turbo_manifest(
+    entries: &std::collections::BTreeMap<PathBuf, std::collections::BTreeMap<String, String>>,
+) -> Result<(PathBuf, String)> {
+    write_turbo_manifest_at(&crate::state::dir(), entries)
+}
+
+fn write_turbo_manifest_at(
+    dir: &Path,
+    entries: &std::collections::BTreeMap<PathBuf, std::collections::BTreeMap<String, String>>,
+) -> Result<(PathBuf, String)> {
+    fs::create_dir_all(dir)?;
+    let manifest = dir.join(format!("dev-manifest-{}.json", std::process::id()));
+    let loader = dir.join(format!("turbo-env-loader-{}.cjs", std::process::id()));
+    let mut entries: std::collections::BTreeMap<_, _> = entries
+        .iter()
+        .map(|(cwd, entry)| {
+            (
+                canonical_cwd(cwd).unwrap_or_else(|_| cwd.clone()),
+                entry.clone(),
+            )
+        })
+        .collect();
+    for (cwd, entry) in &mut entries {
+        let command = entry
+            .remove("_PORCH_COMMAND")
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+        if let (Some(command), Some(port)) =
+            (command, entry.get("PORT").and_then(|s| s.parse().ok()))
+        {
+            // When Turbo invokes a package's `dev: porch` wrapper while the
+            // root already reserved its dev:app route, the inner launcher only
+            // resolves/runs that script and inherits our assigned environment.
+            let task = entry
+                .remove("_PORCH_TURBO_SCRIPT")
+                .unwrap_or_else(|| "dev".into());
+            let wrapper = command.get(2) != Some(&task)
+                && read_json(&cwd.join("package.json")).is_some_and(|pkg| {
+                    pkg["scripts"][&task].as_str().is_some_and(is_porch_wrapper)
+                });
+            if wrapper {
+                entry.insert("PORCH".into(), "0".into());
+                entry.insert("PORTLESS".into(), "0".into());
+            } else {
+                entry.insert("PORCH_ACTIVE".into(), "1".into());
+                entry.insert("PORTLESS_ACTIVE".into(), "1".into());
+            }
+            let lan = entry.get("PORTLESS_LAN").is_some_and(|s| s == "1");
+            let direct = framework_invocation(&command);
+            let name = direct.as_ref().map(|inv| inv.name.clone()).or_else(|| {
+                if command.len() >= 3 && command[1] == "run" {
+                    resolve_script_raw(&command[2], cwd)
+                        .and_then(|s| framework_invocation(&split_command(&s)))
+                        .map(|inv| inv.name)
+                } else {
+                    None
+                }
+            });
+            let (adapted, _) = adapt_command(&command, cwd, port, lan)?;
+            let count = adapted.len().saturating_sub(command.len());
+            if let Some(name) = name.filter(|_| count > 0) {
+                let start = direct.as_ref().map(|i| i.insert).unwrap_or(command.len());
+                let flags: Vec<_> = adapted[start..start + count]
+                    .iter()
+                    .filter(|s| s.as_str() != "--")
+                    .cloned()
+                    .collect();
+                entry.insert(
+                    "_PORCH_FRAMEWORK".into(),
+                    serde_json::to_string(&json!({"name":name,"flags":flags}))?,
+                );
+            }
+        }
+    }
+    fs::write(&manifest, serde_json::to_vec_pretty(&entries)?)?;
+    let source = format!(
+        r#""use strict";
+try {{
+  var fs = require("fs"), path = require("path");
+  var entry = JSON.parse(fs.readFileSync({}, "utf8"))[process.cwd()];
+  if (entry) {{
+    for (var key of Object.keys(entry)) if (!key.startsWith("_PORCH_")) process.env[key] = entry[key];
+    var spec = entry._PORCH_FRAMEWORK && JSON.parse(entry._PORCH_FRAMEWORK);
+    if (spec && process.argv[1]) {{
+      var parts = process.argv[1].replace(/\\/g,"/").split("/");
+      var bin = parts[parts.length-1].replace(/\.(?:c?js|mjs|cmd|exe)$/i, "");
+      if (bin === spec.name || parts.includes(spec.name)) {{
+        var args = process.argv.slice(2);
+        var has = function(flag) {{ return args.some(function(a) {{return a === flag || a.startsWith(flag+"=");}}); }};
+        for (var i=0; i<spec.flags.length; i++) {{
+          var flag=spec.flags[i], value=spec.flags[i+1];
+          if (value && !value.startsWith("--")) {{ i++; if (!has(flag)) process.argv.push(flag,value); }}
+          else if (!has(flag)) process.argv.push(flag);
+        }}
+      }}
+    }}
+  }}
+}} catch (_) {{}}
+"#,
+        serde_json::to_string(&manifest)?
+    );
+    fs::write(&loader, source)?;
+    let require = format!(
+        "--require {}",
+        serde_json::to_string(&loader.to_string_lossy())?
+    );
+    let options = match std::env::var("NODE_OPTIONS") {
+        Ok(s) if !s.is_empty() => format!("{require} {s}"),
+        _ => require,
+    };
+    Ok((manifest, options))
+}
+
+#[cfg(test)]
+mod turbo_loader_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    #[test]
+    fn preload_injects_per_package_environment_and_framework_argv_only_into_framework() {
+        let dir = std::env::temp_dir().join(format!("porch-turbo-config-{}", std::process::id()));
+        let app = dir.join("apps/web");
+        let state = dir.join("isolated-state with spaces");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(
+            app.join("package.json"),
+            r#"{"scripts":{"dev":"vite dev"}}"#,
+        )
+        .unwrap();
+        let record = app.join("vite.js");
+        fs::write(&record,"console.log(JSON.stringify({port:process.env.PORT,url:process.env.PORTLESS_URL,args:process.argv.slice(2)}))").unwrap();
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            app.clone(),
+            BTreeMap::from([
+                ("PORT".into(), "4567".into()),
+                ("PORTLESS_URL".into(), "https://web.localhost".into()),
+                ("_PORCH_COMMAND".into(), r#"["npm","run","dev"]"#.into()),
+            ]),
+        );
+        let (_, options) = write_turbo_manifest_at(&state, &entries).unwrap();
+        let result = Command::new("node")
+            .arg(&record)
+            .arg("dev")
+            .current_dir(&app)
+            .env("NODE_OPTIONS", &options)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let value: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(value["port"], "4567");
+        assert_eq!(value["url"], "https://web.localhost");
+        assert_eq!(
+            value["args"],
+            json!([
+                "dev",
+                "--port",
+                "4567",
+                "--strictPort",
+                "--host",
+                "127.0.0.1"
+            ])
+        );
+        let other = app.join("npm.js");
+        fs::copy(&record, &other).unwrap();
+        let result = Command::new("node")
+            .arg(&other)
+            .arg("run")
+            .arg("dev")
+            .current_dir(&app)
+            .env("NODE_OPTIONS", &options)
+            .output()
+            .unwrap();
+        let value: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(value["args"], json!(["run", "dev"]));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

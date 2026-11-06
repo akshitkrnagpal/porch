@@ -1,5 +1,6 @@
 //! Local CA and SNI certificates. This module never changes system trust.
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::{
     server::{ClientHello, ResolvesServerCert},
@@ -21,7 +22,10 @@ fn write_private(path: &Path, value: &str) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)?.write_all(value.as_bytes())?;
+    let mut file = options.open(path)?;
+    file.write_all(value.as_bytes())?;
+    file.sync_all()?;
+    crate::state::inherit_owner(path)?;
     Ok(())
 }
 fn certified(cert: &str, key: &str) -> Result<Arc<CertifiedKey>> {
@@ -43,7 +47,8 @@ impl LocalResolver {
         let ca_key = KeyPair::from_pem(&self.ca_key)?;
         let ca = CertificateParams::from_ca_cert_pem(&self.ca_pem)?.self_signed(&ca_key)?;
         let key = KeyPair::generate()?;
-        let params = CertificateParams::new(vec![name.to_owned()])?;
+        let mut params = CertificateParams::new(vec![name.to_owned()])?;
+        params.use_authority_key_identifier_extension = true;
         let cert = params.signed_by(&key, &ca, &ca_key)?;
         certified(
             &format!("{}{}", cert.pem(), self.ca_pem),
@@ -91,6 +96,16 @@ pub fn config(cert: Option<PathBuf>, key: Option<PathBuf>) -> Result<Arc<rustls:
         (None, None) => {
             let dir = crate::state::dir();
             fs::create_dir_all(&dir)?;
+            let mut options = fs::OpenOptions::new();
+            options.create(true).truncate(false).read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            let lock = options.open(dir.join("tls.lock"))?;
+            crate::state::inherit_owner(&dir.join("tls.lock"))?;
+            lock.lock_exclusive()?;
             let cert_path = dir.join("ca.pem");
             let key_path = dir.join("ca-key.pem");
             if !cert_path.exists() && !key_path.exists() {

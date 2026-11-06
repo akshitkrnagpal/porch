@@ -24,6 +24,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - run: cargo test --release --target ${{ matrix.target }} --all-targets
       - run: cargo build --release --target ${{ matrix.target }} --bin porch
       - uses: actions/upload-artifact@v4
