@@ -96,6 +96,34 @@ fn catalog_keeps_identity_stable_and_reports_local_only_routes_without_leaking_t
     let _ = fs::remove_dir_all(dir);
 }
 #[test]
+fn catalog_health_matches_porch_list() {
+    let dir = temp();
+    let m = machine(&dir).unwrap();
+    let up = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let up_port = up.local_addr().unwrap().port();
+    let down_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let route = |name: &str, port: u16| Route {
+        name: name.into(),
+        target: format!("http://127.0.0.1:{port}"),
+        pid: None,
+    };
+    let data = State {
+        routes: vec![route("web", up_port), route("db", down_port)],
+        ..Default::default()
+    };
+    write(&dir, "state.json", &serde_json::to_vec(&data).unwrap()).unwrap();
+    let apps = catalog(&dir, m, true).unwrap().apps;
+    // A listening app is healthy, not "status unknown" in the menu.
+    assert_eq!(apps[0].health, Health::Healthy);
+    assert_eq!(apps[1].health, Health::Unreachable);
+    drop(up);
+    let _ = fs::remove_dir_all(dir);
+}
+#[test]
 fn certificate_and_pin_persist() {
     let dir = temp();
     ensure_certificate(&dir, "127.0.0.1").unwrap();
