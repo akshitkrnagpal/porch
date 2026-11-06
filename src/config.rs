@@ -23,26 +23,42 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
 
 /// Missing configuration is an empty object. Invalid explicit files are errors.
 pub fn load(cwd: &Path) -> Result<Value> {
-    let path = cwd.join("portless.json");
-    match fs::read_to_string(&path) {
+    if let Some(config) = config_file(&cwd.join("porch.json"))? {
+        return Ok(config);
+    }
+    let package = read_json(&cwd.join("package.json"));
+    if let Some(config) = package.as_ref().and_then(|p| p.get("porch")) {
+        return package_settings(config.clone());
+    }
+    if let Some(config) = config_file(&cwd.join("portless.json"))? {
+        return Ok(config);
+    }
+    package_settings(
+        package
+            .and_then(|p| p.get("portless").cloned())
+            .unwrap_or(Value::Null),
+    )
+}
+
+fn package_settings(value: Value) -> Result<Value> {
+    let value = match value {
+        Value::String(s) if !s.trim().is_empty() => json!({"name":s.trim()}),
+        Value::String(_) | Value::Null => json!({}),
+        value => value,
+    };
+    validate_config(&value)?;
+    Ok(value)
+}
+
+fn config_file(path: &Path) -> Result<Option<Value>> {
+    match fs::read_to_string(path) {
         Ok(raw) => {
             let v = serde_json::from_str(&raw)
                 .with_context(|| format!("Invalid JSON in {}", path.display()))?;
             validate_config(&v)?;
-            Ok(v)
+            Ok(Some(v))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let v = read_json(&cwd.join("package.json"))
-                .and_then(|p| p.get("portless").cloned())
-                .unwrap_or(Value::Null);
-            let v = match v {
-                Value::String(s) if !s.trim().is_empty() => json!({"name":s.trim()}),
-                Value::String(_) | Value::Null => json!({}),
-                v => v,
-            };
-            validate_config(&v)?;
-            Ok(v)
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("Reading {}", path.display())),
     }
 }
@@ -562,14 +578,14 @@ pub fn effective_config(cwd: &Path) -> Result<Value> {
     let leaf = resolve_app_config(&leaf, cwd, cwd);
     let mut out = merge_config(&root_app, &leaf);
     // The package key is closest to the script, even when a root apps entry exists.
-    if let Some(pkg) = read_json(&cwd.join("package.json")).and_then(|v| v.get("portless").cloned())
-    {
-        let pkg = match pkg {
-            Value::String(s) if !s.trim().is_empty() => json!({"name":s.trim()}),
-            Value::String(_) | Value::Null => json!({}),
-            v => v,
-        };
-        validate_config(&pkg)?;
+    if let Some(pkg) = read_json(&cwd.join("package.json")).and_then(|v| {
+        v.get("porch").cloned().or_else(|| {
+            (!cwd.join("porch.json").exists())
+                .then(|| v.get("portless").cloned())
+                .flatten()
+        })
+    }) {
+        let pkg = package_settings(pkg)?;
         out = merge_config(&out, &resolve_app_config(&pkg, cwd, cwd));
     }
     validate_config(&out)?;

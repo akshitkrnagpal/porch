@@ -32,9 +32,32 @@ fn args(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }
 #[test]
+fn native_configuration_wins_and_legacy_remains_a_fallback() {
+    let f = Fixture::new();
+    f.write("package.json", json!({"portless":"legacy-package"}));
+    assert_eq!(load(&f.0).unwrap()["name"], "legacy-package");
+    f.write("portless.json", json!({"name":"legacy-file"}));
+    assert_eq!(load(&f.0).unwrap()["name"], "legacy-file");
+    f.write(
+        "package.json",
+        json!({"porch":"native-package", "portless":"legacy-package"}),
+    );
+    assert_eq!(effective_config(&f.0).unwrap()["name"], "native-package");
+    f.write(
+        "porch.json",
+        json!({"name":"native-file", "script":"start"}),
+    );
+    assert_eq!(load(&f.0).unwrap()["name"], "native-file");
+    f.write("package.json", json!({"portless":"legacy-package"}));
+    assert_eq!(effective_config(&f.0).unwrap()["name"], "native-file");
+    fs::write(f.0.join("porch.json"), "{").unwrap();
+    assert!(load(&f.0).unwrap_err().to_string().contains("porch.json"));
+}
+
+#[test]
 fn bare_launch_runs_selected_package_script_and_config_precedence() {
     let f = Fixture::new();
-    f.write("package.json",json!({"name":"@scope/site","scripts":{"dev":"vite","start":"node index.js"},"portless":{"name":"leaf","script":"start","appPort":4901}}));
+    f.write("package.json",json!({"name":"@scope/site","scripts":{"dev":"vite","start":"node index.js"},"porch":{"name":"leaf","script":"start","appPort":4901}}));
     let p = launch_plans(&f.0, None, None, None, Some("")).unwrap();
     assert_eq!(p.len(), 1);
     assert_eq!(p[0].name, "leaf");
@@ -58,12 +81,12 @@ fn workspace_launches_servers_and_build_tasks_with_leaf_overrides() {
         "package.json",
         json!({"workspaces":["apps/*","tools/*","!apps/excluded"],"packageManager":"pnpm@10.0.0"}),
     );
-    f.write("portless.json",json!({"apps":{"apps/api":{"name":"backend","appPort":4900}},"worktree":{"hostnameTemplate":"{worktree}-{name}"}}));
+    f.write("porch.json",json!({"apps":{"apps/api":{"name":"backend","appPort":4900}},"worktree":{"hostnameTemplate":"{worktree}-{name}"}}));
     f.write(
         "apps/web/package.json",
         json!({"name":"@org/web","scripts":{"dev":"vite"}}),
     );
-    f.write("apps/api/package.json",json!({"name":"@org/api","scripts":{"serve":"node server.js"},"portless":{"name":"leaf-api","script":"serve","appPort":4902}}));
+    f.write("apps/api/package.json",json!({"name":"@org/api","scripts":{"serve":"node server.js"},"porch":{"name":"leaf-api","script":"serve","appPort":4902}}));
     f.write(
         "apps/excluded/package.json",
         json!({"name":"@org/excluded","scripts":{"dev":"node x"}}),

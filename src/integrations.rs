@@ -1259,6 +1259,15 @@ pub async fn start_shares(port: u16, providers: &[String]) -> Result<ShareSessio
         )?;
         session.registry = Some(path);
     }
+    let porch_urls: Vec<_> = session
+        .urls
+        .iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("PORTLESS_")
+                .map(|suffix| (format!("PORCH_{suffix}"), value.clone()))
+        })
+        .collect();
+    session.urls.extend(porch_urls);
     Ok(session)
 }
 #[derive(Serialize, Deserialize)]

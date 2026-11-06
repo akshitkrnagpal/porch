@@ -4,7 +4,7 @@ serde_json = "1"
 sha2 = "0.10" (Portless-compatible SHA-256 DNS label suffix)
 serde_yaml = "0.9" (pnpm workspace packages)
 No test-only dependencies. Git executable is optional: filesystem fallback supports linked worktrees.
-load reads portless.json then package.json portless at cwd only; absence returns {}.
+load reads porch.json, package.json porch, then legacy portless.json/package.json portless at cwd only; absence returns {}.
 infer_name returns the unprefixed inferred project name. Call resolve_app_config,
 detect_worktree_prefix and apply_worktree_prefix to apply effective config/options.
 PORCH_PREFIX takes precedence over PORTLESS_PREFIX; an empty override disables prefixing.

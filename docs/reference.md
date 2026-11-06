@@ -1,6 +1,6 @@
 # Porch reference
 
-Compatibility baseline: [Portless `49586cfa566ffce8dcc4368f0b74fce560dced49`](https://github.com/vercel-labs/portless/tree/49586cfa566ffce8dcc4368f0b74fce560dced49), frozen on 2026-11-06. The executable is `porch`; configuration retains the `portless.json` filename and `package.json` `portless` key.
+Compatibility baseline: [Portless `49586cfa566ffce8dcc4368f0b74fce560dced49`](https://github.com/vercel-labs/portless/tree/49586cfa566ffce8dcc4368f0b74fce560dced49), frozen on 2026-11-06. The executable is `porch`; configuration uses `porch.json` and the `package.json` `porch` key. Legacy Portless names remain compatibility fallbacks.
 
 ## Launching apps
 
@@ -69,13 +69,13 @@ Aliases also accept HTTP/HTTPS upstream URLs. `remove`/`rm` and `routes` are add
 | `worktree.prefix` | `last-segment` (default) or `branch` |
 | `worktree.hostnameTemplate` | Template containing `{worktree}`, optionally `{name}` |
 
-A package's `portless` value can be a name string or app settings object. CLI selections take priority; leaf package settings override workspace app entries. Worktree fields merge from root to leaf. Long generated labels receive a stable hash suffix. Linked worktrees on feature branches get a prefix; the main checkout and default branches do not.
+A package's `porch` value can be a name string or app settings object. CLI selections take priority; leaf package settings override workspace app entries. Worktree fields merge from root to leaf. Long generated labels receive a stable hash suffix. Linked worktrees on feature branches get a prefix; the main checkout and default branches do not.
 
 Workspace discovery reads `pnpm-workspace.yaml` or array/object `package.json` workspaces and supports single-segment star patterns and exclusions. Unlisted apps infer `<package>.<project>` using the common npm scope, then root name/directory fallback. Known build-only commands such as `tsc` and `tsup` run as tasks without routes. Duplicate generated app names fail before launch.
 
 Package managers are resolved from `packageManager` and ancestor lockfiles: npm, pnpm, yarn, and bun. Package scripts execute through the package manager, preserving shell semantics and lifecycle hooks. Local and ancestor `node_modules/.bin` directories are added to PATH.
 
-With `turbo.json`/`turbo.jsonc`, Porch reserves package routes and runs the root task command once. A per-launch Node preload supplies each package's environment without replacing the Turbo graph. It also supplies required framework flags to Node framework CLIs. Package wrappers using `dev: porch` with `portless.script: dev:app` inherit the reserved environment and avoid a second route owner. Use `porch -- --filter=web` to pass arguments to the root Turbo runner. Setting `turbo: false` uses direct concurrent spawning.
+With `turbo.json`/`turbo.jsonc`, Porch reserves package routes and runs the root task command once. A per-launch Node preload supplies each package's environment without replacing the Turbo graph. It also supplies required framework flags to Node framework CLIs. Package wrappers using `dev: porch` with `porch.script: dev:app` inherit the reserved environment and avoid a second route owner. Use `porch -- --filter=web` to pass arguments to the root Turbo runner. Setting `turbo: false` uses direct concurrent spawning.
 
 Framework detection covers Vite, VitePress, VitePlus (`vp`), React Router, Rsbuild, Astro, Angular (`ng`), React Native, Expo, and Wrangler. It recognizes package runners and one level of package-script indirection. Existing port/host choices are preserved. Build/non-server commands receive no server flags. Compound scripts, trailing comments, and framework `--` boundaries are deliberately left to the package manager rather than appending flags to the wrong command. Expo in LAN mode receives neither an injected HOST variable nor a forced localhost host flag.
 
@@ -100,7 +100,7 @@ Public `PORCH_*` settings take precedence over the corresponding `PORTLESS_*` co
 
 `PORCH=0` or `PORTLESS=0` bypasses routing; `false` and `skip` are also accepted. The child keeps the normal package command and its inherited environment. It receives no newly allocated port or proxy URL.
 
-Child outputs include `PORT`, `HOST`, `PORTLESS_URL`, `PORCH_URL`, `NODE_EXTRA_CA_CERTS` for the generated CA, `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS` for configured domains, and provider variables `PORTLESS_TAILSCALE_URL`, `PORTLESS_NGROK_URL`, and `PORTLESS_CLOUDFLARE_URL`. The launcher records sharing URLs for list output. Expo LAN intentionally omits HOST. Internal active/manifest/authentication variables are implementation details, not configuration inputs.
+Child outputs include `PORT`, `HOST`, `PORCH_URL`, `NODE_EXTRA_CA_CERTS` for the generated CA, `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS` for configured domains, and provider variables `PORCH_TAILSCALE_URL`, `PORCH_NGROK_URL`, and `PORCH_CLOUDFLARE_URL`. The launcher records sharing URLs for list output. Expo LAN intentionally omits HOST. Internal active/manifest/authentication variables are implementation details, not configuration inputs.
 
 ## Host, service, sharing and Compose integration
 
@@ -132,3 +132,5 @@ cargo build --release
 ```
 
 CI definitions target Ubuntu, macOS, and Windows. A workflow definition is not evidence that those runners have passed; current local acceptance was performed on macOS. The manual artifact workflow builds native Linux x86_64, macOS ARM64, and Windows x86_64 binaries without creating a public GitHub Release, signing, or notarizing them.
+
+Configuration lookup prefers `porch.json`, then the package `porch` key, then `portless.json`, then the package `portless` key. A native package key can override app fields from the file, consistent with leaf package overrides. A malformed selected native configuration is an error, never a reason to fall back to legacy settings. Legacy child environment names are also emitted for migration.

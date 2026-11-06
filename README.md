@@ -26,9 +26,9 @@ PORCH_STATE_DIR=/tmp/my-porch porch api node server.js
 PORCH_STATE_DIR=/tmp/my-porch porch proxy stop
 ```
 
-Apps receive `PORT`, `HOST`, `PORTLESS_URL`, and `PORCH_URL`. Supported frameworks get their required port/host flags automatically. HTTPS children also receive `NODE_EXTRA_CA_CERTS` pointing at the local CA. Child arguments remain intact after the first command token or an explicit `--` separator.
+Apps receive `PORT`, `HOST`, and `PORCH_URL`. Supported frameworks get their required port/host flags automatically. HTTPS children also receive `NODE_EXTRA_CA_CERTS` pointing at the local CA. Child arguments remain intact after the first command token or an explicit `--` separator.
 
-Use `portless.json` or the `package.json` `portless` key for app configuration. Bare invocation at a workspace root runs discovered packages; Turbo projects retain their root task graph and receive per-package ports and URLs through a Node preload.
+Use `porch.json` or the `package.json` `porch` key for app configuration. Bare invocation at a workspace root runs discovered packages; Turbo projects retain their root task graph and receive per-package ports and URLs through a Node preload.
 
 ```json
 {
@@ -44,3 +44,5 @@ Porch supports multiple TLDs, strict or parent-wildcard routing, IPv4/IPv6 liste
 `trust`, `hosts`, `service`, and `clean` manage the corresponding OS resources when explicitly invoked. Automated tests use isolated state, temporary hosts files, and fake external CLIs. Real OS trust/startup installation, authenticated public tunnels, and physical LAN discovery still require platform/service verification; service definitions and command flows have been tested with fixtures; privileged installation remains unverified.
 
 Run `cargo test --all-targets` for acceptance coverage. The test suite uses Node.js/npm, Python 3, and Git for real child-process fixtures. No public release is published by the build workflow.
+
+Legacy `portless.json`, the `package.json` `portless` key, and `PORTLESS_*` variables remain compatibility fallbacks. Native Porch configuration takes precedence.

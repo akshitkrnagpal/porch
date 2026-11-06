@@ -1271,7 +1271,7 @@ async fn spawn_prepared(
         })?;
         eprintln!(
             "{} -> {}",
-            p.env.get("PORTLESS_URL").unwrap_or(&p.plan.name),
+            p.env.get("PORCH_URL").unwrap_or(&p.plan.name),
             p.port.unwrap()
         );
     }

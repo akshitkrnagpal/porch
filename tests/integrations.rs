@@ -352,6 +352,12 @@ else:
         "https://box.team.ts.net:8443"
     );
     assert_eq!(env["PORTLESS_NGROK_URL"], "https://demo.ngrok.app");
+    for provider in ["TAILSCALE", "NGROK", "CLOUDFLARE"] {
+        assert_eq!(
+            env[format!("PORCH_{provider}_URL")],
+            env[format!("PORTLESS_{provider}_URL")]
+        );
+    }
     assert_eq!(
         env["PORTLESS_CLOUDFLARE_URL"],
         "https://demo.trycloudflare.com"
