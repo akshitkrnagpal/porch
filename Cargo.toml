@@ -2,6 +2,13 @@
 name = "porch"
 version = "0.3.1"
 edition = "2021"
+description = "Stable named URLs for local dev servers, across your machines"
+license = "MIT"
+repository = "https://github.com/akshitkrnagpal/porch"
+homepage = "https://github.com/akshitkrnagpal/porch"
+readme = "README.md"
+keywords = ["dev-server", "proxy", "localhost", "monorepo", "tailscale"]
+categories = ["command-line-utilities", "development-tools", "web-programming"]
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

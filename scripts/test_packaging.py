@@ -86,6 +86,7 @@ class PackageTests(unittest.TestCase):
                 self.assertTrue(any(name.endswith('/porch-login') for name in names))
                 self.assertTrue(any(name.endswith('/install.py') for name in names))
                 self.assertTrue(any(name.endswith('/README.md') for name in names))
+                self.assertTrue(any(name.endswith('/LICENSE') for name in names))
             self.assertTrue((output / 'Porch.app/Contents/Info.plist').exists())
 
     def test_install_from_archive_into_isolated_prefix(self):

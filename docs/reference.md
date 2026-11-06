@@ -171,7 +171,7 @@ cargo test --all-targets
 cargo build --release
 ```
 
-CI definitions target Ubuntu and macOS; Windows is deferred. A workflow definition is not evidence that those runners have passed; current local acceptance was performed on macOS. The manual artifact workflow builds native Linux x86_64 and macOS ARM64 binaries and optional native desktop packages without creating a public GitHub Release, signing, or notarizing them.
+CI runs these on native Ubuntu x86_64 and macOS ARM64 runners; Windows is deferred. Pushing a `v*` tag builds release archives (CLI, tray, and `Porch.app` on macOS), publishes them on GitHub Releases with `SHA256SUMS`, and updates the Homebrew formula when the `HOMEBREW_TAP_TOKEN` secret is set. Archives are not signed or notarized.
 
 Configuration lookup prefers `porch.json`, then the package `porch` key, then `portless.json`, then the package `portless` key. A native package key can override app fields from the file, consistent with leaf package overrides. A malformed selected native configuration is an error, never a reason to fall back to legacy settings. Legacy child environment names are also emitted for migration.
 
@@ -183,7 +183,7 @@ Automatic TLS issuance accepts configured TLDs, registered route names, and `.lo
 Automatic hosts updates use the daemon's recorded write capability to avoid requesting writes from an incapable proxy. Custom-domain permission errors retain setup guidance; authentication failures remain separate 403 responses, while write failures return 409. Browser `.localhost` resolution needs no hosts entries, so failure yields one hint per state directory. Other clients may still require explicit `sudo porch hosts sync`. The loopback challenge/proof, token and Origin protections apply unchanged.
 
 
-## Desktop and discovery (0.2)
+## Desktop and discovery
 
 `porch pair` shows a 6-digit code (starting the discovery agent and app sharing on an automatically chosen private interface, port 7463); `porch pair CODE [--host NAME-OR-IP]` on another machine pairs both machines with each other. `[--bind IP] [--port PORT] [--no-wait] [--json]` are for scripts. `porch unpair MACHINE` forgets a machine on both sides. Paired apps open at `http://APP.MACHINE.localhost:PROXY_PORT` through the local proxy. `porch tray` launches the optional `porch-tray` companion. The CLI remains headless with no desktop runtime dependencies. `porch list --all [--json]` and `porch peers [list|refresh] [--json]` return the shared versioned local/remote catalog. Advanced: `porch peers add ENDPOINT --fingerprint SHA256 [--token-file PATH]` enrolls using a one-time token on stdin or a private file; `peers trust` aliases Add. `peers remove ID` forgets local trust. `porch open APP [--peer ID] [--url-only]` and `porch copy APP [--peer ID]` use supported state; remote apps use readable URLs served by the local proxy.
 
