@@ -11,7 +11,7 @@ Run `cargo test --all-targets`. Tests use unique temporary state and loopback li
 | `network.rs` | Actual IPv4/IPv6 sockets, HTTP/HTTPS/h2, generated CA verification, WS/WSS, extended CONNECT WebSocket frames, delayed streamed events, routing/TLD/wildcard/alias semantics, redirects, structured errors, recursive loop detection, authenticated hosts sync |
 | `integrations.rs` | Fake Docker Compose model and published-port reconciliation, project scoping, all three OS service definitions, temporary hosts safety, Tailscale/ngrok/Cloudflare readiness/URL/process ownership, recorded trust installation/removal |
 
-See [the remediation record](../docs/remediation-2026-11-06.md) for current integrated results. Unit tests additionally exercise configuration validation, hostname truncation, routing scores, headers/errors, TLS PEM/certificate issuance, host authentication proofs, service serialization, and MCP framing/profiles/arguments.
+Unit tests additionally exercise configuration validation, hostname truncation, routing scores, headers/errors, TLS PEM/certificate issuance, host authentication proofs, service serialization, and MCP framing/profiles/arguments.
 
 External integration tests place fake executables on an isolated PATH and point hosts/service/trust paths at temporary fixtures. These tests inspect generated arguments/files and owned subprocess cleanup; they do not assert that a real OS administrator operation, Docker Engine, provider account, or remote machine accepted the operation.
 

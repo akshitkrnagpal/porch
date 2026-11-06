@@ -58,9 +58,10 @@ def main():
         for script in ['install.py', 'porch-login']:
             shutil.copy2(ROOT / 'scripts' / script, package / script)
         shutil.copy2(ROOT / 'packaging/README.md', package / 'README.md')
+        shutil.copy2(ROOT / 'LICENSE', package / 'LICENSE')
         shutil.copytree(ROOT / 'packaging', package / 'packaging')
         (package / 'docs').mkdir()
-        for document in ['discovery.md', 'discovery-verification.md', 'reference.md']:
+        for document in ['discovery.md', 'reference.md']:
             source = ROOT / 'docs' / document
             if source.exists():
                 shutil.copy2(source, package / 'docs' / document)

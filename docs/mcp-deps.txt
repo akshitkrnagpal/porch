@@ -1,5 +1,0 @@
-anyhow = "1"
-serde_json = "1"
-tokio = { version = "1", features = ["io-std", "io-util", "process", "time", "macros", "rt-multi-thread"] }
-
-MCP uses crate::state::load() per INTERFACES.md and current_exe() for CLI tools.
