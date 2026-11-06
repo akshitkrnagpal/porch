@@ -1,6 +1,6 @@
 # Porch
 
-All your dev apps, across your machines, one click away. Porch gives local development servers stable names such as `https://web.localhost`, assigns free app ports, and manages the shared reverse proxy and child processes. It is a standalone Rust CLI inspired by the [Portless](https://github.com/vercel-labs/portless) development workflow.
+All your dev apps, across your machines, one click away. Porch gives local development servers stable names such as `http://web.localhost:7462`, assigns free app ports, and manages the shared reverse proxy and child processes. It is a standalone Rust CLI inspired by the [Portless](https://github.com/vercel-labs/portless) development workflow.
 
 Porch is under active development; full Portless parity and daily-use readiness are not yet established. The [original independent review](docs/reviews/opus-2026-11-06.md) is preserved alongside the [remediation evidence](docs/remediation-2026-11-06.md).
 
@@ -35,20 +35,26 @@ Cutting a release (maintainers): bump `version` in `Cargo.toml`, commit, then pu
 ```sh
 cargo build --release
 export PATH="$PWD/target/release:$PATH"
+porch setup                   # optional first run: port, HTTPS opt-in, login start, sharing
 porch                         # runs the package's dev script; starts the proxy
-porch run next dev            # infers the app name
-porch api node server.js      # https://api.localhost
+porch run pnpm dev            # infers the app name
+porch api node server.js      # http://api.localhost:7462
 porch get api                 # prints the browser-facing URL
-porch list --json
+porch list                    # routes with a health column
+porch doctor --fix            # find and fix common problems
 ```
 
-The default proxy uses HTTPS on port 443. When binding requires privileges, terminal sessions prompt with sudo; unattended sessions need cached authorization or explicit setup/high-port options. Porch never silently changes the requested port or security mode. For an isolated, unprivileged high-port setup:
+The default proxy is plain HTTP on port 7462: no sudo, no `/etc/hosts` edits (browsers resolve `*.localhost` natively). Port and privilege mode are one choice: any port ≥1024 runs without sudo or hosts sync unless you explicitly set `PORCH_SYNC_HOSTS=1`. HTTPS on port 443 is an explicit opt-in (`porch setup` or `porch proxy start --https`); it asks for sudo once and trusts a local CA.
+
+If the proxy port is busy, Porch names the owner (for example `port 7462 is used by tailscaled (pid 123)`). A default or saved port moves to the next free port (7464, …; 7463 is reserved for discovery) and is saved, with one line saying so. A port you pass explicitly (`--port` or `PORCH_PORT`) never moves; Porch fails with the owner and a command to run.
+
+After a launch, Porch waits up to 15 seconds (`PORCH_LISTEN_TIMEOUT`, `0` disables) for the app to accept connections on its assigned `PORT`. If nothing does, it prints a warning, naming the port the app's processes listen on instead when it can, and leaves the app running. Routes whose process has exited are removed automatically. Launches frozen by job control show as `stopped`. A newer `porch` binary restarts an older running proxy, keeping routes.
+
+For an isolated experiment that never touches your real state:
 
 ```sh
-PORCH_STATE_DIR=/tmp/my-porch PORCH_SYNC_HOSTS=0 \
-  porch proxy start --unprivileged --port 1355 --no-tls
-PORCH_STATE_DIR=/tmp/my-porch porch api node server.js
-# http://api.localhost:1355
+PORCH_STATE_DIR=/tmp/my-porch PORCH_SYNC_HOSTS=0 porch api node server.js
+# http://api.localhost:7462 (or the next free port, printed on start)
 PORCH_STATE_DIR=/tmp/my-porch porch proxy stop
 ```
 
