@@ -2,7 +2,11 @@
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const DEFAULT_PORT: u16 = 1356;
+/// Discovery agent port. The app proxy uses 7462; the agent sits beside it.
+pub const DEFAULT_PORT: u16 = 7463;
+/// A pairing code is valid for five minutes and at most five wrong guesses.
+pub const PAIR_CODE_LIFETIME: u64 = 300;
+pub const PAIR_CODE_MAX_FAILURES: u32 = 5;
 pub const SERVICE_TYPE: &str = "_porch._tcp.local.";
 pub const MAX_BODY: usize = 1024 * 1024;
 
@@ -64,10 +68,15 @@ pub struct Peer {
     pub token: String,
     pub sources: Vec<Source>,
     pub last_seen: u64,
+    /// Stable, unique hostname label used in `APP.SLUG.localhost` browser URLs.
+    #[serde(default)]
+    pub slug: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerCatalog {
     pub machine: Machine,
+    #[serde(default)]
+    pub slug: String,
     pub endpoint: String,
     pub sources: Vec<Source>,
     pub last_seen: u64,
@@ -98,5 +107,24 @@ pub struct PairRequest {
 pub struct PairResponse {
     pub version: u32,
     pub machine: Machine,
+    pub token: String,
+}
+/// Unauthenticated probe: is this agent currently showing a pairing code?
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairingStatus {
+    pub version: u32,
+    pub open: bool,
+}
+/// Code pairing is mutual: the joining machine sends the credentials the host
+/// needs to reach it back, bound to the certificate it observed (TOFU).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairCodeRequest {
+    pub version: u32,
+    pub code: String,
+    /// SHA-256 of the host certificate as seen by the joiner.
+    pub host_fingerprint: String,
+    pub machine: Machine,
+    pub endpoint: String,
+    pub fingerprint: String,
     pub token: String,
 }

@@ -50,3 +50,25 @@ Observed native results for implementation commit `5ed3d7ac31e5c38b0543094061cef
 - [Private build artifacts: both architectures passed](https://github.com/akshitkrnagpal/porch/actions/runs/42175939494): release-profile full regression suite, CLI/tray binaries and installable archives for `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`. Artifact names are `porch-aarch64-apple-darwin` and `porch-x86_64-unknown-linux-gnu`. No PR or public release was created.
 
 The follow-up documentation commit records this evidence and clarifies that revocation applies to subsequent requests; Disable closes existing transports. It does not change executable code.
+
+## Code pairing and readable URLs — 2026-11-06
+
+Branch `simple-pairing`. Discovery agent default port 7463. `porch pair` / `porch pair CODE` replace the fingerprint + token + `peers add` flow as the main path. Remote apps open at `http://APP.MACHINE.localhost:PROXY_PORT` through the local proxy's loopback gateway.
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo clippy --features tray --all-targets -- -D warnings
+cargo test --no-fail-fast --all-targets
+cargo test --features tray --lib tray
+```
+
+All passed on macOS ARM64. In one earlier full run, two timing-sensitive tests outside discovery failed under load: `tests/cli.rs::global_reserved_name_bypass_and_unregistered_get_work` and `tests/integrations.rs::stalled_external_helper_has_bounded_lifetime`. Both passed when run alone, and the next full run passed completely.
+
+New evidence:
+
+- `tests/discovery.rs` uses the real CLI, two isolated state dirs and loopback agents. One wrong code is rejected. The right code pairs both machines in one exchange, and the waiting host prints `Paired with node-a`. Each machine opens the other's app at `http://web.<peer>.localhost:<own proxy port>`. A WebSocket passes through A's proxy, the gateway and B's agent to B's app. An unknown app under a paired name returns 404. The URL is unchanged and still works after a proxy restart. `porch unpair` removes the pairing on both sides. A separate test shows that five wrong codes end the host's wait with an error, and the right code is then refused.
+- Server tests cover the window directly and over real TLS: single use, the code is never stored in clear, re-pairing replaces the old credential, revocation by machine works, five-failure lockout, expiry (the 5-minute lifetime is exercised with a zero-lifetime window), the `/v1/pairing` probe, rejection when the certificate fingerprint does not match (interception), the per-source 429 limit, and the host storing the joiner's credentials.
+- Client, gateway and tray unit tests cover slug uniqueness and stability, host splitting (including rebinding names), and the tray's **Pair a device…** action and code notice.
+
+Not verified: two physical machines over a real tailnet or LAN, mDNS-based candidate discovery during `porch pair CODE` without `--host`, and automatic interface selection (`auto_bind`) on real Tailscale/LAN interfaces. Tests pass `--bind 127.0.0.1` and `--host`, and never invoke `tailscale`. Rendered tray menu interaction was also not observed.

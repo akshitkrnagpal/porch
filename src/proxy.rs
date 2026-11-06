@@ -415,7 +415,14 @@ async fn forward(
                 .max_by_key(|(score, _)| *score)
                 .map(|(_, r)| r)
         });
-    let Some(route) = route else {
+    // Paired machines: APP.MACHINE.<tld> is served by the discovery gateway.
+    let remote = route
+        .is_none()
+        .then(|| {
+            crate::discovery::gateway::target(&hostname, peer.ip().is_loopback(), &settings.tlds)
+        })
+        .flatten();
+    let Some(target) = route.map(|r| r.target.clone()).or(remote) else {
         let local_name = settings
             .tlds
             .iter()
@@ -464,10 +471,10 @@ async fn forward(
         }
         return Ok(response);
     };
-    let target = if route.target.contains("://") {
-        route.target.clone()
+    let target = if target.contains("://") {
+        target
     } else {
-        format!("http://{}", route.target)
+        format!("http://{target}")
     };
     let target = match target.parse::<hyper::Uri>() {
         Ok(u) if u.authority().is_some() => u,
@@ -846,6 +853,7 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
             redirect_only,
         ));
     }
+    crate::discovery::gateway::start(settings.tlds.clone());
     crate::state::atomic_write("proxy.ready", std::process::id().to_string().as_bytes())?;
     if settings.lan {
         let settings = (*settings).clone();

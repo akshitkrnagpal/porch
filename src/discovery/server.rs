@@ -13,13 +13,14 @@ use hyper_util::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
     convert::Infallible,
     fs::{self, OpenOptions},
     io::Write,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -29,6 +30,8 @@ const MAX_CLIENTS: usize = 64;
 const MAX_ROUTES: usize = 512;
 const MAX_UPLOAD: usize = 16 * 1024 * 1024;
 const PAIR_LIFETIME: u64 = 600;
+/// Pairing attempts allowed per source address per minute (code and token).
+const PAIR_RATE_LIMIT: usize = 10;
 
 pub fn now() -> u64 {
     SystemTime::now()
@@ -36,10 +39,10 @@ pub fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|v| format!("{v:02x}")).collect()
 }
-fn random() -> Result<String> {
+pub(super) fn random() -> Result<String> {
     let mut value = [0u8; 32];
     getrandom::fill(&mut value).map_err(|e| anyhow::anyhow!("secure random generation: {e}"))?;
     Ok(hex(&value))
@@ -47,7 +50,7 @@ fn random() -> Result<String> {
 fn digest(value: &str) -> String {
     hex(&Sha256::digest(value.as_bytes()))
 }
-fn equal(a: &str, b: &str) -> bool {
+pub(super) fn equal(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |n, (x, y)| n | (x ^ y)) == 0
 }
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -65,7 +68,7 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     }
 }
 /// Private atomic files do not reuse proxy lifecycle state or modify trust stores.
-fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+pub(super) fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     if fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
         bail!("discovery state directory cannot be a symlink")
     }
@@ -90,7 +93,7 @@ fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
-fn lock(dir: &Path) -> Result<fs::File> {
+pub(super) fn lock(dir: &Path) -> Result<fs::File> {
     // Preparing the directory through an atomic marker ensures private permissions.
     write(dir, "discovery-format", b"1\n")?;
     let mut options = OpenOptions::new();
@@ -109,6 +112,28 @@ struct Auth {
     invitation: Option<Invitation>,
     #[serde(default)]
     clients: Vec<String>,
+    /// Bearer digest -> machine ID for clients enrolled through code pairing, so
+    /// `porch unpair` can revoke exactly one machine.
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pairing: Option<PairingWindow>,
+    #[serde(default)]
+    pairing_result: Option<PairingResult>,
+}
+#[derive(Serialize, Deserialize)]
+struct PairingWindow {
+    id: String,
+    /// SHA-256 of `id \0 code`; the code itself is never written to disk.
+    hash: String,
+    expires: u64,
+    failures: u32,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct PairingResult {
+    id: String,
+    paired: Option<String>,
+    error: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Invitation {
@@ -184,6 +209,93 @@ pub fn configure(value: ServerConfig) -> Result<()> {
 pub fn config() -> Result<Option<ServerConfig>> {
     read(&state::dir().join("discovery-config.json"))
 }
+/// Pairing is consent to share apps; the running agent reads this per request.
+pub fn set_share_apps(share: bool) -> Result<()> {
+    let mut value = config()?.context("discovery is disabled")?;
+    if value.share_apps != share {
+        value.share_apps = share;
+        write(
+            &state::dir(),
+            "discovery-config.json",
+            &serde_json::to_vec_pretty(&value)?,
+        )?;
+    }
+    Ok(())
+}
+fn private_v4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_private() && !ip.is_loopback()
+}
+fn tailnet_v4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 100 && (64..=127).contains(&b)
+}
+#[cfg(unix)]
+fn interface_addresses() -> Vec<std::net::Ipv4Addr> {
+    let mut out = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs allocates a list we walk read-only and free exactly once.
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return out;
+        }
+        let mut cursor = list;
+        while !cursor.is_null() {
+            let entry = &*cursor;
+            if !entry.ifa_addr.is_null()
+                && i32::from((*entry.ifa_addr).sa_family) == libc::AF_INET
+                && entry.ifa_flags & (libc::IFF_UP as libc::c_uint) != 0
+            {
+                let addr = &*(entry.ifa_addr as *const libc::sockaddr_in);
+                out.push(std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)));
+            }
+            cursor = entry.ifa_next;
+        }
+        libc::freeifaddrs(list);
+    }
+    out
+}
+#[cfg(not(unix))]
+fn interface_addresses() -> Vec<std::net::Ipv4Addr> {
+    vec![]
+}
+/// The local source address the OS would use to reach `target`. A UDP connect
+/// selects a route without sending any packet.
+fn route_source(target: IpAddr) -> Option<IpAddr> {
+    let socket = std::net::UdpSocket::bind(if target.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .ok()?;
+    socket.connect(SocketAddr::new(target, 9)).ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
+/// Choose the private interface to share on: the one that reaches `peer` when
+/// known, otherwise the Tailscale 100.x address, otherwise the primary private
+/// LAN address. Public and wildcard addresses are never chosen.
+pub fn auto_bind(peer: Option<IpAddr>) -> Result<IpAddr> {
+    if let Some(peer) = peer {
+        if peer.is_loopback() {
+            return Ok(peer);
+        }
+        if let Some(ip) = route_source(peer).filter(|ip| validate_bind(&ip.to_string()).is_ok()) {
+            return Ok(ip);
+        }
+    }
+    let all = interface_addresses();
+    if let Some(ip) = all.iter().find(|ip| tailnet_v4(**ip)) {
+        return Ok(IpAddr::V4(*ip));
+    }
+    if let Some(IpAddr::V4(ip)) = route_source(IpAddr::from([1, 1, 1, 1])) {
+        if private_v4(ip) {
+            return Ok(IpAddr::V4(ip));
+        }
+    }
+    if let Some(ip) = all.iter().find(|ip| private_v4(**ip)) {
+        return Ok(IpAddr::V4(*ip));
+    }
+    bail!("no private LAN or Tailscale address found; connect to a network or pass --bind IP")
+}
 pub fn disable() -> Result<()> {
     match fs::remove_file(state::dir().join("discovery-config.json")) {
         Ok(()) => Ok(()),
@@ -219,12 +331,213 @@ pub fn fingerprint() -> Result<String> {
         .context("discovery is disabled; enable it with an explicit bind first")?
         .bind;
     ensure_certificate(&state::dir(), &bind)?;
-    let cert = cert_der(&state::dir())?;
+    fingerprint_in(&state::dir())
+}
+fn fingerprint_in(dir: &Path) -> Result<String> {
+    let cert = cert_der(dir)?;
     Ok(hex(&Sha256::digest(
         cert.first()
             .context("missing discovery certificate")?
             .as_ref(),
     )))
+}
+pub struct PairingCode {
+    pub id: String,
+    pub code: String,
+    pub expires: u64,
+}
+fn six_digits() -> Result<String> {
+    // Rejection sampling keeps every code equally likely.
+    loop {
+        let mut bytes = [0u8; 4];
+        getrandom::fill(&mut bytes)
+            .map_err(|e| anyhow::anyhow!("secure random generation: {e}"))?;
+        let value = u32::from_le_bytes(bytes);
+        if value < u32::MAX - (u32::MAX % 1_000_000) {
+            return Ok(format!("{:06}", value % 1_000_000));
+        }
+    }
+}
+/// Open (or replace) the single pairing window and return its one-time code.
+pub fn open_pairing() -> Result<PairingCode> {
+    config()?.context("discovery is disabled")?;
+    open_pairing_in(&state::dir(), PAIR_CODE_LIFETIME)
+}
+fn open_pairing_in(dir: &Path, lifetime: u64) -> Result<PairingCode> {
+    let _lock = lock(dir)?;
+    let id = random()?;
+    let code = six_digits()?;
+    let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    let expires = now() + lifetime;
+    auth.pairing = Some(PairingWindow {
+        hash: digest(&format!("{id}\0{code}")),
+        id: id.clone(),
+        expires,
+        failures: 0,
+    });
+    write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
+    Ok(PairingCode { id, code, expires })
+}
+pub enum PairingProgress {
+    Waiting,
+    Paired(String),
+    Closed(String),
+}
+/// What happened to a pairing window opened by this process.
+pub fn pairing_progress(id: &str) -> Result<PairingProgress> {
+    pairing_progress_in(&state::dir(), id)
+}
+fn pairing_progress_in(dir: &Path, id: &str) -> Result<PairingProgress> {
+    let auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    if let Some(result) = auth.pairing_result.filter(|r| r.id == id) {
+        return Ok(match (result.paired, result.error) {
+            (Some(name), _) => PairingProgress::Paired(name),
+            (None, error) => {
+                PairingProgress::Closed(error.unwrap_or_else(|| "pairing window closed".into()))
+            }
+        });
+    }
+    match auth.pairing {
+        Some(w) if w.id == id && w.expires > now() => Ok(PairingProgress::Waiting),
+        Some(w) if w.id == id => Ok(PairingProgress::Closed(
+            "pairing code expired; run porch pair again".into(),
+        )),
+        _ => Ok(PairingProgress::Closed(
+            "pairing window was replaced or revoked".into(),
+        )),
+    }
+}
+/// Close the window (Ctrl-C). Harmless if it already closed.
+pub fn close_pairing(id: &str) -> Result<()> {
+    let dir = state::dir();
+    let _lock = lock(&dir)?;
+    let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    if auth.pairing.as_ref().is_some_and(|w| w.id == id) {
+        auth.pairing = None;
+        write(&dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
+    }
+    Ok(())
+}
+fn pairing_open(dir: &Path) -> bool {
+    read::<Auth>(&dir.join("discovery-auth.json"))
+        .ok()
+        .flatten()
+        .and_then(|a| a.pairing)
+        .is_some_and(|w| w.expires > now() && w.failures < PAIR_CODE_MAX_FAILURES)
+}
+enum CodeOutcome {
+    Accepted(String),
+    Wrong,
+    Closed,
+}
+/// Check a code in constant time. Five wrong guesses or expiry close the window;
+/// success consumes it and enrolls a new bearer labelled with the peer's machine ID.
+fn try_code(dir: &Path, code: &str, peer: &Machine) -> Result<CodeOutcome> {
+    let _lock = lock(dir)?;
+    let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    let Some(window) = auth.pairing.as_mut() else {
+        return Ok(CodeOutcome::Closed);
+    };
+    if window.expires <= now() || window.failures >= PAIR_CODE_MAX_FAILURES {
+        let id = window.id.clone();
+        auth.pairing = None;
+        auth.pairing_result = Some(PairingResult {
+            id,
+            paired: None,
+            error: Some("pairing code expired; run porch pair again".into()),
+        });
+        write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
+        return Ok(CodeOutcome::Closed);
+    }
+    let candidate = digest(&format!("{}\0{code}", window.id));
+    if !equal(&candidate, &window.hash) {
+        window.failures += 1;
+        if window.failures >= PAIR_CODE_MAX_FAILURES {
+            let id = window.id.clone();
+            auth.pairing = None;
+            auth.pairing_result = Some(PairingResult {
+                id,
+                paired: None,
+                error: Some(
+                    "too many wrong pairing codes; the code was cancelled. Run porch pair again"
+                        .into(),
+                ),
+            });
+        }
+        write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
+        return Ok(CodeOutcome::Wrong);
+    }
+    let id = window.id.clone();
+    // Re-pairing replaces this machine's previous credential.
+    let stale: Vec<String> = auth
+        .labels
+        .iter()
+        .filter(|(_, m)| **m == peer.id)
+        .map(|(d, _)| d.clone())
+        .collect();
+    auth.clients.retain(|c| !stale.contains(c));
+    auth.labels.retain(|d, _| !stale.contains(d));
+    if auth.clients.len() >= MAX_CLIENTS {
+        bail!("client enrollment limit reached; revoke old clients locally")
+    }
+    let bearer = random()?;
+    auth.clients.push(digest(&bearer));
+    auth.labels.insert(digest(&bearer), peer.id.clone());
+    auth.pairing = None;
+    auth.pairing_result = Some(PairingResult {
+        id,
+        paired: Some(peer.name.clone()),
+        error: None,
+    });
+    write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
+    Ok(CodeOutcome::Accepted(bearer))
+}
+/// Joining side: issue a credential the host will use to reach this machine.
+pub fn mint_client(label: &str) -> Result<String> {
+    let dir = state::dir();
+    let _lock = lock(&dir)?;
+    let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    if auth.clients.len() >= MAX_CLIENTS {
+        bail!("client enrollment limit reached; revoke old clients locally")
+    }
+    let bearer = random()?;
+    auth.clients.push(digest(&bearer));
+    auth.labels.insert(digest(&bearer), label.into());
+    write(&dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
+    Ok(bearer)
+}
+/// Bind a minted credential to the machine that accepted it, replacing older ones.
+pub fn label_client(bearer: &str, machine_id: &str) -> Result<()> {
+    let dir = state::dir();
+    let _lock = lock(&dir)?;
+    let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    let own = digest(bearer);
+    let stale: Vec<String> = auth
+        .labels
+        .iter()
+        .filter(|(d, m)| **m == machine_id && **d != own)
+        .map(|(d, _)| d.clone())
+        .collect();
+    auth.clients.retain(|c| !stale.contains(c));
+    auth.labels.retain(|d, _| !stale.contains(d));
+    auth.labels.insert(own, machine_id.into());
+    write(&dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)
+}
+pub fn revoke_bearer(bearer: &str) -> Result<()> {
+    revoke_where(&state::dir(), |d, _| d == digest(bearer))
+}
+/// Revoke every credential this machine issued to `machine_id`.
+pub fn revoke_machine(machine_id: &str) -> Result<()> {
+    revoke_where(&state::dir(), |_, m| m == Some(machine_id))
+}
+fn revoke_where(dir: &Path, f: impl Fn(&str, Option<&str>) -> bool) -> Result<()> {
+    let _lock = lock(dir)?;
+    let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    let labels = auth.labels.clone();
+    auth.clients
+        .retain(|d| !f(d, labels.get(d).map(String::as_str)));
+    auth.labels.retain(|d, m| !f(d, Some(m)));
+    write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)
 }
 pub fn create_pairing_token() -> Result<String> {
     config()?.context("discovery is disabled")?;
@@ -422,16 +735,146 @@ fn strip(headers: &mut header::HeaderMap) {
 struct ContextState {
     dir: PathBuf,
     machine: Machine,
+    /// Used when no config file exists (tests); the config file wins so that
+    /// `porch pair` can turn sharing on without restarting the agent.
     share_apps: bool,
     client: Upstream,
     tunnels: Arc<tokio::sync::Semaphore>,
+    attempts: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
 }
-async fn request(mut req: Request<Incoming>, context: Arc<ContextState>) -> Result<Response<Body>> {
+impl ContextState {
+    fn sharing(&self) -> bool {
+        read::<ServerConfig>(&self.dir.join("discovery-config.json"))
+            .ok()
+            .flatten()
+            .map_or(self.share_apps, |c| c.share_apps)
+    }
+    /// Per-source pairing rate limit, independent of the per-window failure cap.
+    fn allow_attempt(&self, source: IpAddr) -> bool {
+        let Ok(mut all) = self.attempts.lock() else {
+            return false;
+        };
+        let cutoff = Instant::now() - Duration::from_secs(60);
+        all.retain(|_, v| {
+            v.retain(|t| *t > cutoff);
+            !v.is_empty()
+        });
+        if all.len() > 4096 {
+            return false;
+        }
+        let entry = all.entry(source).or_default();
+        if entry.len() >= PAIR_RATE_LIMIT {
+            return false;
+        }
+        entry.push_back(Instant::now());
+        true
+    }
+}
+async fn small_body<T: serde::de::DeserializeOwned>(
+    req: Request<Incoming>,
+    limit: usize,
+) -> Option<T> {
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        Limited::new(req.into_body(), limit).collect(),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .to_bytes();
+    serde_json::from_slice(&body).ok()
+}
+fn valid_secret(token: &str) -> bool {
+    (32..=512).contains(&token.len())
+        && token
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+}
+async fn pair_code(req: Request<Incoming>, context: &ContextState) -> Result<Response<Body>> {
+    let Some(input) = small_body::<PairCodeRequest>(req, 4096).await else {
+        return Ok(response(StatusCode::BAD_REQUEST, "invalid pairing request"));
+    };
+    let code_ok = input.code.len() == 6 && input.code.bytes().all(|b| b.is_ascii_digit());
+    let peer_ok = input.version == PROTOCOL_VERSION
+        && super::client::validate_machine(&input.machine).is_ok()
+        && input.machine.id != context.machine.id
+        && super::client::validate_endpoint(&input.endpoint).is_ok()
+        && super::client::normalize_pin(&input.fingerprint).is_ok()
+        && valid_secret(&input.token);
+    if !code_ok || !peer_ok {
+        return Ok(response(StatusCode::BAD_REQUEST, "invalid pairing request"));
+    }
+    // The joiner binds the code to the certificate it pinned. A TLS-terminating
+    // interceptor relaying the request presents a different certificate.
+    let own = fingerprint_in(&context.dir)?;
+    let seen = super::client::normalize_pin(&input.host_fingerprint)
+        .map(|p| super::client::hex_pin(&p))
+        .unwrap_or_default();
+    if !equal(&own, &seen) {
+        return Ok(response(
+            StatusCode::CONFLICT,
+            "certificate mismatch; the pairing connection was intercepted",
+        ));
+    }
+    match try_code(&context.dir, &input.code, &input.machine)? {
+        CodeOutcome::Closed => Ok(response(
+            StatusCode::GONE,
+            "this machine is not waiting to pair; run porch pair on it",
+        )),
+        CodeOutcome::Wrong => Ok(response(StatusCode::UNAUTHORIZED, "wrong pairing code")),
+        CodeOutcome::Accepted(token) => {
+            let peer = Peer {
+                machine: input.machine,
+                endpoint: input.endpoint,
+                fingerprint: super::client::hex_pin(&super::client::normalize_pin(
+                    &input.fingerprint,
+                )?),
+                token: input.token,
+                sources: vec![Source::Explicit],
+                last_seen: now(),
+                slug: String::new(),
+            };
+            if super::client::upsert_peer_in(&context.dir, peer).is_err() {
+                revoke_where(&context.dir, |d, _| d == digest(&token))?;
+                return Ok(response(
+                    StatusCode::CONFLICT,
+                    "cannot store the pairing machine; remove an unused peer and retry",
+                ));
+            }
+            Ok(json(&PairResponse {
+                version: PROTOCOL_VERSION,
+                machine: context.machine.clone(),
+                token,
+            }))
+        }
+    }
+}
+async fn request(
+    mut req: Request<Incoming>,
+    context: Arc<ContextState>,
+    source: IpAddr,
+) -> Result<Response<Body>> {
     if req.headers().contains_key(header::ORIGIN) {
         return Ok(response(
             StatusCode::FORBIDDEN,
             "browser origins are not allowed on the agent API",
         ));
+    }
+    if req.uri().path() == "/v1/pairing" && req.method() == Method::GET {
+        return Ok(json(&PairingStatus {
+            version: PROTOCOL_VERSION,
+            open: pairing_open(&context.dir),
+        }));
+    }
+    let pairing = matches!(req.uri().path(), "/v1/pair" | "/v1/pair-code");
+    if pairing && req.method() == Method::POST && !context.allow_attempt(source) {
+        return Ok(response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many pairing attempts; wait a minute",
+        ));
+    }
+    if req.uri().path() == "/v1/pair-code" && req.method() == Method::POST {
+        return pair_code(req, &context).await;
     }
     if req.uri().path() == "/v1/pair" && req.method() == Method::POST {
         let body = match tokio::time::timeout(
@@ -475,8 +918,19 @@ async fn request(mut req: Request<Incoming>, context: Arc<ContextState>) -> Resu
         return Ok(json(&catalog(
             &context.dir,
             context.machine.clone(),
-            context.share_apps,
+            context.sharing(),
         )?));
+    }
+    if req.uri().path() == "/v1/unpair" && req.method() == Method::POST {
+        // The caller forgets us; forget it too and revoke its credential.
+        let bearer = token.unwrap_or_default().to_owned();
+        let auth: Auth = read(&context.dir.join("discovery-auth.json"))?.unwrap_or_default();
+        let machine = auth.labels.get(&digest(&bearer)).cloned();
+        revoke_where(&context.dir, |d, _| d == digest(&bearer))?;
+        if let Some(machine) = machine {
+            let _ = super::client::remove_peer_in(&context.dir, &machine);
+        }
+        return Ok(response(StatusCode::OK, "unpaired"));
     }
     let Some((app_id, app_path)) = req
         .uri()
@@ -489,7 +943,7 @@ async fn request(mut req: Request<Incoming>, context: Arc<ContextState>) -> Resu
     if !app_path.is_empty() && !app_path.starts_with('/') {
         return Ok(response(StatusCode::NOT_FOUND, "unknown app endpoint"));
     }
-    if !context.share_apps {
+    if !context.sharing() {
         return Ok(response(
             StatusCode::FORBIDDEN,
             "remote app transport is disabled",
@@ -717,6 +1171,7 @@ pub async fn serve() -> Result<()> {
         share_apps: config.share_apps,
         client: upstream(&dir)?,
         tunnels: Arc::new(tokio::sync::Semaphore::new(64)),
+        attempts: Arc::default(),
     });
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
     let slots = Arc::new(tokio::sync::Semaphore::new(64));
@@ -730,7 +1185,7 @@ async fn connections(
     slots: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, remote) = listener.accept().await?;
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             drop(stream);
             continue;
@@ -747,7 +1202,7 @@ async fn connections(
             let service = hyper::service::service_fn(move |req| {
                 let context = context.clone();
                 async move {
-                    Ok::<_, Infallible>(match request(req, context).await {
+                    Ok::<_, Infallible>(match request(req, context, remote.ip()).await {
                         Ok(v) => v,
                         Err(_) => {
                             response(StatusCode::INTERNAL_SERVER_ERROR, "agent request failed")

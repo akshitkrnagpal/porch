@@ -38,7 +38,7 @@ const MAX_CANDIDATES: usize = 256;
 const CANDIDATE_TTL: u64 = 90;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
-type RelayClient =
+pub(super) type RelayClient =
     Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>;
 
 fn now() -> u64 {
@@ -72,7 +72,7 @@ pub fn validate_endpoint(value: &str) -> Result<Url> {
     }
     Ok(u)
 }
-fn allowed_ip(ip: IpAddr) -> bool {
+pub(super) fn allowed_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, _, _] = ip.octets();
@@ -84,13 +84,13 @@ fn allowed_ip(ip: IpAddr) -> bool {
         IpAddr::V6(ip) => ip.is_loopback() || ip.octets()[0] & 0xfe == 0xfc,
     }
 }
-fn endpoint(ip: IpAddr, port: u16) -> Option<String> {
+pub(super) fn endpoint(ip: IpAddr, port: u16) -> Option<String> {
     if !allowed_ip(ip) || port == 0 {
         return None;
     }
     Some(format!("https://{}/", SocketAddr::new(ip, port)))
 }
-fn normalize_pin(pin: &str) -> Result<[u8; 32]> {
+pub(super) fn normalize_pin(pin: &str) -> Result<[u8; 32]> {
     let p: String = pin.chars().filter(|c| *c != ':').collect();
     if p.len() != 64 || !p.bytes().all(|c| c.is_ascii_hexdigit()) {
         bail!("certificate fingerprint must contain 64 SHA-256 hex digits");
@@ -101,7 +101,7 @@ fn normalize_pin(pin: &str) -> Result<[u8; 32]> {
     }
     Ok(bytes)
 }
-fn hex_pin(pin: &[u8; 32]) -> String {
+pub(super) fn hex_pin(pin: &[u8; 32]) -> String {
     pin.iter().map(|v| format!("{v:02x}")).collect()
 }
 
@@ -157,7 +157,7 @@ impl ServerCertVerifier for PinnedCertificate {
             .supported_schemes()
     }
 }
-fn tls_config(pin: &str) -> Result<rustls::ClientConfig> {
+pub(super) fn tls_config(pin: &str) -> Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(PinnedCertificate {
         fingerprint: normalize_pin(pin)?,
@@ -169,7 +169,7 @@ fn tls_config(pin: &str) -> Result<rustls::ClientConfig> {
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth())
 }
-fn http_client(pin: &str) -> Result<reqwest::Client> {
+pub(super) fn http_client(pin: &str) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .use_preconfigured_tls(tls_config(pin)?)
         .https_only(true)
@@ -179,7 +179,7 @@ fn http_client(pin: &str) -> Result<reqwest::Client> {
         .timeout(REQUEST_TIMEOUT)
         .build()?)
 }
-async fn bounded_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+pub(super) async fn bounded_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
     if !response.status().is_success() {
         bail!(
             "peer rejected request (HTTP {}); check enrollment and token",
@@ -210,7 +210,7 @@ fn valid_id(id: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
-fn validate_machine(machine: &Machine) -> Result<()> {
+pub(super) fn validate_machine(machine: &Machine) -> Result<()> {
     if !valid_id(&machine.id)
         || machine.name.is_empty()
         || machine.name.len() > 256
@@ -251,7 +251,10 @@ fn validate_catalog(catalog: &Catalog, expected_id: &str) -> Result<()> {
     Ok(())
 }
 fn read_json<T: DeserializeOwned + Default>(file: &str) -> Result<T> {
-    match fs::read(crate::state::dir().join(file)) {
+    read_json_in(&crate::state::dir(), file)
+}
+fn read_json_in<T: DeserializeOwned + Default>(dir: &std::path::Path, file: &str) -> Result<T> {
+    match fs::read(dir.join(file)) {
         Ok(bytes) if bytes.len() <= MAX_BODY => {
             serde_json::from_slice(&bytes).with_context(|| format!("invalid {file}"))
         }
@@ -260,8 +263,66 @@ fn read_json<T: DeserializeOwned + Default>(file: &str) -> Result<T> {
         Err(e) => Err(e.into()),
     }
 }
+/// A short hostname label for a machine name: `Akshits-Mac-mini.local` -> `akshits-mac-mini`.
+pub fn slug(name: &str) -> String {
+    let base = name.split('.').next().unwrap_or(name);
+    let mut out = String::new();
+    for c in base.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out: String = out.trim_matches('-').chars().take(40).collect();
+    let out = out.trim_end_matches('-').to_owned();
+    if out.is_empty() {
+        "peer".into()
+    } else {
+        out
+    }
+}
+/// Assign missing slugs in file (pairing) order. Existing slugs never change,
+/// so URLs stay stable; a later machine with the same name becomes `name-2`.
+fn assign_slugs(peers: &mut [Peer]) {
+    for p in peers.iter_mut() {
+        if p.slug.is_empty()
+            || p.slug.len() > 63
+            || !p
+                .slug
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        {
+            p.slug.clear();
+        }
+    }
+    let reserved: Vec<String> = peers
+        .iter()
+        .filter(|p| !p.slug.is_empty())
+        .map(|p| p.slug.clone())
+        .collect();
+    let mut taken = std::collections::HashSet::new();
+    for p in peers.iter_mut() {
+        if !p.slug.is_empty() && taken.insert(p.slug.clone()) {
+            continue;
+        }
+        let base = slug(&p.machine.name);
+        let mut candidate = base.clone();
+        let mut n = 2;
+        while taken.contains(&candidate) || reserved.contains(&candidate) {
+            candidate = format!("{base}-{n}");
+            n += 1;
+        }
+        taken.insert(candidate.clone());
+        p.slug = candidate;
+    }
+}
 pub fn peers() -> Result<Vec<Peer>> {
-    let peers: Vec<Peer> = read_json(PEERS_FILE)?;
+    peers_in(&crate::state::dir())
+}
+pub(super) fn peers_in(dir: &std::path::Path) -> Result<Vec<Peer>> {
+    let mut peers: Vec<Peer> = read_json_in(dir, PEERS_FILE)?;
+    assign_slugs(&mut peers);
     if peers.len() > MAX_PEERS {
         bail!("too many enrolled peers");
     }
@@ -282,8 +343,15 @@ pub fn peers() -> Result<Vec<Peer>> {
     Ok(peers)
 }
 fn update_peers(f: impl FnOnce(&mut Vec<Peer>) -> Result<()>) -> Result<()> {
-    use fs2::FileExt;
     crate::state::load()?;
+    update_peers_in(&crate::state::dir(), f)
+}
+fn update_peers_in(
+    dir: &std::path::Path,
+    f: impl FnOnce(&mut Vec<Peer>) -> Result<()>,
+) -> Result<()> {
+    use fs2::FileExt;
+    fs::create_dir_all(dir)?;
     let mut options = fs::OpenOptions::new();
     options.create(true).truncate(false).write(true).read(true);
     #[cfg(unix)]
@@ -291,14 +359,59 @@ fn update_peers(f: impl FnOnce(&mut Vec<Peer>) -> Result<()>) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let lock = options.open(crate::state::dir().join("discovery-peers.lock"))?;
+    let lock = options.open(dir.join("discovery-peers.lock"))?;
     lock.lock_exclusive()?;
-    let mut all = peers()?;
+    let mut all = peers_in(dir)?;
     f(&mut all)?;
     if all.len() > MAX_PEERS {
         bail!("peer enrollment limit reached; remove an unused peer first");
     }
-    crate::state::atomic_write(PEERS_FILE, &serde_json::to_vec_pretty(&all)?)
+    assign_slugs(&mut all);
+    super::server::write(dir, PEERS_FILE, &serde_json::to_vec_pretty(&all)?)
+}
+/// Insert or replace a peer by machine ID, keeping an existing slug.
+pub(super) fn upsert_peer_in(dir: &std::path::Path, mut peer: Peer) -> Result<Peer> {
+    let mut stored = None;
+    update_peers_in(dir, |all| {
+        if let Some(old) = all.iter_mut().find(|p| p.machine.id == peer.machine.id) {
+            peer.slug = old.slug.clone();
+            *old = peer.clone();
+        } else {
+            peer.slug = String::new();
+            all.push(peer.clone());
+        }
+        Ok(())
+    })?;
+    for p in peers_in(dir)? {
+        if p.machine.id == peer.machine.id {
+            stored = Some(p);
+        }
+    }
+    stored.context("peer was not stored")
+}
+pub(super) fn remove_peer_in(dir: &std::path::Path, id: &str) -> Result<()> {
+    update_peers_in(dir, |all| {
+        all.retain(|p| p.machine.id != id);
+        Ok(())
+    })
+}
+/// Resolve a user-supplied machine reference: ID, exact name or URL slug.
+pub fn find_peer(reference: &str) -> Result<Peer> {
+    let all = peers()?;
+    let wanted = reference.to_ascii_lowercase();
+    let matches: Vec<_> = all
+        .iter()
+        .filter(|p| {
+            p.machine.id == reference
+                || p.machine.name.eq_ignore_ascii_case(reference)
+                || p.slug == wanted
+        })
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => bail!("no paired machine named {reference}; see porch peers list"),
+        _ => bail!("{reference} matches several paired machines; use its ID from porch peers list"),
+    }
 }
 pub fn remove_peer(id: &str) -> Result<()> {
     update_peers(|all| {
@@ -352,15 +465,12 @@ pub async fn pair(endpoint: &str, fingerprint: &str, token: &str) -> Result<Peer
         token: response.token,
         sources: vec![Source::Explicit],
         last_seen: now(),
+        slug: String::new(),
     };
-    update_peers(|all| {
-        all.retain(|p| p.machine.id != peer.machine.id);
-        all.push(peer.clone());
-        Ok(())
-    })?;
-    Ok(peer)
+    crate::state::load()?;
+    upsert_peer_in(&crate::state::dir(), peer)
 }
-async fn fetch_catalog(peer: &Peer, endpoint: &str) -> Result<Catalog> {
+pub(super) async fn fetch_catalog(peer: &Peer, endpoint: &str) -> Result<Catalog> {
     let endpoint = validate_endpoint(endpoint)?;
     let response = http_client(&peer.fingerprint)?
         .get(endpoint.join("v1/catalog")?)
@@ -547,7 +657,7 @@ async fn tailscale_status() -> Result<Vec<Candidate>> {
         Err(_) => bail!("Tailscale status timed out; LAN and explicit peers still work"),
     }
 }
-async fn collect_candidates(refresh: bool) -> Result<(Vec<Candidate>, Vec<String>)> {
+pub(super) async fn collect_candidates(refresh: bool) -> Result<(Vec<Candidate>, Vec<String>)> {
     let mut cache: CandidateCache = read_json(CACHE_FILE)?;
     cache.expire(now());
     let mut warnings = Vec::new();
@@ -621,6 +731,7 @@ async fn query_peer_inner(mut peer: Peer, candidates: &[Candidate]) -> PeerCatal
                     }
                 }
                 return PeerCatalog {
+                    slug: peer.slug,
                     machine: peer.machine,
                     endpoint: peer.endpoint,
                     sources: peer.sources,
@@ -633,6 +744,7 @@ async fn query_peer_inner(mut peer: Peer, candidates: &[Candidate]) -> PeerCatal
         }
     }
     PeerCatalog {
+        slug: peer.slug,
         machine: peer.machine,
         endpoint: peer.endpoint,
         sources: peer.sources,
@@ -643,6 +755,7 @@ async fn query_peer_inner(mut peer: Peer, candidates: &[Candidate]) -> PeerCatal
 }
 fn unavailable_peer(peer: Peer, message: &str) -> PeerCatalog {
     PeerCatalog {
+        slug: peer.slug,
         machine: peer.machine,
         endpoint: peer.endpoint,
         sources: peer.sources,
@@ -722,12 +835,21 @@ pub async fn snapshot(refresh: bool) -> Result<Snapshot> {
 }
 
 #[derive(Clone)]
-struct RelayContext {
-    peer: Peer,
-    app_id: String,
-    client: RelayClient,
-    relay_url: Url,
-    local_app: Url,
+pub(super) struct RelayContext {
+    pub(super) peer: Peer,
+    pub(super) app_id: String,
+    pub(super) client: RelayClient,
+    /// Browser-visible origin; the request Host must match its authority.
+    pub(super) relay_url: Url,
+    pub(super) local_app: Url,
+}
+pub(super) fn relay_client(pin: &str) -> Result<RelayClient> {
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config(pin)?)
+        .https_only()
+        .enable_http1()
+        .build();
+    Ok(Client::builder(TokioExecutor::new()).build(https))
 }
 fn plain_error(status: StatusCode, message: &str) -> Response<Body> {
     let mut r = Response::new(Body::from(message.to_owned()));
@@ -774,7 +896,7 @@ fn rewrite_location(value: &str, context: &RelayContext) -> Result<String> {
     };
     if target.origin() == context.local_app.origin() {
         target
-            .set_scheme("http")
+            .set_scheme(context.relay_url.scheme())
             .map_err(|_| anyhow::anyhow!("invalid redirect"))?;
         target.set_host(context.relay_url.host_str())?;
         target
@@ -792,7 +914,7 @@ fn rewrite_location(value: &str, context: &RelayContext) -> Result<String> {
     }
     Ok(value.into())
 }
-async fn relay_request(
+pub(super) async fn relay_request(
     mut req: Request<Incoming>,
     context: RelayContext,
 ) -> std::result::Result<Response<Body>, Infallible> {
@@ -816,7 +938,7 @@ async fn relay_request(
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
     {
-        if origin != format!("http://{expected}") {
+        if origin != format!("{}://{expected}", context.relay_url.scheme()) {
             return Ok(plain_error(
                 StatusCode::FORBIDDEN,
                 "Cross-origin browser access to a Porch relay is rejected",
@@ -992,12 +1114,7 @@ pub async fn relay(peer_id: &str, app_id: &str, bind_port: u16) -> Result<()> {
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
     let address = listener.local_addr()?;
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config(&peer.fingerprint)?)
-        .https_only()
-        .enable_http1()
-        .build();
-    let client = Client::builder(TokioExecutor::new()).build(https);
+    let client = relay_client(&peer.fingerprint)?;
     let scope: String = Sha256::digest(format!("{}\0{app_id}", peer.machine.id).as_bytes())
         .iter()
         .map(|v| format!("{v:02x}"))
