@@ -26,7 +26,7 @@ pub enum Health {
     Unknown,
     Unreachable,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Machine {
     pub id: String,
     pub name: String,
@@ -131,4 +131,95 @@ pub struct PairCodeRequest {
     pub endpoint: String,
     pub fingerprint: String,
     pub token: String,
+}
+/// Lifecycle of one pairing code on the machine showing it. `accepted` means the
+/// code was right; `paired` means the new peer has since authenticated.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairState {
+    Waiting,
+    Accepted,
+    Paired,
+    Expired,
+    Cancelled,
+    Replaced,
+}
+impl PairState {
+    /// The code can no longer be used and nothing further will happen.
+    pub fn is_final(self) -> bool {
+        !matches!(self, Self::Waiting | Self::Accepted)
+    }
+}
+/// `porch pair status ID --json` (and `pair cancel ID --json`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairStatusReport {
+    pub version: u32,
+    pub id: String,
+    pub state: PairState,
+    /// Why a code was cancelled: `user`, `too_many_failures` or `host_full`.
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub expires: Option<u64>,
+    #[serde(default)]
+    pub expires_in: Option<u64>,
+    #[serde(default)]
+    pub peer: Option<Machine>,
+}
+/// `porch pair --no-wait --json`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairShown {
+    pub version: u32,
+    pub id: String,
+    pub code: String,
+    pub expires: u64,
+    pub expires_in: u64,
+    pub machine: Machine,
+    pub endpoint: String,
+}
+/// A machine that could receive a pairing code, offered when the target is ambiguous.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JoinCandidate {
+    pub name: String,
+    pub endpoint: String,
+    pub source: Source,
+}
+/// Why `porch pair CODE` failed. `code` is stable for scripts and the tray:
+/// wrong_code, not_waiting, rate_limited, certificate_mismatch, host_full,
+/// no_host, multiple_hosts, unreachable, invalid_code, protocol, local.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JoinFailure {
+    pub code: String,
+    pub message: String,
+    /// Trying again with another code or later can succeed.
+    pub retry: bool,
+    #[serde(default)]
+    pub candidates: Vec<JoinCandidate>,
+    /// Underlying cause, for logs and terminals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+impl std::fmt::Display for JoinFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)?;
+        if let Some(detail) = &self.detail {
+            write!(f, " ({detail})")?;
+        }
+        for c in &self.candidates {
+            write!(f, "\n  {} at {}", c.name, c.endpoint.trim_end_matches('/'))?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for JoinFailure {}
+/// Error body of `POST /v1/pair-code`. Status codes are unchanged from the
+/// plain-text bodies older agents send, so joiners map by status first.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairCodeError {
+    pub error: PairCodeErrorBody,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairCodeErrorBody {
+    pub code: String,
+    pub message: String,
 }
