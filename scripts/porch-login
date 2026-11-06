@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Explicit user-session login startup for the Porch menu only."""
+import argparse
+import os
+from pathlib import Path
+import plistlib
+import subprocess
+import sys
+import tempfile
+
+LABEL = 'dev.porch.tray'
+MARKER = 'X-Porch-Owned=true'
+
+
+def atomic_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.porch-login-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o600)
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def launchctl(*args):
+    result = subprocess.run(['launchctl', *args], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f'launchctl exited {result.returncode}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['enable', 'disable', 'status'])
+    parser.add_argument('--binary', type=Path, help='absolute porch-tray executable path')
+    args = parser.parse_args()
+    binary = args.binary or Path(__file__).resolve().parent / 'porch-tray'
+    binary = binary.resolve()
+    if args.action == 'enable' and not binary.is_file():
+        parser.error(f'no porch-tray executable at {binary}; use --binary')
+    if sys.platform == 'darwin':
+        path = Path.home() / 'Library/LaunchAgents' / f'{LABEL}.plist'
+        domain = f'gui/{os.getuid()}'
+        if path.exists():
+            with open(path, 'rb') as stream:
+                if plistlib.load(stream).get('Label') != LABEL:
+                    raise RuntimeError(f'refusing to modify unrelated startup file: {path}')
+        if args.action == 'status':
+            print('enabled' if path.exists() else 'disabled')
+            return
+        if args.action == 'disable':
+            if path.exists():
+                subprocess.run(['launchctl', 'bootout', f'{domain}/{LABEL}'], capture_output=True)
+                path.unlink()
+            print('Porch menu login startup disabled. Apps and proxy are unchanged.')
+            return
+        logs = Path.home() / 'Library/Logs/Porch'
+        logs.mkdir(parents=True, exist_ok=True)
+        config = {'Label': LABEL, 'ProgramArguments': [str(binary)], 'RunAtLoad': True,
+                  'KeepAlive': False, 'ProcessType': 'Interactive',
+                  'StandardOutPath': str(logs / 'tray.log'), 'StandardErrorPath': str(logs / 'tray.log')}
+        if os.getenv('PORCH_STATE_DIR'):
+            config['EnvironmentVariables'] = {'PORCH_STATE_DIR': os.environ['PORCH_STATE_DIR']}
+        if path.exists():
+            subprocess.run(['launchctl', 'bootout', f'{domain}/{LABEL}'], capture_output=True)
+        atomic_write(path, plistlib.dumps(config))
+        try:
+            launchctl('bootstrap', domain, str(path))
+        except RuntimeError:
+            path.unlink(missing_ok=True)
+            raise
+        print('Porch menu login startup enabled and launched. Sharing remains unchanged.')
+    elif sys.platform.startswith('linux'):
+        root = Path(os.getenv('XDG_CONFIG_HOME', Path.home() / '.config'))
+        path = root / 'autostart/porch-tray.desktop'
+        if path.exists() and MARKER not in path.read_text():
+            raise RuntimeError(f'refusing to modify unrelated startup file: {path}')
+        if args.action == 'status':
+            print('enabled' if path.exists() else 'disabled')
+        elif args.action == 'disable':
+            path.unlink(missing_ok=True)
+            print('Porch tray login startup disabled. The current tray and apps keep running.')
+        else:
+            # Desktop Entry quoting is not shell quoting; escape % field codes.
+            escaped = str(binary).replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%')
+            data = f'[Desktop Entry]\nType=Application\nName=Porch\nComment=Your dev apps in the system tray\nExec="{escaped}"\nTerminal=false\n{MARKER}\n'
+            atomic_write(path, data.encode())
+            print('Porch tray will launch on your next graphical login. Sharing remains unchanged.')
+    else:
+        parser.error('Porch login startup supports macOS and Linux')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (RuntimeError, OSError, ValueError) as error:
+        sys.exit(f'porch-login: {error}')

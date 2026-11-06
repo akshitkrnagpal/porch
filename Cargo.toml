@@ -1,6 +1,6 @@
 [package]
 name = "porch"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 [dependencies]
 anyhow = "1"
@@ -10,7 +10,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 fs2 = "0.4"
 libc = "0.2"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 axum = { version = "0.8", features = ["ws"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
@@ -34,3 +34,21 @@ rustls-native-certs = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[features]
+default = []
+tray = ["dep:tray-icon", "dep:tao", "dep:gtk"]
+
+[[bin]]
+name = "porch-tray"
+path = "src/bin/porch-tray.rs"
+required-features = ["tray"]
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+tray-icon = { version = "0.26", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tao = { version = "0.37", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }

@@ -1,10 +1,12 @@
 # Porch
 
-Porch gives local development servers stable names such as `https://web.localhost`, assigns free app ports, and manages the shared reverse proxy and child processes. It is a standalone Rust CLI inspired by the [Portless](https://github.com/vercel-labs/portless) development workflow.
+All your dev apps, across your machines, one click away. Porch gives local development servers stable names such as `https://web.localhost`, assigns free app ports, and manages the shared reverse proxy and child processes. It is a standalone Rust CLI inspired by the [Portless](https://github.com/vercel-labs/portless) development workflow.
 
 Porch is under active development; full Portless parity and daily-use readiness are not yet established. The [original independent review](docs/reviews/opus-2026-11-06.md) is preserved alongside the [remediation evidence](docs/remediation-2026-11-06.md).
 
 **Supported build targets:** macOS Apple Silicon and Linux x86_64. Windows is deferred and is not included in CI or release artifacts.
+
+The optional native menu bar / tray companion lists local apps and authenticated LAN/Tailscale peers. Start with the [two-machine and desktop guide](docs/discovery.md); sharing and pairing are explicitly opt-in.
 
 Build and run:
 
@@ -41,9 +43,9 @@ Per-directory configuration precedence is `porch.json` > `package.json` `porch` 
 }
 ```
 
-Porch supports multiple TLDs, strict or parent-wildcard routing, IPv4/IPv6 listeners, HTTP/2, WebSockets including extended CONNECT, streamed responses, LAN discovery, static aliases, Docker Compose, sharing providers, startup services, and stdio MCP. See the [command and configuration reference](docs/reference.md) and [evidence-based compatibility matrix](docs/feature-comparison.md).
+Porch supports multiple TLDs, strict or parent-wildcard routing, IPv4/IPv6 listeners, HTTP/2, WebSockets including extended CONNECT, streamed responses, authenticated LAN/Tailscale app discovery, an optional native tray, static aliases, Docker Compose, sharing providers, startup services, and stdio MCP. See the [command and configuration reference](docs/reference.md) and [evidence-based compatibility matrix](docs/feature-comparison.md).
 
-`trust`, `hosts`, `service`, and `clean` manage the corresponding OS resources when explicitly invoked. Automated tests use isolated state, temporary hosts files, and fake external CLIs. Real OS trust/startup installation, authenticated public tunnels, and physical LAN discovery still require platform/service verification; service definitions and command flows have been tested with fixtures; privileged installation remains unverified.
+`trust`, `hosts`, `service`, and `clean` manage the corresponding OS resources when explicitly invoked. Automated tests use isolated state, temporary hosts files, and fake external CLIs. Real OS trust/startup installation, authenticated public tunnels, and physical LAN/Tailscale discovery and rendered desktop behavior still require platform/service verification; service definitions and command flows have been tested with fixtures; privileged installation remains unverified.
 
 Run `cargo test --all-targets` for acceptance coverage. For mandatory real Turbo TUI coverage, install Turbo 2.6.3 and set `PORCH_TEST_TURBO_REQUIRED=1`; CI does this on macOS and Linux. The test suite uses Node.js/npm, Python 3, and Git for real child-process fixtures. No public release is published by the build workflow.
 

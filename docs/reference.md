@@ -133,7 +133,7 @@ cargo test --all-targets
 cargo build --release
 ```
 
-CI definitions target Ubuntu, macOS, and Windows. A workflow definition is not evidence that those runners have passed; current local acceptance was performed on macOS. The manual artifact workflow builds native Linux x86_64, macOS ARM64, and Windows x86_64 binaries without creating a public GitHub Release, signing, or notarizing them.
+CI definitions target Ubuntu and macOS; Windows is deferred. A workflow definition is not evidence that those runners have passed; current local acceptance was performed on macOS. The manual artifact workflow builds native Linux x86_64, macOS ARM64, binaries and optional native desktop packages without creating a public GitHub Release, signing, or notarizing them.
 
 Configuration lookup prefers `porch.json`, then the package `porch` key, then `portless.json`, then the package `portless` key. A native package key can override app fields from the file, consistent with leaf package overrides. A malformed selected native configuration is an error, never a reason to fall back to legacy settings. Legacy child environment names are also emitted for migration.
 
@@ -143,3 +143,10 @@ Configuration lookup prefers `porch.json`, then the package `porch` key, then `p
 Automatic TLS issuance accepts configured TLDs, registered route names, and `.local` in LAN mode; unrelated SNI is rejected before certificate creation, including previously cached names after removal. Leaves have hostname CN/SAN, serverAuth EKU and at most 365 days validity. New local CAs have at most 3650 days validity and pathLen=0. Persisted roots/keys are retained byte-for-byte to preserve installed trust, with profile-v2 leaves taking effect after daemon restart and a one-time legacy-root hint. DNS NameConstraints are not fixed on the root because domains can change; the running resolver enforces the issuance boundary. Replacing a legacy root requires explicit cleanup and renewed trust setup. Real trusted-CA Safari/Chrome/Firefox behavior remains unverified.
 
 Automatic hosts updates use the daemon's recorded write capability to avoid requesting writes from an incapable proxy. Custom-domain permission errors retain setup guidance; authentication failures remain separate 403 responses, while write failures return 409. Browser `.localhost` resolution needs no hosts entries, so failure yields one hint per state directory. Other clients may still require explicit `sudo porch hosts sync`. The loopback challenge/proof, token and Origin protections apply unchanged.
+
+
+## Desktop and discovery (0.2)
+
+`porch tray` launches the optional `porch-tray` companion. The CLI remains headless with no desktop runtime dependencies. `porch list --all [--json]` and `porch peers [list|refresh] [--json]` return the shared versioned local/remote catalog. `porch peers add ENDPOINT --fingerprint SHA256 [--token-file PATH]` enrolls using a one-time token on stdin or a private file; `peers trust` aliases Add. `peers remove ID` forgets local trust. `porch open APP [--peer ID] [--url-only]` and `porch copy APP [--peer ID]` use supported state and a local authenticated relay for remote apps.
+
+`porch discovery enable --bind PRIVATE_IP [--port 1356] [--share-apps] [--no-advertise]` starts an independent TLS agent. App transport is a separate explicit grant. `discovery serve` runs the saved configuration in the foreground; `status [--json]`, `fingerprint`, `pair-token`, `revoke`, `disconnect`, and `disable` manage local discovery only. Nothing automatically enables network sharing, login startup, trust, Tailscale Serve/Funnel, or public tunnels. See the [complete two-machine setup, security model and wire protocol](discovery.md).

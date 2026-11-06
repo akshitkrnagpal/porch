@@ -116,7 +116,31 @@ enum Commands {
     List {
         #[arg(long)]
         json: bool,
+        /// Include paired LAN and tailnet machines in the versioned shared catalog.
+        #[arg(long)]
+        all: bool,
     },
+    Peers(crate::discovery::commands::Peers),
+    Discovery {
+        #[command(subcommand)]
+        command: crate::discovery::commands::Command,
+    },
+    /// Open an app locally or through a paired machine's authenticated browser relay.
+    Open {
+        app: String,
+        #[arg(long)]
+        peer: Option<String>,
+        #[arg(long)]
+        url_only: bool,
+    },
+    /// Copy a local app URL or a paired machine's loopback relay URL.
+    Copy {
+        app: String,
+        #[arg(long)]
+        peer: Option<String>,
+    },
+    /// Launch the optional native menu bar / tray companion.
+    Tray,
     Alias {
         name: Option<String>,
         target: Option<String>,
@@ -274,7 +298,35 @@ pub async fn run() -> Result<i32> {
             };
             println!("{}", resolve_settings(&ProxyOptions::default())?.url(&n));
         }
-        Some(Commands::List { json }) => list(json)?,
+        Some(Commands::List { json, all }) => {
+            if all {
+                crate::discovery::commands::print_snapshot(
+                    crate::discovery::client::snapshot(false).await?,
+                    json,
+                )?;
+            } else {
+                list(json)?;
+            }
+        }
+        Some(Commands::Peers(p)) => crate::discovery::commands::peers(p).await?,
+        Some(Commands::Discovery { command }) => crate::discovery::commands::run(command).await?,
+        Some(Commands::Open {
+            app,
+            peer,
+            url_only,
+        }) => {
+            let url = crate::discovery::app_url(&app, peer.as_deref()).await?;
+            if !url_only {
+                crate::discovery::open_url(&url)?;
+            }
+            println!("{url}");
+        }
+        Some(Commands::Copy { app, peer }) => {
+            let url = crate::discovery::app_url(&app, peer.as_deref()).await?;
+            crate::discovery::copy_url(&url)?;
+            println!("{url}");
+        }
+        Some(Commands::Tray) => crate::discovery::commands::launch_tray()?,
         Some(Commands::Alias {
             name,
             target,
