@@ -120,6 +120,10 @@ To keep a machine shared across reboots, run `porch discovery autostart enable` 
 
 ## Menu bar app
 
+<p align="center">
+  <img src="assets/screenshots/menu-bar.png" alt="The Porch menu bar app listing this machine's running apps (docs, api, web) and a paired Mac mini" width="430">
+</p>
+
 On macOS, open `Porch.app`. On Linux, run `porch tray` (GTK 3 with an AppIndicator host).
 
 The menu lists local apps and paired machines with their status. Click an app to open it, copy its URL, refresh, pair a new device, or start and stop the proxy. The icon shows solid dots while the proxy runs, dims them when it stops, and adds a badge when a paired machine is reachable. To launch it at login, run `porch-login enable`.
