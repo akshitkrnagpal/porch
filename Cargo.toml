@@ -52,3 +52,8 @@ tao = { version = "0.37", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", optional = true }
+
+[profile.dev]
+# Keep only line tables in debug builds: much smaller target/, and
+# backtraces still show file:line.
+debug = "line-tables-only"
