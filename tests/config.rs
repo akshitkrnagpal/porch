@@ -833,3 +833,42 @@ fn explicit_workspace_graph_commands_reject_a_shared_app_port() {
     )
     .is_ok());
 }
+#[test]
+fn package_manager_script_shorthands_resolve_framework_flags() {
+    let f = Fixture::new();
+    for (raw, framework_flags) in [
+        ("astro dev", vec!["--port", "4567", "--host", "127.0.0.1"]),
+        (
+            "vite",
+            vec!["--port", "4567", "--strictPort", "--host", "127.0.0.1"],
+        ),
+    ] {
+        f.write("package.json", json!({"scripts":{"dev":raw,"install":raw}}));
+        for invocation in [
+            &["pnpm", "dev"][..],
+            &["pnpm", "run", "dev"],
+            &["yarn", "dev"],
+            &["bun", "dev"],
+            &["bun", "run", "dev"],
+        ] {
+            let (out, host) = adapt_command(&args(invocation), &f.0, 4567, false).unwrap();
+            let mut expected = args(invocation);
+            expected.extend(args(&framework_flags));
+            assert_eq!(out, expected, "{raw}: {invocation:?}");
+            assert_eq!(host.as_deref(), Some("127.0.0.1"));
+        }
+        let (out, _) = adapt_command(&args(&["npm", "run", "dev"]), &f.0, 4567, false).unwrap();
+        let mut expected = args(&["npm", "run", "dev", "--"]);
+        expected.extend(args(&framework_flags));
+        assert_eq!(out, expected, "{raw}: npm run dev");
+        // npm has no script shorthand; builtins never resolve same-named scripts.
+        for untouched in [&["npm", "dev"][..], &["pnpm", "install"]] {
+            let (out, _) = adapt_command(&args(untouched), &f.0, 4567, false).unwrap();
+            assert_eq!(out, args(untouched));
+        }
+        // Forwarded arguments after the shorthand are respected.
+        let (out, _) =
+            adapt_command(&args(&["pnpm", "dev", "--port", "9999"]), &f.0, 4567, false).unwrap();
+        assert!(!out.iter().any(|s| s == "4567"), "{out:?}");
+    }
+}

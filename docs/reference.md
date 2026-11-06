@@ -14,20 +14,22 @@ Compatibility baseline: [Portless `49586cfa566ffce8dcc4368f0b74fce560dced49`](ht
 | `porch --name NAME COMMAND...` | Permit names that collide with subcommands |
 | `porch NAME --app-port 4500 -- COMMAND...` | Choose a fixed app port and terminate Porch option parsing |
 | `porch NAME --force COMMAND...` | Take over an existing route and terminate its owned app group |
+| `porch setup [--yes] [--port N] [--https\|--no-https]` | First-run walkthrough; idempotent, current values are the defaults |
+| `porch doctor [--fix] [--yes]` | Diagnose; `--fix` applies safe fixes |
 
 Launch options include `--name`, `--script`, `--prefix`, `--app-port`, `--force`, `--lan`, `--ip`, `--tailscale`, `--funnel`, `--ngrok`, and `--cloudflare`. Options following the child command belong to that child. `--prefix ''` suppresses worktree naming. `--help`, `-h`, `--version`, `-v`, and `-V` provide CLI information.
 
-The proxy starts automatically and launch waits for listener readiness before spawning the app. Its last saved configuration survives stop/restart. App ports are reserved under the shared route lock and selected from 4000–4999 when unspecified, excluding browser-blocked ports 4045 and 4190. A fixed port must be available and unreserved.
+The proxy starts automatically and launch waits for listener readiness before spawning the app. After spawning, Porch waits up to `PORCH_LISTEN_TIMEOUT` seconds (default 15, `0` disables) for something to accept TCP on the assigned port. If nothing does, it prints a warning and the app keeps running. When a process in the app's tree listens on a different port, the warning names it (`app is listening on 4321 instead`) and suggests `porch run --app-port 4321 COMMAND`. Porch never reroutes automatically. Its last saved configuration survives stop/restart. App ports are reserved under the shared route lock and selected from 4000–4999 when unspecified, excluding browser-blocked ports 4045 and 4190. A fixed port must be available and unreserved.
 
 Child exit codes are preserved. Unix children lead their own process groups; signal forwarding and cleanup cover descendants. Persistent ownership records include process start identity so stale routes can be distinguished from a reused PID. `prune --force` removes orphan routes and terminates their owned children. Successful commands that leave an owned listening daemon transfer their route to that process. Windows code uses native process identity and kill-on-close Job Objects for tree termination; native Windows runtime acceptance is a separate verification requirement.
 
 ## Proxy and routes
 
 ```sh
-porch proxy start                         # HTTPS, port 443
-porch proxy start --port 1355 --no-tls     # HTTP, custom port
-porch proxy start --unprivileged          # HTTP, low port without sudo where OS allows
-porch proxy start --https --unprivileged  # explicit HTTPS in unprivileged mode
+porch proxy start                         # HTTP, port 7462, no sudo (default)
+porch proxy start --port 8080             # HTTP, custom port, no sudo
+porch proxy start --https                 # opt-in HTTPS on 443 (sudo + local CA trust)
+porch proxy start --https --port 8443     # HTTPS on a high port, no sudo (run `porch trust` for browser trust)
 porch proxy start --foreground
 porch proxy start --tld localhost --tld test --wildcard
 porch proxy start --cert ./cert.pem --key ./key.pem
@@ -38,7 +40,13 @@ porch proxy status
 
 Proxy options are `--port`/`-p`, `--https`, `--no-tls`, `--foreground`, `--skip-trust`, `--unprivileged`, `--lan`, `--ip`, repeatable/comma-separated `--tld`, `--wildcard`, paired `--cert`/`--key`, and `--state-dir`. Porch also provides explicit `--bind` and `--redirect-port` overrides. A custom certificate implies TLS.
 
-Normal listeners bind IPv4 and IPv6 loopback. LAN mode binds both wildcard addresses and uses `.local` names. Unprivileged mode may also require wildcard binding, but the proxy rejects non-loopback peers unless LAN is enabled. Unsupported low-port binding produces an actionable error. Where binding needs privileges, interactive startup runs `sudo -v` before detaching. Unattended startup uses cached sudo authorization or gives explicit terminal-setup and `--unprivileged --port 1355 --no-tls` choices. Missing sudo never silently changes settings. Listeners and app reservations use exclusive non-reuse binds across IPv4/IPv6 wildcard interfaces; occupied ports are refused or skipped. `doctor` verifies daemon identity and HTTP readiness and lists other listeners where lsof is available.
+Port and privilege mode are one setting. Ports ≥1024 imply unprivileged mode: no sudo, no hosts-file synchronization, no automatic trust changes. Browsers resolve `*.localhost` without hosts entries. Set `PORCH_SYNC_HOSTS=1` only if you explicitly want hosts entries on a high port. Ports below 1024 (HTTPS on 443) need administrator rights. Interactive startup runs `sudo -v` before detaching. Unattended startup uses cached sudo authorization or fails with `porch proxy start --no-tls --port 7462` as the no-sudo alternative. `--unprivileged` still forces no-sudo mode on a low port where the OS allows wildcard binding.
+
+Normal listeners bind IPv4 and IPv6 loopback. LAN mode, and unprivileged low ports, bind both wildcard addresses; the proxy rejects non-loopback peers unless LAN is enabled. Listeners and app reservations use exclusive non-reuse binds across IPv4/IPv6 wildcard interfaces.
+
+Port conflicts never dead-end. When the proxy port is busy, Porch identifies the owner (pid and process name via `lsof` on macOS, `ss` then `lsof` on Linux; best effort, since other users' processes may be invisible without sudo). A default or saved port moves to the next free port, skipping 7463 (reserved for Porch discovery). The new port is saved, and one line reports the move. An explicit `--port` or `PORCH_PORT` never moves silently; startup fails with the owner and a suggested `porch proxy start --port N`. An HTTPS port below 1024 does not move; Porch suggests the no-sudo HTTP default instead. A port held only by recently closed connections (no listener, typically for about 30 seconds after a proxy stop) is waited out, up to 60 seconds, rather than moved.
+
+The proxy records its version in `proxy.version`. When a newer `porch` binary finds an older proxy running (or one that predates the record), it restarts the proxy with the same saved settings. Routes live in state and survive the restart.
 
 HTTPS supports HTTP/1.1 and HTTP/2. The proxy streams request/response bodies, forwards WebSocket Upgrade and RFC 8441 extended CONNECT, preserves forwarding metadata, and detects recursive proxy loops. Plain HTTP requests on a TLS listener redirect to HTTPS; an additional redirect listener can be configured. Unknown configured hosts receive a structured 404; unrelated domains receive 421. HTML and JSON error responses include a useful error code.
 
@@ -50,11 +58,13 @@ porch alias web 3000 --force --tld test
 porch alias --remove web --tld test
 porch get web                            # public URL, even before registration
 porch get web --no-worktree
-porch list                               # readable active routes and sharing URLs
-porch list --json                         # structured active routes/proxy settings
+porch list                               # routes with health, plus sharing URLs
+porch list --json                         # structured routes (with health), proxy settings and version
 ```
 
 Aliases also accept HTTP/HTTPS upstream URLs. `remove`/`rm` and `routes` are additional aliases for removal and listing.
+
+`list` health values: `ok`; `not listening` (nothing accepts on the target); `stopped` (an owned process is job-control stopped, state T, e.g. frozen by SIGTTOU/SIGTTIN; JSON includes `stopped_seconds`); `dead` (launcher exited while app processes remain; `porch prune --force`). Routes whose launcher and app are both gone are removed automatically on `list`, on launch, on proxy start, and every 5 seconds by the running proxy.
 
 ## Configuration and workspaces
 
@@ -88,15 +98,16 @@ Public `PORCH_*` settings take precedence over the corresponding `PORTLESS_*` co
 | Suffix | Input behavior |
 | --- | --- |
 | `STATE_DIR` | State directory, default `~/.porch` |
-| `PORT` | Proxy port |
+| `PORT` | Proxy port (default 7462); explicit, so a busy port fails rather than moves |
 | `APP_PORT` | App port; explicit CLI selection wins |
-| `HTTPS` | TLS enabled by default; `0` disables |
+| `HTTPS` | `1` opts in to HTTPS (port 443 unless `PORT` is set); plain HTTP by default |
 | `LAN`, `LAN_IP` | LAN mode and optional pinned address |
 | `TLD` | Comma-separated configured domains |
 | `PREFIX` | Worktree prefix; empty disables |
 | `WILDCARD` | Parent wildcard fallback |
-| `UNPRIVILEGED` | No elevation or automatic hosts/trust changes |
-| `SYNC_HOSTS` | `0` disables automatic hosts reconciliation |
+| `UNPRIVILEGED` | No elevation or automatic hosts/trust changes; implied for ports ≥1024 |
+| `SYNC_HOSTS` | `0` disables automatic hosts reconciliation; `1` requests it even on a high port |
+| `LISTEN_TIMEOUT` | Seconds to wait for a launched app to listen before warning (default 15, `0` disables) |
 | `TAILSCALE`, `FUNNEL`, `NGROK`, `CLOUDFLARE` | Sharing provider selection |
 | `SKIP_TRUST` | Skip interactive CA trust setup |
 
@@ -118,7 +129,18 @@ Child outputs include `PORT`, `HOST`, `PORCH_URL`, `NODE_EXTRA_CA_CERTS` for the
 
 LAN advertisement publishes route-specific `.local` names and refreshes route/IP changes every two seconds. A pinned IP remains fixed. Multicast reachability and physical network transitions need a real multi-device LAN check.
 
-`doctor` reports proxy/state/routes, hostname resolution, trust, and external-tool prerequisites. `prune [--force]` terminates stale owned children; `clean` performs explicit teardown.
+`doctor` reports proxy/state/routes, hostname resolution, trust, and external-tool prerequisites, then lists issues as `problem → fix applied` or `problem → command to run`. `doctor --fix` applies safe fixes. It moves a stopped proxy off a busy port, prunes dead routes, restarts an outdated proxy, and switches legacy high-port settings to no-sudo mode. Terminating stopped or orphaned launches asks first; `--yes` accepts. Non-interactive sessions without `--yes` never terminate anything. `prune [--force]` terminates stale owned children; `clean` performs explicit teardown.
+
+## First run: `porch setup`
+
+`porch setup` walks through four choices and is safe to re-run. Each prompt defaults to the current value.
+
+1. HTTPS opt-in (default no): HTTPS on 443 needs sudo once and adds a local CA to the trust store.
+2. Proxy port (default 7462): a busy port is reported with its owner, and the next free port is offered.
+3. Start at login (default: current): installs or uninstalls the `porch service` startup definition, which asks for sudo.
+4. Share with your other machines (default: current): enables or disables discovery on this machine's private address through the discovery API, with app sharing granted. Peers still pair explicitly.
+
+Then it saves settings and starts (or restarts) the proxy. It prints a three-line summary and the next command. `--yes`, or stdin that is not a terminal, accepts every default without prompting. `--port`, `--https` and `--no-https` preselect answers.
 
 ## Updates
 

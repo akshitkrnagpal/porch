@@ -17,6 +17,9 @@ pub struct State {
     pub shares: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     pub compose_projects: BTreeMap<String, Vec<String>>,
+    /// Unix seconds when a route's processes were first seen job-control stopped.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stopped_since: BTreeMap<String, u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
@@ -50,13 +53,13 @@ pub struct ProxySettings {
 impl Default for ProxySettings {
     fn default() -> Self {
         Self {
-            port: 443,
-            tls: true,
+            port: crate::ports::DEFAULT_PROXY_PORT,
+            tls: false,
             tlds: vec!["localhost".into()],
             wildcard: false,
             lan: false,
             lan_ip: None,
-            unprivileged: false,
+            unprivileged: true,
             bind: None,
             cert: None,
             key: None,
@@ -315,6 +318,7 @@ pub fn remove_route(s: &mut State, name: &str) {
     s.routes.retain(|r| r.name != name);
     s.owners.remove(name);
     s.shares.remove(name);
+    s.stopped_since.remove(name);
     for names in s.compose_projects.values_mut() {
         names.retain(|n| n != name);
     }

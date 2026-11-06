@@ -791,7 +791,10 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
     let client = Client::builder(TokioExecutor::new()).build::<_, Body>(connector);
     let binds = if let Some(bind) = &settings.bind {
         vec![bind.clone()]
-    } else if settings.lan || settings.unprivileged {
+    } else if settings.lan
+        || (settings.unprivileged && settings.port < crate::ports::FIRST_UNPRIVILEGED_PORT)
+    {
+        // Wildcard binds permit unprivileged low ports on macOS; high ports stay on loopback.
         vec!["0.0.0.0".into(), "::".into()]
     } else {
         vec!["127.0.0.1".into(), "::1".into()]

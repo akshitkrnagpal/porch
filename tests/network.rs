@@ -150,6 +150,8 @@ async fn actual_http_tls_h2_ws_streaming_routing_and_redirects() {
                 "example.com".into(),
             ],
             redirect_port: tls.then_some(redirect_port),
+            // This case exercises the privileged hosts-sync authentication path.
+            unprivileged: false,
             ..ProxySettings::default()
         };
         porch::state::mutate(|s| {

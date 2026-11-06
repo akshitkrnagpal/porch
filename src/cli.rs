@@ -63,37 +63,37 @@ struct App {
     command: Vec<String>,
 }
 #[derive(Args, Debug, Default, Clone)]
-struct ProxyOptions {
+pub(crate) struct ProxyOptions {
     #[arg(short='p',long,value_parser=clap::value_parser!(u16).range(1..))]
-    port: Option<u16>,
+    pub(crate) port: Option<u16>,
     #[arg(long, conflicts_with = "no_tls")]
-    https: bool,
+    pub(crate) https: bool,
     #[arg(long)]
-    no_tls: bool,
+    pub(crate) no_tls: bool,
     #[arg(long)]
-    foreground: bool,
+    pub(crate) foreground: bool,
     #[arg(long)]
-    skip_trust: bool,
+    pub(crate) skip_trust: bool,
     #[arg(long)]
-    unprivileged: bool,
+    pub(crate) unprivileged: bool,
     #[arg(long)]
-    lan: bool,
+    pub(crate) lan: bool,
     #[arg(long)]
-    ip: Option<String>,
+    pub(crate) ip: Option<String>,
     #[arg(long, value_delimiter = ',')]
-    tld: Vec<String>,
+    pub(crate) tld: Vec<String>,
     #[arg(long)]
-    wildcard: bool,
+    pub(crate) wildcard: bool,
     #[arg(long, requires = "key")]
-    cert: Option<PathBuf>,
+    pub(crate) cert: Option<PathBuf>,
     #[arg(long, requires = "cert")]
-    key: Option<PathBuf>,
+    pub(crate) key: Option<PathBuf>,
     #[arg(long)]
-    bind: Option<String>,
+    pub(crate) bind: Option<String>,
     #[arg(long,value_parser=clap::value_parser!(u16).range(1..))]
-    redirect_port: Option<u16>,
+    pub(crate) redirect_port: Option<u16>,
     #[arg(long)]
-    state_dir: Option<PathBuf>,
+    pub(crate) state_dir: Option<PathBuf>,
 }
 #[derive(Subcommand, Debug)]
 enum ProxyCommand {
@@ -191,7 +191,16 @@ enum Commands {
         args: Vec<String>,
     },
     Lan,
-    Doctor,
+    Doctor {
+        /// Apply safe fixes; terminating stopped or orphaned launches still asks first.
+        #[arg(long)]
+        fix: bool,
+        /// Accept every fix, including terminating stopped or orphaned launches.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Interactive first-run setup: port, HTTPS, start at login, sharing.
+    Setup(crate::setup::SetupArgs),
     Trust,
     Workspace,
     /// Update porch to the latest release (or run `brew upgrade` for Homebrew installs).
@@ -381,7 +390,7 @@ pub async fn run() -> Result<i32> {
                     trust_if_needed(&s, o.skip_trust).await?;
                     return foreground(s).await.map(|_| 0);
                 }
-                start_proxy(s, o.skip_trust).await?;
+                start_proxy(s, o.skip_trust, port_explicit(&o)).await?;
             }
             ProxyCommand::Stop { port } => {
                 if port.is_some_and(|p| state::proxy_settings().is_ok_and(|s| s.port != p)) {
@@ -417,7 +426,11 @@ pub async fn run() -> Result<i32> {
         }
         Some(Commands::Share { args }) => integration("share", args).await?,
         Some(Commands::Lan) => integration("lan", vec![]).await?,
-        Some(Commands::Doctor) => integration("doctor", vec![]).await?,
+        Some(Commands::Doctor { fix, yes }) => {
+            integration("doctor", vec![]).await?;
+            crate::doctor::run(fix, yes).await?;
+        }
+        Some(Commands::Setup(args)) => crate::setup::run(args).await?,
         Some(Commands::Trust) => integration("trust", vec![]).await?,
         Some(Commands::Workspace) => {
             let cwd = std::env::current_dir()?;
@@ -427,7 +440,7 @@ pub async fn run() -> Result<i32> {
     }
     Ok(0)
 }
-async fn integration(name: &str, args: Vec<String>) -> Result<()> {
+pub(crate) async fn integration(name: &str, args: Vec<String>) -> Result<()> {
     let argv: Vec<String> = std::iter::once(name.into()).chain(args).collect();
     if requires_elevation(name, &argv[1..]) {
         let code = elevate(&argv).await?;
@@ -472,8 +485,14 @@ fn tlds(values: &[String]) -> Result<Vec<String>> {
     }
     Ok(out)
 }
-fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
-    let mut s = state::proxy_settings()?;
+/// Did the caller choose the proxy port (flag or PORCH_PORT)? Explicit ports never move.
+pub(crate) fn port_explicit(o: &ProxyOptions) -> bool {
+    o.port.is_some() || state::env("PORT").is_some()
+}
+pub(crate) fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
+    use crate::ports::{DEFAULT_PROXY_PORT, FIRST_UNPRIVILEGED_PORT};
+    let saved = state::proxy_settings()?;
+    let mut s = saved.clone();
     let tls_explicit = o.https || o.no_tls || state::env("HTTPS").is_some() || o.cert.is_some();
     if let Some(v) = enabled("HTTPS") {
         s.tls = v
@@ -484,13 +503,12 @@ fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
     if o.no_tls {
         s.tls = false
     }
-    if let Some(v) = enabled("UNPRIVILEGED") {
-        s.unprivileged = v
-    }
-    if o.unprivileged {
-        s.unprivileged = true
-    }
-    if s.unprivileged && !tls_explicit {
+    let unprivileged_choice = if o.unprivileged {
+        Some(true)
+    } else {
+        enabled("UNPRIVILEGED")
+    };
+    if unprivileged_choice == Some(true) && !tls_explicit {
         s.tls = false
     }
     if let Some(v) = enabled("LAN") {
@@ -540,16 +558,28 @@ fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
         .port
         .or_else(|| state::env("PORT").and_then(|p| p.parse().ok()));
     if state::env("PORT").is_some() && explicit_port.is_none() {
-        bail!("invalid proxy port")
+        bail!("invalid proxy port; set a number, e.g. `PORCH_PORT={DEFAULT_PROXY_PORT} porch proxy start`")
     }
     if let Some(p) = explicit_port {
         if p == 0 {
-            bail!("proxy port must be 1-65535")
+            bail!("proxy port must be 1-65535; run `porch proxy start --port {DEFAULT_PROXY_PORT}`")
         }
         s.port = p
-    } else if (s.port == 443 && !s.tls) || (s.port == 80 && s.tls) {
-        s.port = if s.tls { 443 } else { 80 }
+    } else if s.tls && (s.port == 80 || s.port == DEFAULT_PROXY_PORT) {
+        // HTTPS opt-in uses the standard port.
+        s.port = 443
+    } else if !s.tls && s.port == 443 {
+        s.port = DEFAULT_PROXY_PORT
     }
+    // Port and privilege mode are one choice: high ports never need sudo or
+    // hosts-file edits (browsers resolve *.localhost natively), unless the user
+    // explicitly asked for hosts synchronization.
+    let sync_requested = enabled("SYNC_HOSTS") == Some(true);
+    s.unprivileged = match unprivileged_choice {
+        Some(v) => v,
+        None if s.port >= FIRST_UNPRIVILEGED_PORT => !sync_requested,
+        None => saved.unprivileged && saved.port == s.port,
+    };
     if let Some(b) = &o.bind {
         let _: std::net::IpAddr = b.parse()?;
         s.bind = Some(b.clone())
@@ -562,15 +592,15 @@ fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
     if !s.tls {
         s.redirect_port = None
     }
-    if s.unprivileged && enabled("SYNC_HOSTS") == Some(true) {
-        bail!("SYNC_HOSTS=1 cannot be combined with unprivileged mode")
+    if s.unprivileged && sync_requested {
+        bail!("PORCH_SYNC_HOSTS=1 cannot be combined with --unprivileged; drop one, e.g. `PORCH_SYNC_HOSTS=0 porch proxy start --unprivileged`")
     }
     Ok(s)
 }
 fn proxy_identity() -> Option<ProcessIdentity> {
     serde_json::from_slice(&fs::read(state::dir().join("proxy.identity")).ok()?).ok()
 }
-fn proxy_running() -> bool {
+pub(crate) fn proxy_running() -> bool {
     proxy_identity().is_some_and(|p| state::matches(&p))
         && fs::read_to_string(state::dir().join("proxy.ready"))
             .ok()
@@ -597,7 +627,12 @@ struct ProxyGuard {
 impl Drop for ProxyGuard {
     fn drop(&mut self) {
         if proxy_identity().is_some_and(|p| p.pid == self.pid) {
-            for file in ["proxy.pid", "proxy.identity", "proxy.ready"] {
+            for file in [
+                "proxy.pid",
+                "proxy.identity",
+                "proxy.ready",
+                "proxy.version",
+            ] {
                 let _ = fs::remove_file(state::dir().join(file));
             }
         }
@@ -612,7 +647,75 @@ async fn foreground(s: ProxySettings) -> Result<()> {
     state::save_proxy_settings(&s)?;
     state::atomic_write("proxy.pid", i.pid.to_string().as_bytes())?;
     state::atomic_write("proxy.identity", &serde_json::to_vec(&i)?)?;
-    tokio::select! {r=crate::proxy::serve_config(s)=>r,s=signals.recv()=>{s?;Ok(())}}
+    state::atomic_write("proxy.version", PROXY_VERSION.as_bytes())?;
+    crate::health::reconcile_quietly();
+    let cleanup = tokio::spawn(crate::health::reconcile_forever(Duration::from_secs(5)));
+    let result = tokio::select! {r=crate::proxy::serve_config(s)=>r,s=signals.recv()=>{s?;Ok(())}};
+    cleanup.abort();
+    result
+}
+const PROXY_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Version recorded by the running proxy; `None` for proxies predating the record.
+pub(crate) fn running_proxy_version() -> Option<String> {
+    fs::read_to_string(state::dir().join("proxy.version"))
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+fn version_key(v: &str) -> Vec<u64> {
+    v.split(['-', '+'])
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .map(|p| p.parse().unwrap_or(0))
+        .collect()
+}
+/// A running proxy older than this binary (or with no recorded version).
+pub(crate) fn proxy_outdated() -> bool {
+    proxy_running()
+        && running_proxy_version().is_none_or(|v| version_key(&v) < version_key(PROXY_VERSION))
+}
+/// Restart an older running proxy with this binary. Routes live in state and survive.
+pub(crate) async fn restart_outdated_proxy() -> Result<bool> {
+    if !proxy_outdated() {
+        return Ok(false);
+    }
+    let settings = state::proxy_settings()?;
+    eprintln!(
+        "Restarting the Porch proxy: it runs {}, this porch is {PROXY_VERSION}. Routes are kept.",
+        running_proxy_version().unwrap_or_else(|| "an older version".into())
+    );
+    stop_proxy()
+        .await
+        .context("could not stop the outdated proxy; run `porch proxy stop` and retry")?;
+    Box::pin(start_proxy(settings, true, true)).await?;
+    Ok(true)
+}
+/// A busy proxy port: move to the next free port unless the user chose this one.
+pub(crate) fn move_off_busy_port(mut s: ProxySettings, explicit: bool) -> Result<ProxySettings> {
+    use crate::ports::{DEFAULT_PROXY_PORT, FIRST_UNPRIVILEGED_PORT};
+    let port = s.port;
+    let who = crate::ports::describe_owner(port);
+    let next = crate::ports::next_free(port.max(FIRST_UNPRIVILEGED_PORT))
+        .context("no free proxy port found nearby; run `porch proxy start --port <free port>`")?;
+    if explicit {
+        bail!("proxy port {port} unavailable: it is used by {who}. Stop that process, or use the next free port: `porch proxy start --port {next}`")
+    }
+    if port < FIRST_UNPRIVILEGED_PORT {
+        let fallback = if crate::ports::available(DEFAULT_PROXY_PORT) {
+            DEFAULT_PROXY_PORT
+        } else {
+            next
+        };
+        bail!("proxy port {port} unavailable: it is used by {who}. Use plain HTTP without sudo instead: `porch proxy start --no-tls --port {fallback}`")
+    }
+    s.port = next;
+    state::save_proxy_settings(&s)?;
+    eprintln!(
+        "Port {port} is used by {who}; Porch now uses port {next} (saved). Apps: {}",
+        s.url("<name>")
+    );
+    Ok(s)
 }
 fn settings_args(s: &ProxySettings) -> Vec<String> {
     let mut a = vec![
@@ -660,7 +763,7 @@ fn settings_args(s: &ProxySettings) -> Vec<String> {
     a
 }
 fn authenticate_sudo(interactive: bool, port: u16) -> Result<()> {
-    let guidance = format!("port {port} requires administrator privileges; run `porch proxy start` in a terminal to complete sudo setup, or choose `porch proxy start --unprivileged --port 1355 --no-tls` explicitly");
+    let guidance = format!("port {port} requires administrator privileges; run `porch proxy start` in a terminal to complete sudo setup, or switch to the no-sudo default: `porch proxy start --no-tls --port {}`", crate::ports::DEFAULT_PROXY_PORT);
     let mut command = Command::new("sudo");
     if !interactive {
         command.arg("-n");
@@ -678,12 +781,27 @@ fn authenticate_sudo(interactive: bool, port: u16) -> Result<()> {
     }
     Ok(())
 }
-async fn start_proxy(s: ProxySettings, skip_trust: bool) -> Result<()> {
+pub(crate) async fn start_proxy(
+    mut s: ProxySettings,
+    skip_trust: bool,
+    port_explicit: bool,
+) -> Result<()> {
+    if restart_outdated_proxy().await? {
+        return Ok(());
+    }
     let _startup = startup_lock().await?;
     if proxy_running() {
         let actual = state::proxy_settings()?;
-        if actual != s {
-            bail!("running proxy uses different settings; stop it first")
+        // Privilege mode is derived from the port; it alone never blocks reuse.
+        let comparable = ProxySettings {
+            unprivileged: actual.unprivileged,
+            ..s.clone()
+        };
+        if actual != comparable {
+            bail!(
+                "the running proxy uses different settings ({}); run `porch proxy stop` and retry",
+                actual.url("<name>")
+            )
         }
         trust_if_needed(&s, skip_trust).await?;
         return Ok(());
@@ -691,22 +809,55 @@ async fn start_proxy(s: ProxySettings, skip_trust: bool) -> Result<()> {
     // Detect privilege requirements before detaching; never leave a false ready marker.
     let mut needs_privilege = false;
     let mut privileged_port = s.port;
-    for port in std::iter::once(s.port).chain(s.redirect_port.filter(|p| s.tls && *p != s.port)) {
+    match crate::sockets::reserve(s.port) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            needs_privilege = true;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            let port = s.port;
+            let released = tokio::task::spawn_blocking(move || {
+                crate::ports::wait_released(port, Duration::from_secs(60))
+            })
+            .await?;
+            if !released {
+                s = move_off_busy_port(s, port_explicit)?;
+            }
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "proxy port {} unavailable; choose another: `porch proxy start --port {}`",
+                    s.port,
+                    crate::ports::DEFAULT_PROXY_PORT
+                )
+            })
+        }
+    }
+    if let Some(port) = s.redirect_port.filter(|p| s.tls && *p != s.port) {
         match crate::sockets::reserve(port) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 needs_privilege = true;
                 privileged_port = port;
             }
-            Err(e) => return Err(e).with_context(|| format!("proxy port {port} unavailable")),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "HTTP redirect port {port} unavailable: it is used by {}; run `porch proxy start --https --redirect-port 8080`",
+                        crate::ports::describe_owner(port)
+                    )
+                })
+            }
         }
     }
     let mut elevated = false;
     if needs_privilege {
         if s.unprivileged {
             bail!(
-                "this OS does not permit unprivileged binding on port {}; choose --port 1355",
-                s.port
+                "this OS does not permit unprivileged binding on port {}; run `porch proxy start --port {}`",
+                s.port,
+                crate::ports::DEFAULT_PROXY_PORT
             )
         }
         use std::io::IsTerminal;
@@ -800,11 +951,12 @@ async fn trust_if_needed(s: &ProxySettings, skip: bool) -> Result<()> {
     Ok(())
 }
 async fn ensure_proxy() -> Result<ProxySettings> {
-    let s = resolve_settings(&ProxyOptions::default())?;
-    start_proxy(s.clone(), enabled("SKIP_TRUST") == Some(true)).await?;
+    let o = ProxyOptions::default();
+    let s = resolve_settings(&o)?;
+    start_proxy(s, enabled("SKIP_TRUST") == Some(true), port_explicit(&o)).await?;
     state::proxy_settings()
 }
-async fn stop_proxy() -> Result<()> {
+pub(crate) async fn stop_proxy() -> Result<()> {
     let _startup = startup_lock().await?;
     if let Some(i) = proxy_identity() {
         if state::matches(&i) {
@@ -851,7 +1003,12 @@ async fn stop_proxy() -> Result<()> {
             }
         }
     };
-    for f in ["proxy.pid", "proxy.identity", "proxy.ready"] {
+    for f in [
+        "proxy.pid",
+        "proxy.identity",
+        "proxy.ready",
+        "proxy.version",
+    ] {
         match fs::remove_file(state::dir().join(f)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -932,24 +1089,44 @@ impl TerminationSignals {
     }
 }
 fn list(json: bool) -> Result<()> {
+    let (_, rows) = crate::health::reconcile()?;
     let s = state::load()?;
     let p = state::proxy_settings()?;
-    let routes:Vec<_>=s.routes.iter().filter(|r|state::route_alive(&s,r)).map(|r|serde_json::json!({"name":r.name,"url":p.url(&r.name),"target":r.target,"pid":r.pid,"urls":s.shares.get(&r.name)})).collect();
+    let routes: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let r = &row.route;
+            serde_json::json!({
+                "name": r.name,
+                "url": p.url(&r.name),
+                "target": r.target,
+                "pid": r.pid,
+                "urls": s.shares.get(&r.name),
+                "health": row.health.label(),
+                "stopped_seconds": row.stopped_for.map(|d| d.as_secs()),
+            })
+        })
+        .collect();
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(
-                &serde_json::json!({"routes":routes,"proxy":p,"running":proxy_running()})
-            )?
+            serde_json::to_string_pretty(&serde_json::json!({
+                "routes": routes,
+                "proxy": p,
+                "running": proxy_running(),
+                "proxy_version": running_proxy_version(),
+            }))?
         )
     } else if routes.is_empty() {
         println!("No active routes")
     } else {
-        for r in routes {
+        println!("{:<14} URL -> TARGET", "HEALTH");
+        for (row, r) in rows.iter().zip(&routes) {
             println!(
-                "{}  -> {}{}",
-                r["url"].as_str().unwrap(),
-                r["target"].as_str().unwrap(),
+                "{:<14} {}  -> {}{}",
+                row.health.label(),
+                r["url"].as_str().unwrap_or(""),
+                r["target"].as_str().unwrap_or(""),
                 r["pid"]
                     .as_u64()
                     .map(|p| format!(" (pid {p})"))
@@ -959,6 +1136,21 @@ fn list(json: bool) -> Result<()> {
                 for url in urls.values() {
                     println!("  {}", url.as_str().unwrap_or(""));
                 }
+            }
+            match row.health {
+                crate::health::Health::Ok => {}
+                crate::health::Health::NotListening => println!(
+                    "  nothing accepts connections on the target; make sure the app uses the PORT env var, then run `porch doctor`"
+                ),
+                crate::health::Health::Stopped => println!(
+                    "  processes are stopped{} (frozen by job control); run `porch doctor --fix`",
+                    row.stopped_for
+                        .map(|d| format!(" for {}s", d.as_secs()))
+                        .unwrap_or_default()
+                ),
+                crate::health::Health::Dead { .. } => println!(
+                    "  its launcher exited but app processes remain; run `porch prune --force`"
+                ),
             }
         }
     }
@@ -1144,7 +1336,44 @@ async fn evict_conflicts(names: &[String], settings: &ProxySettings, force: bool
     }
     Ok(())
 }
-async fn prune(force: bool) -> Result<()> {
+/// Terminate launches (including job-control stopped ones) and drop their routes.
+pub(crate) async fn terminate_routes(names: &[String]) -> Result<()> {
+    let s = state::load()?;
+    for n in names {
+        kill_route(&s, n, 15)?;
+        if let Some(owner) = s.owners.get(n) {
+            if state::matches(owner) && state::process_owned(owner.pid) {
+                signal_pid(owner.pid, 15);
+                #[cfg(unix)]
+                signal_pid(owner.pid, libc::SIGCONT);
+            }
+            #[cfg(unix)]
+            if let Some(child) = owner.child {
+                if state::group_matches(child, owner.child_started.as_deref()) {
+                    // Resume stopped members so the pending SIGTERM is delivered.
+                    signal_group(child, libc::SIGCONT);
+                }
+            }
+        }
+    }
+    let settings = state::proxy_settings()?;
+    evict_conflicts(names, &settings, true).await?;
+    state::mutate(|st| {
+        for n in names {
+            if st
+                .routes
+                .iter()
+                .find(|r| &r.name == n)
+                .is_some_and(|r| !state::route_alive(st, r))
+            {
+                state::remove_route(st, n);
+            }
+        }
+    })?;
+    crate::health::reconcile_quietly();
+    Ok(())
+}
+pub(crate) async fn prune(force: bool) -> Result<()> {
     let old = state::load()?;
     let names: Vec<_> = old
         .routes
@@ -1357,7 +1586,17 @@ async fn spawn_prepared(
             p.port.unwrap()
         );
     }
+    let listen_check = p.port.filter(|_| p.lease.is_some()).map(|port| {
+        tokio::spawn(crate::health::listen_check(
+            port,
+            id,
+            p.plan.command.join(" "),
+        ))
+    });
     let code = tokio::select! {status=child.wait()=>child_status(status?),failure=share_failure(&mut p.shares)=>{signal_group(id,15);let _=tokio::time::timeout(Duration::from_secs(3),child.wait()).await;failure?;bail!("sharing tunnel stopped")},changed=shutdown.changed()=>{changed?;let sig=(*shutdown.borrow()).unwrap_or(15);signal_group(id,sig);match tokio::time::timeout(Duration::from_secs(3),child.wait()).await{Ok(r)=>{r?;},Err(_)=>{signal_group(id,9);let _=child.wait().await;}}128+sig}};
+    if let Some(task) = listen_check {
+        task.abort();
+    }
     let mut transferred = false;
     if code == 0 && shutdown.borrow().is_none() {
         if let (Some(port), Some(lease)) = (p.port, p.lease.as_ref()) {
@@ -1438,6 +1677,7 @@ async fn launch_extra(
     // Subscribe before publishing route ownership, so a signal observed by a
     // supervising caller cannot fall into the registration-to-spawn window.
     let mut signals = TerminationSignals::new()?;
+    crate::health::reconcile_quietly();
     let cwd = std::env::current_dir()?;
     let explicit = !command.is_empty();
     if let Some(port) = options.app_port {
@@ -1655,6 +1895,7 @@ fn clean_state() -> Result<()> {
             "proxy.pid",
             "proxy.identity",
             "proxy.ready",
+            "proxy.version",
             "ca.pem",
             "ca-key.pem",
             "hosts-sync.token",
@@ -1883,10 +2124,7 @@ mod elevation_tests {
         if std::env::var_os("PORCH_SUDO_EXPECT_FAILURE").is_some() {
             let message = format!("{:#}", result.unwrap_err());
             assert!(message.contains("terminal"), "{message}");
-            assert!(
-                message.contains("--unprivileged --port 1355 --no-tls"),
-                "{message}"
-            );
+            assert!(message.contains("--no-tls --port 7462"), "{message}");
             println!("ELEVATION_FAILURE_OK");
         } else {
             result.unwrap();

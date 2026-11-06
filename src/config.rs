@@ -1094,6 +1094,69 @@ fn unsafe_script(raw: &str) -> bool {
     false
 }
 
+/// Package-manager subcommands that never run a same-named package script.
+const PACKAGE_MANAGER_BUILTINS: &[&str] = &[
+    "add",
+    "audit",
+    "bin",
+    "cache",
+    "config",
+    "create",
+    "dedupe",
+    "dlx",
+    "exec",
+    "i",
+    "import",
+    "info",
+    "init",
+    "install",
+    "link",
+    "list",
+    "ls",
+    "outdated",
+    "pack",
+    "patch",
+    "publish",
+    "rebuild",
+    "remove",
+    "rm",
+    "root",
+    "run",
+    "run-script",
+    "store",
+    "unlink",
+    "up",
+    "update",
+    "upgrade",
+    "view",
+    "why",
+    "workspace",
+    "workspaces",
+    "x",
+];
+
+/// Resolve `npm run dev`, `pnpm dev`, `pnpm run dev`, `yarn dev`, `bun dev` and `bun run dev`
+/// to the package script's raw text and the index where forwarded arguments begin.
+/// npm has no script shorthand, so `npm dev` is not treated as a script.
+pub fn package_script_call(command: &[String], cwd: &Path) -> Option<(String, usize)> {
+    let pm = basename(command.first()?);
+    if !["npm", "pnpm", "yarn", "bun"].contains(&pm) {
+        return None;
+    }
+    let first = command.get(1)?;
+    let (script, rest) = if first == "run" || (pm == "npm" && first == "run-script") {
+        (command.get(2)?, 3)
+    } else if pm != "npm" && !PACKAGE_MANAGER_BUILTINS.contains(&first.as_str()) {
+        (first, 2)
+    } else {
+        return None;
+    };
+    if script.starts_with('-') {
+        return None;
+    }
+    resolve_script_raw(script, cwd).map(|raw| (raw, rest))
+}
+
 /// Adapt direct frameworks and package scripts without retokenizing shell scripts.
 pub fn adapt_command(
     command: &[String],
@@ -1106,15 +1169,11 @@ pub fn adapt_command(
     }
     let mut out = command.to_vec();
     let direct = framework_invocation(command);
-    let package = if command.len() >= 3
-        && ["npm", "pnpm", "yarn", "bun"].contains(&basename(&command[0]))
-        && command[1] == "run"
-        && !command[2].starts_with('-')
-    {
-        resolve_script_raw(&command[2], cwd)
-    } else {
-        None
-    };
+    let script_call = package_script_call(command, cwd);
+    let package = script_call.as_ref().map(|(raw, _)| raw.clone());
+    let rest = script_call
+        .as_ref()
+        .map_or(command.len(), |(_, rest)| *rest);
     let script_tokens = package.as_deref().map(split_command);
     // Keep the framework identity even for compound scripts whose argv cannot be altered.
     let resolved_name = direct.as_ref().map(|i| i.name.clone()).or_else(|| {
@@ -1139,7 +1198,7 @@ pub fn adapt_command(
                     probe.extend(
                         command
                             .iter()
-                            .skip(3)
+                            .skip(rest)
                             .filter(|s| s.as_str() != "--")
                             .cloned(),
                     );
@@ -1263,13 +1322,9 @@ fn write_turbo_manifest_at(
             let lan = entry.get("PORTLESS_LAN").is_some_and(|s| s == "1");
             let direct = framework_invocation(&command);
             let name = direct.as_ref().map(|inv| inv.name.clone()).or_else(|| {
-                if command.len() >= 3 && command[1] == "run" {
-                    resolve_script_raw(&command[2], cwd)
-                        .and_then(|s| framework_invocation(&split_command(&s)))
-                        .map(|inv| inv.name)
-                } else {
-                    None
-                }
+                package_script_call(&command, cwd)
+                    .and_then(|(s, _)| framework_invocation(&split_command(&s)))
+                    .map(|inv| inv.name)
             });
             let (adapted, _) = adapt_command(&command, cwd, port, lan)?;
             let count = adapted.len().saturating_sub(command.len());

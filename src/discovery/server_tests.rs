@@ -371,7 +371,7 @@ async fn real_tls_pair_auth_origin_limits_and_two_distinct_nodes_route_to_correc
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, format!("{label}|web.localhost|none"));
+        assert_eq!(body, format!("{label}|web.localhost:7462|none"));
     }
     let (status, _) = call(
         &b,
