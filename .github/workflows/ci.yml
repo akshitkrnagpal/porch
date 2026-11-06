@@ -1,0 +1,30 @@
+name: CI
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check implementation availability
+        id: implementation
+        shell: bash
+        run: |
+          if test -f Cargo.toml; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::Bootstrap checkout: Cargo.toml is absent; Rust checks did not run.'
+          fi
+      - run: cargo fmt --all -- --check
+        if: steps.implementation.outputs.ready == 'true'
+      - run: cargo test --all-targets
+        if: steps.implementation.outputs.ready == 'true'

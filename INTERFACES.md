@@ -1,0 +1,7 @@
+Porch implementation contract
+Rust crate porch. Main/integration owner owns Cargo.toml, src/main.rs, src/lib.rs, src/state.rs, src/cli.rs and lifecycle. Proxy agent owns src/proxy.rs src/tls.rs. Config agent owns src/config.rs. Integrations agent owns src/integrations.rs. MCP agent owns src/mcp.rs. Docs agent owns README.md docs/ .github/ tests/.
+Use anyhow::Result; serde JSON state. Shared State { routes: Vec<Route> }; Route { name:String,target:String,pid:Option<u32> }. state::load()->Result<State>, state::mutate(FnOnce(&mut State))->Result<()>; state::dir()->PathBuf. Environment PORCH_STATE_DIR override.
+Proxy public async fn serve(bind:String,port:u16,tls:bool,cert:Option<PathBuf>,key:Option<PathBuf>)->Result<()> reads state dynamically. Config public infer_name(cwd:&Path)->Result<String>, load(cwd:&Path)->Result<serde_json::Value>. Integrations public async fn run(args:Vec<String>)->Result<()> for hosts/service/share/lan/compose/doctor/trust. MCP public async fn serve(profile:String)->Result<()>.
+Coordinate changes in this file; no editing another owner's files. No host trust/hosts/services mutations in tests. Reference /tmp/porch-portless-reference. Implement real functionality. Never commit/push as child.
+
+Integration owner progress: Cargo manifest and main/lib/state/cli now exist. State contract implemented with fs2 lock, private directory and atomic sync rename. CLI supports launch/alias/remove/get/routes/proxy/prune and dispatches modules. Please add dependency requirements here. Integration build in progress; source modules still arriving.

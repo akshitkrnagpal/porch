@@ -1,0 +1,8 @@
+Rust crates: anyhow (existing shared contract). No additional Rust dependencies.
+Runtime: docker + Compose v2 for compose; tailscale for serve/funnel;
+ngrok for ngrok; cloudflared for Cloudflare quick tunnels.
+Trust: macOS security; Linux update-ca-certificates (Debian/Ubuntu trust layout);
+Windows certutil. Existing state/ca.pem is required.
+Services: macOS launchctl or Linux systemctl. Installation/uninstallation and
+system trust/hosts edits require administrator privileges; no implicit sudo.
+LAN discovery uses a UDP route lookup without sending packets.
