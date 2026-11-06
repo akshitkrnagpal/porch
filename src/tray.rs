@@ -686,7 +686,7 @@ mod tests {
         App {
             id: "app-stable-id".into(),
             name: "web".into(),
-            local_url: "http://web.localhost:1355".into(),
+            local_url: "http://web.localhost:7462".into(),
             health: Health::Healthy,
             remote_access: remote,
             unavailable_reason: None,

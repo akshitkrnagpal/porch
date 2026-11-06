@@ -380,7 +380,7 @@ pub async fn request_hosts_sync() -> Result<()> {
             if capability["pid"].as_u64() == ready.trim().parse::<u64>().ok()
                 && capability["writable"] == false
             {
-                return Err(direct_error).context("the running proxy cannot write the hosts file; run `sudo porch hosts sync` for custom domains, or use --unprivileged with .localhost");
+                return Err(direct_error).context(format!("the running proxy cannot write the hosts file; for custom domains run `sudo porch hosts sync`, or use the no-sudo default: `porch proxy start --port {}`", crate::ports::DEFAULT_PROXY_PORT));
             }
         }
     }
@@ -596,11 +596,20 @@ fn service_settings(args: &[String]) -> Result<crate::state::ProxySettings> {
     if !tlds.is_empty() {
         s.tlds = tlds;
     }
+    let explicit_unprivileged = s.unprivileged;
     if s.unprivileged && !explicit_tls {
         s.tls = false;
     }
     if !explicit_port {
-        s.port = if s.tls { 443 } else { 80 };
+        s.port = if s.tls {
+            443
+        } else {
+            crate::ports::DEFAULT_PROXY_PORT
+        };
+    }
+    // High ports never need hosts-file edits or elevation.
+    if !explicit_unprivileged && s.port >= crate::ports::FIRST_UNPRIVILEGED_PORT {
+        s.unprivileged = true;
     }
     if s.port == 0 {
         bail!("proxy port must be nonzero");

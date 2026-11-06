@@ -319,10 +319,10 @@ fn orphan_prune_kills_child_group_and_preserves_static_alias() {
 
 #[cfg(unix)]
 #[test]
-fn https_default_ca_environment_allows_node_to_call_another_app() {
+fn https_opt_in_ca_environment_allows_node_to_call_another_app() {
     let s = Sandbox::new();
     let mut server=s.command(&["secure","node","-e","require('http').createServer((q,r)=>r.end('from-secure')).listen(process.env.PORT,'127.0.0.1')"])
-      .env_remove("PORCH_HTTPS").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+      .env("PORCH_HTTPS", "1").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     s.wait_route("secure");
     let settings: serde_json::Value =
         serde_json::from_slice(&std::fs::read(s.root.join("state/proxy.json")).unwrap()).unwrap();
@@ -330,7 +330,7 @@ fn https_default_ca_environment_allows_node_to_call_another_app() {
     let script=format!("const https=require('https');let n=0;function fetch(){{https.get({{hostname:'127.0.0.1',port:{},servername:'secure.localhost',headers:{{host:'secure.localhost'}}}},r=>{{let b='';r.on('data',c=>b+=c);r.on('end',()=>{{console.log(b);process.exit(b==='from-secure'?0:1)}})}}).on('error',e=>{{if(++n<50)setTimeout(fetch,30);else{{console.error(e);process.exit(1)}}}})}}fetch()",s.port);
     let output = s
         .command(&["client", "node", "-e", &script])
-        .env_remove("PORCH_HTTPS")
+        .env("PORCH_HTTPS", "1")
         .output()
         .unwrap();
     unsafe {
