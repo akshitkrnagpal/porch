@@ -1,21 +1,57 @@
-name: Build release artifacts
+name: Release
+# Pushing a tag vX.Y.Z (matching Cargo.toml) builds every target, publishes a
+# GitHub Release with the tarballs and SHA256SUMS, then updates the Homebrew tap.
+# A manual run builds and uploads workflow artifacts only; it never publishes.
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        name: Tag must match Cargo.toml version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          echo "Cargo.toml version: $version"
+          if [ "$REF_TYPE" = tag ] && [ "$REF_NAME" != "v$version" ]; then
+            echo "::error::tag $REF_NAME does not match Cargo.toml version v$version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: version
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            test: true
           - os: macos-15
             target: aarch64-apple-darwin
+            test: true
+          # Cross-compiled on the Apple Silicon runner; not executed in CI.
+          - os: macos-15
+            target: x86_64-apple-darwin
+            test: false
     runs-on: ${{ matrix.os }}
     env:
       PORCH_TEST_TURBO_REQUIRED: "1"
+      PORCH_NO_UPDATE_CHECK: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -27,24 +63,95 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-release.yml-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}-release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - run: npm install --global turbo@2.6.3
+      - if: matrix.test
+        run: npm install --global turbo@2.6.3
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libdbus-1-dev
-      - run: cargo test --features tray --lib tray::tests
-      - run: python3 scripts/test_packaging.py
-      - run: cargo test --no-fail-fast --release --target ${{ matrix.target }} --all-targets
+      - if: matrix.test
+        run: cargo test --features tray --lib tray::tests
+      - if: matrix.test
+        run: python3 scripts/test_packaging.py
+      - if: matrix.test
+        run: cargo test --no-fail-fast --release --target ${{ matrix.target }} --all-targets
       - run: cargo build --release --target ${{ matrix.target }} --bin porch
       - run: cargo build --release --target ${{ matrix.target }} --features tray --bin porch-tray
+      - if: matrix.test
+        name: Built binary reports the release version
+        run: target/${{ matrix.target }}/release/porch --version | grep -Fx "porch ${{ needs.version.outputs.version }}"
       - run: python3 scripts/package.py --target ${{ matrix.target }} --binaries target/${{ matrix.target }}/release
       - uses: actions/upload-artifact@v7
         with:
           name: porch-${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: dist/porch-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz
           if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: porch-*
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum porch-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "Porch $TAG" --generate-notes --verify-tag
+      - uses: actions/upload-artifact@v7
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+
+  homebrew:
+    if: github.ref_type == 'tag'
+    needs: [version, release]
+    runs-on: ubuntu-24.04
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      TAP_REPO: akshitkrnagpal/homebrew-tap
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - if: env.HOMEBREW_TAP_TOKEN == ''
+        run: echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the Homebrew tap update. Render it locally with scripts/render_formula.py."
+      - if: env.HOMEBREW_TAP_TOKEN != ''
+        uses: actions/checkout@v7
+      - if: env.HOMEBREW_TAP_TOKEN != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: SHA256SUMS
+          path: dist
+      - if: env.HOMEBREW_TAP_TOKEN != ''
+        name: Commit Formula/porch.rb to the tap
+        run: |
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          python3 scripts/render_formula.py --version "$VERSION" --sums dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --output tap/Formula/porch.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/porch.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date."
+            exit 0
+          fi
+          git commit -m "porch ${VERSION}"
+          git push origin HEAD

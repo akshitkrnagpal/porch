@@ -120,6 +120,22 @@ LAN advertisement publishes route-specific `.local` names and refreshes route/IP
 
 `doctor` reports proxy/state/routes, hostname resolution, trust, and external-tool prerequisites. `prune [--force]` terminates stale owned children; `clean` performs explicit teardown.
 
+## Updates
+
+`porch self-update` upgrades Porch. When the running binary lives in a Homebrew Cellar it prints and runs `brew upgrade akshitkrnagpal/tap/porch`. Otherwise it reads the latest GitHub Release, downloads `porch-VERSION-TARGET.tar.gz`, verifies it against the release `SHA256SUMS`, and atomically replaces the running executable (temp file beside it, fsync, rename, `porch.old` kept until `porch --version` reports the new version). `porch-tray`/`porch-login` beside it and, on macOS, an installed `~/Applications/Porch.app` are replaced too. Running apps, the proxy, and the tray keep running; a proxy started by the previous version is restarted on next use. Binaries inside a Cargo `target/` directory are refused unless `--force`.
+
+`--check` prints current and latest versions and exits 0 (up to date), 1 (update available), or 2 (error). `--dry-run` prints the plan without downloading or running brew. `--force` reinstalls the latest release.
+
+| Variable | Behavior |
+| --- | --- |
+| `PORCH_UPDATE_REPO` | Release repository, default `akshitkrnagpal/porch` |
+| `PORCH_UPDATE_API` | GitHub API base URL, default `https://api.github.com` |
+| `GITHUB_TOKEN`, `GH_TOKEN` | Token for private repositories; `porch self-update` also tries `gh auth token` |
+| `PORCH_NO_UPDATE_CHECK=1` | Disable the passive update notice |
+| `PORCH_APP_DIR` | Directory holding the installed `Porch.app`, default `~/Applications` |
+
+Interactive commands check for a newer release in a background thread (2 s timeout) at most once per 24 hours, caching the result in `STATE_DIR/update-check.json`, and print at most one dim line per day: `porch 0.3.1 is available — run porch self-update`. The check is skipped when stderr is not a terminal, for `--json` output, `mcp`, `tray`, `self-update`, under `CI`, and when running as root. The passive check never invokes `gh`.
+
 ## MCP
 
 `porch mcp [--tools core,proxy,diagnostics,all]` serves newline-delimited stdio JSON-RPC. `default` aliases `core`; `full` aliases `all`. Core exposes list/get/static alias management and profile discovery; proxy adds start/stop; diagnostics adds doctor/prune/version. The server does not spawn development servers. Tool arguments include `cwd`, `extraArgs`, and `timeoutMs`, with typed route/proxy options where applicable. Foreground commands are rejected. Stdout is reserved for protocol responses.
