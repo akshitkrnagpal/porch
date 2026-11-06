@@ -1251,6 +1251,7 @@ try {{
   }};
   var cwd = normalize(process.cwd());
   var entry = Object.entries(entries).find(function(pair) {{ return normalize(pair[0]) === cwd; }});
+  if (!entry && process.env.PORCH_DEBUG) console.error("Porch workspace lookup", cwd, Object.keys(entries));
   entry = entry && entry[1];
   if (entry) {{
     for (var key of Object.keys(entry)) if (!key.startsWith("_PORCH_")) process.env[key] = entry[key];
@@ -1317,6 +1318,7 @@ mod turbo_loader_tests {
             .arg("dev")
             .current_dir(&app)
             .env("NODE_OPTIONS", &options)
+            .env("PORCH_DEBUG", "1")
             .output()
             .unwrap();
         assert!(
@@ -1325,7 +1327,12 @@ mod turbo_loader_tests {
             String::from_utf8_lossy(&result.stderr)
         );
         let value: Value = serde_json::from_slice(&result.stdout).unwrap();
-        assert_eq!(value["port"], "4567");
+        assert_eq!(
+            value["port"],
+            "4567",
+            "options={options}; stderr={}",
+            String::from_utf8_lossy(&result.stderr)
+        );
         assert_eq!(value["url"], "https://web.localhost");
         assert_eq!(
             value["args"],
@@ -1346,6 +1353,7 @@ mod turbo_loader_tests {
             .arg("dev")
             .current_dir(&app)
             .env("NODE_OPTIONS", &options)
+            .env("PORCH_DEBUG", "1")
             .output()
             .unwrap();
         let value: Value = serde_json::from_slice(&result.stdout).unwrap();
