@@ -9,29 +9,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     env:
       PORCH_TEST_TURBO_REQUIRED: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: cargo-${{ runner.os }}-release.yml-${{ hashFiles('Cargo.lock') }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: npm install --global turbo@2.6.3
@@ -43,7 +43,7 @@ jobs:
       - run: cargo build --release --target ${{ matrix.target }} --bin porch
       - run: cargo build --release --target ${{ matrix.target }} --features tray --bin porch-tray
       - run: python3 scripts/package.py --target ${{ matrix.target }} --binaries target/${{ matrix.target }}/release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: porch-${{ matrix.target }}
           path: dist/*.tar.gz
