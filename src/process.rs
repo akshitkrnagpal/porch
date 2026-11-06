@@ -524,24 +524,34 @@ mod tests {
                 "127.0.0.1",
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         configure(&mut command);
         let mut child = command.spawn().unwrap();
         let pid = child.id().unwrap();
         let guard = TreeGuard::new(&child).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    return Err(format!("Python exited: {status}"));
+                }
                 if tokio::net::TcpStream::connect(("127.0.0.1", port))
                     .await
                     .is_ok()
                 {
-                    break;
+                    return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
-        .await
-        .unwrap();
+        .await;
+        if !matches!(ready, Ok(Ok(()))) {
+            drop(guard);
+            let output = child.wait_with_output().await.unwrap();
+            panic!(
+                "Python HTTP server failed to bind: {ready:?}; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         assert_eq!(listening_process(port), Some(pid));
         drop(guard);
         child.wait().await.unwrap();
