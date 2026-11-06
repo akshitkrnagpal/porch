@@ -94,7 +94,7 @@ fn command(program: &str, args: &[String]) -> Result<String> {
         .with_context(|| format!("{program} failed: {}", String::from_utf8_lossy(&err)))?;
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
-fn exec(program: &str, args: &[&str]) -> Result<String> {
+pub(crate) fn exec(program: &str, args: &[&str]) -> Result<String> {
     command(
         program,
         &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -431,14 +431,14 @@ pub async fn request_hosts_sync() -> Result<()> {
     Ok(())
 }
 
-fn xml(s: &str) -> String {
+pub(crate) fn xml(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
-fn systemd_quote(s: &str) -> Result<String> {
+pub(crate) fn systemd_quote(s: &str) -> Result<String> {
     if s.contains(['\n', '\r', '\0']) {
         bail!("invalid service argument");
     }

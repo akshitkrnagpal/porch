@@ -149,9 +149,10 @@ pub async fn run(a: SetupArgs) -> Result<()> {
 
     // 3. Start at login (reuses the service integration).
     let service_installed = state::dir().join("service.json").exists();
+    let autostart_installed = crate::discovery::autostart::installed();
     let service = confirm(
         "Start Porch automatically at login? (installs a system service; asks for sudo)",
-        service_installed,
+        service_installed || autostart_installed,
         interactive,
     );
 
@@ -226,6 +227,21 @@ pub async fn run(a: SetupArgs) -> Result<()> {
         match crate::discovery::disable().await {
             Ok(()) => sharing = false,
             Err(e) => println!("Sharing is still on ({e:#}); run `porch discovery disable`"),
+        }
+    }
+
+    // Start at login covers sharing too, or paired machines lose this one at reboot.
+    if service && sharing && !crate::discovery::autostart::installed() {
+        if let Err(e) = crate::discovery::autostart::enable().await {
+            println!(
+                "Sharing will not start at login ({e:#}); run `porch discovery autostart enable`"
+            );
+        }
+    } else if !service && crate::discovery::autostart::installed() {
+        if let Err(e) = crate::discovery::autostart::disable().await {
+            println!(
+                "Sharing still starts at login ({e:#}); run `porch discovery autostart disable`"
+            );
         }
     }
 

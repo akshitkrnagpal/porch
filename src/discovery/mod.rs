@@ -1,4 +1,5 @@
 //! Opt-in discovery agent lifecycle and shared browser actions.
+pub mod autostart;
 pub mod client;
 pub mod commands;
 pub mod gateway;
@@ -53,6 +54,10 @@ pub async fn enable(config: ServerConfig) -> Result<()> {
         bail!("discovery already running; disable it before changing its exposure")
     }
     server::configure(config)?;
+    spawn_agent().await
+}
+/// Start the configured agent as a detached process and wait until it is ready.
+async fn spawn_agent() -> Result<()> {
     let _ = fs::remove_file(crate::state::dir().join("discovery.ready"));
     let log = private_file(crate::state::dir().join("discovery.log"))?;
     let mut command = tokio::process::Command::new(std::env::current_exe()?);
@@ -104,7 +109,19 @@ impl Drop for AgentGuard {
         }
     }
 }
-pub async fn serve() -> Result<()> {
+pub async fn serve(autostart: bool) -> Result<()> {
+    if autostart {
+        // Login startup must not fail-loop: an agent that is already running, or
+        // sharing that was turned off, is a clean exit for launchd/systemd.
+        if running() {
+            eprintln!("Porch discovery is already running");
+            return Ok(());
+        }
+        if server::config()?.is_none() {
+            eprintln!("Porch discovery is disabled; nothing to start");
+            return Ok(());
+        }
+    }
     let _lock = lock("discovery.agent.lock")?;
     let identity = crate::state::identity(std::process::id()).context("cannot identify agent")?;
     crate::state::atomic_write("discovery.identity", &serde_json::to_vec(&identity)?)?;
@@ -140,6 +157,8 @@ async fn stop_identity(identity: &crate::state::ProcessIdentity) -> Result<()> {
 }
 pub async fn disable() -> Result<()> {
     let _lock = lock("discovery.start.lock")?;
+    // Sharing off also means not starting it again at the next login.
+    autostart::remove()?;
     if let Some(i) = process_identity("discovery") {
         stop_identity(&i).await?;
     }
@@ -153,6 +172,8 @@ pub struct Status {
     pub config: Option<ServerConfig>,
     pub machine: Machine,
     pub fingerprint: Option<String>,
+    /// Discovery starts at login (`porch discovery autostart`).
+    pub autostart: bool,
 }
 pub fn status() -> Result<Status> {
     let config = server::config()?;
@@ -162,6 +183,7 @@ pub fn status() -> Result<Status> {
         fingerprint: config.as_ref().map(|_| server::fingerprint()).transpose()?,
         config,
         machine: server::identity()?,
+        autostart: autostart::installed(),
     })
 }
 

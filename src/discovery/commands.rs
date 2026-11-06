@@ -17,7 +17,16 @@ pub enum Command {
         no_advertise: bool,
     },
     /// Run the configured agent in the foreground (no startup service is installed).
-    Serve,
+    Serve {
+        /// Used by login startup: exit cleanly if already running or disabled.
+        #[arg(long, hide = true)]
+        autostart: bool,
+    },
+    /// Start sharing automatically at login (per-user; no sudo).
+    Autostart {
+        #[arg(value_enum)]
+        action: AutostartAction,
+    },
     /// Stop only the discovery agent and remove its exposure configuration.
     Disable,
     Status {
@@ -41,6 +50,12 @@ pub enum Command {
         #[arg(long, default_value_t = 0)]
         port: u16,
     },
+}
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum AutostartAction {
+    Enable,
+    Disable,
+    Status,
 }
 /// Pair two machines. Run `porch pair` on one to show a code, then
 /// `porch pair CODE` on the other. Both can then open each other's apps.
@@ -82,6 +97,7 @@ pub async fn pair(args: PairArgs) -> Result<()> {
                 "Open its apps at {} (porch list --all shows them).",
                 super::pairing::url_template(&peer.slug)
             );
+            autostart_hint();
         }
         return Ok(());
     }
@@ -111,7 +127,14 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     }
     let name = super::pairing::wait(&shown.id).await?;
     println!("Paired with {name}");
+    autostart_hint();
     Ok(())
+}
+/// Sharing started by pairing stops at reboot unless login startup is on.
+fn autostart_hint() {
+    if super::server::config().is_ok_and(|c| c.is_some()) && !super::autostart::installed() {
+        eprintln!("To keep sharing after a restart: porch discovery autostart enable");
+    }
 }
 pub async fn unpair(machine: &str) -> Result<()> {
     let (peer, reached) = super::pairing::unpair(machine).await?;
@@ -171,7 +194,31 @@ pub async fn run(command: Command) -> Result<()> {
             .await?;
             eprintln!("Porch discovery enabled. Pair a machine with `porch pair`.");
         }
-        Command::Serve => serve().await?,
+        Command::Serve { autostart } => serve(autostart).await?,
+        Command::Autostart { action } => match action {
+            AutostartAction::Enable => {
+                if super::autostart::enable().await? {
+                    eprintln!("Porch discovery now starts at login.");
+                } else {
+                    eprintln!(
+                        "Porch discovery now starts at login. It is not ready yet and is retried every 30s; see {}",
+                        crate::state::dir().join("discovery.log").display()
+                    );
+                }
+            }
+            AutostartAction::Disable => {
+                super::autostart::disable().await?;
+                eprintln!("Porch discovery no longer starts at login. Sharing is unchanged.");
+            }
+            AutostartAction::Status => println!(
+                "{}",
+                if super::autostart::installed() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
+        },
         Command::Disable => {
             disable().await?;
             eprintln!("Porch discovery disabled; apps and proxy remain running.");
@@ -199,6 +246,14 @@ pub async fn run(command: Command) -> Result<()> {
                 if let Some(pin) = status.fingerprint {
                     println!("Certificate SHA-256: {pin}");
                 }
+                println!(
+                    "Start at login: {}",
+                    if status.autostart {
+                        "on"
+                    } else {
+                        "off (porch discovery autostart enable)"
+                    }
+                );
             }
         }
         Command::PairToken => println!("{}", server::create_pairing_token()?),
