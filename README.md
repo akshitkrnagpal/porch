@@ -2,6 +2,8 @@
 
 Porch gives local development servers stable names such as `https://web.localhost`, assigns free app ports, and manages the shared reverse proxy and child processes. It is a Rust implementation of the [Portless](https://github.com/vercel-labs/portless) development workflow.
 
+**Supported release targets:** macOS Apple Silicon and Linux x86_64. Windows is deferred and is not included in CI or release artifacts.
+
 Build and run:
 
 ```sh
@@ -39,6 +41,6 @@ Use `portless.json` or the `package.json` `portless` key for app configuration. 
 
 Porch supports multiple TLDs, strict or parent-wildcard routing, IPv4/IPv6 listeners, HTTP/2, WebSockets including extended CONNECT, streamed responses, LAN discovery, static aliases, Docker Compose, sharing providers, startup services, and stdio MCP. See the [command and configuration reference](docs/reference.md) and [evidence-based compatibility matrix](docs/feature-comparison.md).
 
-`trust`, `hosts`, `service`, and `clean` manage the corresponding OS resources when explicitly invoked. Automated tests use isolated state, temporary hosts files, and fake external CLIs. Real OS trust/startup installation, authenticated public tunnels, and physical LAN discovery still require platform/service verification; generated Windows/Linux definitions and command flows have been tested with fixtures on macOS.
+`trust`, `hosts`, `service`, and `clean` manage the corresponding OS resources when explicitly invoked. Automated tests use isolated state, temporary hosts files, and fake external CLIs. Real OS trust/startup installation, authenticated public tunnels, and physical LAN discovery still require platform/service verification; service definitions and command flows have been tested with fixtures; privileged installation remains unverified.
 
 Run `cargo test --all-targets` for acceptance coverage. The test suite uses Node.js/npm, Python 3, and Git for real child-process fixtures. No public release is published by the build workflow.
