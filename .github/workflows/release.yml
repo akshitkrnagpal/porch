@@ -24,6 +24,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-release.yml-${{ hashFiles('Cargo.lock') }}
       - uses: actions/setup-node@v4
         with:
           node-version: '24'

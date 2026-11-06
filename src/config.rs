@@ -1269,7 +1269,7 @@ try {{
       }}
     }}
   }}
-}} catch (_) {{}}
+}} catch (error) {{ throw new Error("Porch could not load workspace environment: " + error.message); }}
 "#,
         serde_json::to_string(&manifest)?
     );
