@@ -633,6 +633,8 @@ fn listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
         socket2::Domain::IPV4
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    // Windows SO_REUSEADDR permits overlapping live listeners.
+    #[cfg(not(windows))]
     socket.set_reuse_address(true)?;
     if addr.is_ipv6() {
         socket.set_only_v6(true)?;

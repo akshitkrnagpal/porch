@@ -1244,7 +1244,14 @@ fn write_turbo_manifest_at(
         r#""use strict";
 try {{
   var fs = require("fs"), path = require("path");
-  var entry = JSON.parse(fs.readFileSync({}, "utf8"))[process.cwd()];
+  var entries = JSON.parse(fs.readFileSync({}, "utf8"));
+  var normalize = function(p) {{
+    var resolved = fs.realpathSync(p);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  }};
+  var cwd = normalize(process.cwd());
+  var entry = Object.entries(entries).find(function(pair) {{ return normalize(pair[0]) === cwd; }});
+  entry = entry && entry[1];
   if (entry) {{
     for (var key of Object.keys(entry)) if (!key.startsWith("_PORCH_")) process.env[key] = entry[key];
     var spec = entry._PORCH_FRAMEWORK && JSON.parse(entry._PORCH_FRAMEWORK);
