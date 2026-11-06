@@ -4,7 +4,7 @@ Porch 0.2 adds an optional native macOS menu bar / Linux tray companion and auth
 
 ## Install and start
 
-Build the CLI alone with `cargo build --release --bin porch`. Build the desktop package with `cargo build --release --features tray --bins`, then follow [packaging instructions](../packaging/README.md). macOS Apple Silicon and Linux x86_64 are supported; Windows is deferred. Private CI artifacts contain the CLI and tray; no public release is created.
+Build the CLI alone with `cargo build --release --bin porch`. Build the desktop package with `cargo build --release --features tray --bins`, then follow [packaging instructions](../packaging/README.md). macOS Apple Silicon and Linux x86_64 are supported; prebuilt Linux GNU artifacts require glibc 2.39+ (build from source on older distributions). Windows is deferred. Private CI artifacts contain the CLI and tray; no public release is created.
 
 Run `porch tray`, or open the installed `Porch.app` on macOS. The tray lists local apps and paired machines, status and errors, Open / Copy URL, Refresh / reconnect, and proxy Start / Stop. It runs the existing CLI for lifecycle actions. Quit closes only the tray. Apps, proxy, the independently enabled discovery agent, and browser relays continue running. Stop them explicitly using their commands. Login startup is optional and requires an explicit packaging-script action; installation and launch do not enable it or network sharing.
 

@@ -56,7 +56,9 @@ be launched with `open dist/Porch.app`.
 ## Linux dependencies and desktop limits
 
 Headless `porch` does not link GTK or AppIndicator and works without DISPLAY.
-Only `porch-tray` needs these desktop libraries. Debian/Ubuntu build dependencies:
+Only `porch-tray` needs these desktop libraries. Prebuilt Linux GNU artifacts
+require glibc 2.39 or newer; build from source on older distributions.
+Debian/Ubuntu build dependencies:
 
 ```sh
 sudo apt-get install libgtk-3-dev libayatana-appindicator3-dev libdbus-1-dev
