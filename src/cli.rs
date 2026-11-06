@@ -120,6 +120,12 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
+    /// Pair with another machine: `porch pair` shows a code, `porch pair CODE` joins.
+    Pair(crate::discovery::commands::PairArgs),
+    /// Forget a paired machine on both sides.
+    Unpair {
+        machine: String,
+    },
     Peers(crate::discovery::commands::Peers),
     Discovery {
         #[command(subcommand)]
@@ -320,6 +326,8 @@ pub async fn run() -> Result<i32> {
                 list(json)?;
             }
         }
+        Some(Commands::Pair(p)) => crate::discovery::commands::pair(p).await?,
+        Some(Commands::Unpair { machine }) => crate::discovery::commands::unpair(&machine).await?,
         Some(Commands::Peers(p)) => crate::discovery::commands::peers(p).await?,
         Some(Commands::Discovery { command }) => crate::discovery::commands::run(command).await?,
         Some(Commands::Open {

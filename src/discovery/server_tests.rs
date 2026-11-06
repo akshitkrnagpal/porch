@@ -37,6 +37,7 @@ fn invitations_expire_and_are_consumed_and_bearers_can_be_revoked() {
             expires: now() + 60,
         }),
         clients: vec![],
+        ..Default::default()
     };
     write(
         &dir,
@@ -55,6 +56,7 @@ fn invitations_expire_and_are_consumed_and_bearers_can_be_revoked() {
             expires: now() - 1,
         }),
         clients: vec![],
+        ..Default::default()
     };
     write(
         &dir,
@@ -200,6 +202,7 @@ async fn fixture(label: &'static str) -> Fixture {
         share_apps: true,
         client: upstream(&dir).unwrap(),
         tunnels: Arc::new(tokio::sync::Semaphore::new(64)),
+        attempts: Arc::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -280,6 +283,7 @@ async fn pair(f: &Fixture) -> String {
                 expires: now() + 60,
             }),
             clients: vec![],
+            ..Default::default()
         })
         .unwrap(),
     )
@@ -420,4 +424,183 @@ async fn authenticated_remote_websocket_uses_registered_route() {
         .unwrap()
         .unwrap();
     assert_eq!(message, Message::Text("remote-echo".into()));
+}
+
+fn joiner(name: &str) -> Machine {
+    Machine {
+        id: format!("{name}-id"),
+        name: name.into(),
+    }
+}
+fn progress(dir: &Path, id: &str) -> String {
+    match pairing_progress_in(dir, id).unwrap() {
+        PairingProgress::Waiting => "waiting".into(),
+        PairingProgress::Paired(name) => format!("paired:{name}"),
+        PairingProgress::Closed(reason) => format!("closed:{reason}"),
+    }
+}
+#[test]
+fn pairing_code_is_single_use_and_labels_the_new_credential() {
+    let dir = temp();
+    let opened = open_pairing_in(&dir, PAIR_CODE_LIFETIME).unwrap();
+    assert_eq!(opened.code.len(), 6);
+    assert!(opened.code.bytes().all(|b| b.is_ascii_digit()));
+    assert!(pairing_open(&dir));
+    assert_eq!(progress(&dir, &opened.id), "waiting");
+    let raw = fs::read_to_string(dir.join("discovery-auth.json")).unwrap();
+    assert!(
+        !raw.contains(&format!("\"{}\"", opened.code)),
+        "code stored in clear"
+    );
+    let CodeOutcome::Accepted(bearer) = try_code(&dir, &opened.code, &joiner("laptop")).unwrap()
+    else {
+        panic!("correct code rejected")
+    };
+    assert!(paired(&dir, &bearer).unwrap());
+    assert_eq!(progress(&dir, &opened.id), "paired:laptop");
+    assert!(!pairing_open(&dir));
+    assert!(matches!(
+        try_code(&dir, &opened.code, &joiner("laptop")).unwrap(),
+        CodeOutcome::Closed
+    ));
+    // Re-pairing the same machine replaces its old credential.
+    let again = open_pairing_in(&dir, PAIR_CODE_LIFETIME).unwrap();
+    let CodeOutcome::Accepted(second) = try_code(&dir, &again.code, &joiner("laptop")).unwrap()
+    else {
+        panic!("re-pair rejected")
+    };
+    assert!(!paired(&dir, &bearer).unwrap());
+    assert!(paired(&dir, &second).unwrap());
+    revoke_where(&dir, |_, m| m == Some("laptop-id")).unwrap();
+    assert!(!paired(&dir, &second).unwrap());
+    let _ = fs::remove_dir_all(dir);
+}
+#[test]
+fn five_wrong_codes_close_the_window_even_for_the_right_code() {
+    let dir = temp();
+    let opened = open_pairing_in(&dir, PAIR_CODE_LIFETIME).unwrap();
+    let wrong = if opened.code == "000000" {
+        "111111"
+    } else {
+        "000000"
+    };
+    for attempt in 1..=PAIR_CODE_MAX_FAILURES {
+        assert!(
+            matches!(
+                try_code(&dir, wrong, &joiner("attacker")).unwrap(),
+                CodeOutcome::Wrong
+            ),
+            "attempt {attempt}"
+        );
+        assert_eq!(pairing_open(&dir), attempt < PAIR_CODE_MAX_FAILURES);
+    }
+    assert!(matches!(
+        try_code(&dir, &opened.code, &joiner("laptop")).unwrap(),
+        CodeOutcome::Closed
+    ));
+    assert!(progress(&dir, &opened.id).contains("too many wrong pairing codes"));
+    let auth: Auth = read(&dir.join("discovery-auth.json")).unwrap().unwrap();
+    assert!(auth.clients.is_empty());
+    let _ = fs::remove_dir_all(dir);
+}
+#[test]
+fn expired_code_is_refused() {
+    let dir = temp();
+    let opened = open_pairing_in(&dir, 0).unwrap();
+    assert!(!pairing_open(&dir));
+    assert!(matches!(
+        try_code(&dir, &opened.code, &joiner("laptop")).unwrap(),
+        CodeOutcome::Closed
+    ));
+    assert!(progress(&dir, &opened.id).contains("expired"));
+    let _ = fs::remove_dir_all(dir);
+}
+#[tokio::test]
+async fn real_tls_pair_code_binds_certificate_rate_limits_and_stores_joiner() {
+    let f = fixture("host").await;
+    let status = |body: Bytes| serde_json::from_slice::<PairingStatus>(&body).unwrap().open;
+    let (code, body) = call(&f, Method::GET, "/v1/pairing", None, None, String::new()).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(!status(body));
+    let opened = open_pairing_in(&f.dir, PAIR_CODE_LIFETIME).unwrap();
+    let (_, body) = call(&f, Method::GET, "/v1/pairing", None, None, String::new()).await;
+    assert!(status(body));
+    let own = fingerprint_in(&f.dir).unwrap();
+    let request = |code: &str, seen: &str| {
+        serde_json::to_string(&PairCodeRequest {
+            version: PROTOCOL_VERSION,
+            code: code.into(),
+            host_fingerprint: seen.into(),
+            machine: joiner("laptop"),
+            endpoint: "https://127.0.0.1:7463/".into(),
+            fingerprint: "ab".repeat(32),
+            token: "c".repeat(64),
+        })
+        .unwrap()
+    };
+    // An interceptor presenting another certificate never gets the code checked.
+    let (code, _) = call(
+        &f,
+        Method::POST,
+        "/v1/pair-code",
+        None,
+        None,
+        request(&opened.code, &"0".repeat(64)),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert!(pairing_open(&f.dir));
+    let (code, body) = call(
+        &f,
+        Method::POST,
+        "/v1/pair-code",
+        None,
+        None,
+        request(&opened.code, &own),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let response: PairResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response.machine.id, f.machine.id);
+    let (code, _) = call(
+        &f,
+        Method::GET,
+        "/v1/catalog",
+        Some(&response.token),
+        None,
+        String::new(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    // Mutual: the host stored the joiner with the credentials it supplied.
+    let stored = super::super::client::peers_in(&f.dir).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].machine.name, "laptop");
+    assert_eq!(stored[0].token, "c".repeat(64));
+    assert_eq!(stored[0].slug, "laptop");
+    let (code, _) = call(
+        &f,
+        Method::POST,
+        "/v1/pair-code",
+        None,
+        None,
+        request(&opened.code, &own),
+    )
+    .await;
+    assert_eq!(code, StatusCode::GONE, "code is single-use");
+    // Per-source rate limit (10/minute) applies on top of the 5-failure cap.
+    let mut limited = false;
+    for _ in 0..12 {
+        let (code, _) = call(
+            &f,
+            Method::POST,
+            "/v1/pair-code",
+            None,
+            None,
+            request("123456", &own),
+        )
+        .await;
+        limited |= code == StatusCode::TOO_MANY_REQUESTS;
+    }
+    assert!(limited);
 }

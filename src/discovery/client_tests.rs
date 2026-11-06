@@ -11,7 +11,7 @@ fn fixture_catalog() -> Catalog {
         apps: vec![App {
             id: "web".into(),
             name: "web".into(),
-            local_url: "http://web.localhost:1355".into(),
+            local_url: "http://web.localhost:7462".into(),
             health: Health::Healthy,
             remote_access: true,
             unavailable_reason: None,
@@ -28,6 +28,7 @@ fn fixture_peer(endpoint: String, fingerprint: String) -> Peer {
         token: "a".repeat(64),
         sources: vec![Source::Explicit],
         last_seen: 0,
+        slug: String::new(),
     }
 }
 async fn tls_fixture(
@@ -91,15 +92,15 @@ async fn tls_fixture(
 #[test]
 fn endpoints_reject_dns_public_credentials_redirect_paths_and_mapped_addresses() {
     for u in [
-        "http://127.0.0.1:1356",
-        "https://porch.local:1356",
+        "http://127.0.0.1:7463",
+        "https://porch.local:7463",
         "https://example.com",
         "https://8.8.8.8",
-        "https://0.0.0.0:1356",
-        "https://[::]:1356",
-        "https://[::ffff:127.0.0.1]:1356",
-        "https://name:secret@192.168.1.4:1356",
-        "https://192.168.1.4:1356/v1/catalog",
+        "https://0.0.0.0:7463",
+        "https://[::]:7463",
+        "https://[::ffff:127.0.0.1]:7463",
+        "https://name:secret@192.168.1.4:7463",
+        "https://192.168.1.4:7463/v1/catalog",
         "https://192.168.1.4?url=http://169.254.169.254",
         "https://192.168.1.4/#secret",
     ] {
@@ -107,12 +108,12 @@ fn endpoints_reject_dns_public_credentials_redirect_paths_and_mapped_addresses()
     }
     for u in [
         "https://127.0.0.2:1234",
-        "https://192.168.1.4:1356",
-        "https://10.0.0.2:1356",
-        "https://172.16.0.2:1356",
-        "https://100.64.1.2:1356",
-        "https://[::1]:1356",
-        "https://[fd7a:115c:a1e0::2]:1356",
+        "https://192.168.1.4:7463",
+        "https://10.0.0.2:7463",
+        "https://172.16.0.2:7463",
+        "https://100.64.1.2:7463",
+        "https://[::1]:7463",
+        "https://[fd7a:115c:a1e0::2]:7463",
     ] {
         assert!(validate_endpoint(u).is_ok(), "rejected {u}");
     }
@@ -129,7 +130,7 @@ fn tailscale_adapter_filters_offline_self_unroutable_and_backend() {
     assert!(all
         .iter()
         .all(|c| c.name == "Linux" && c.last_seen == 42 && c.source == Source::Tailscale));
-    assert_eq!(all[0].endpoint, "https://100.92.2.3:1356/");
+    assert_eq!(all[0].endpoint, "https://100.92.2.3:7463/");
     assert!(
         tailscale_candidates(br#"{"BackendState":"Stopped","Peer":{}}"#, 42)
             .unwrap()
@@ -142,7 +143,7 @@ fn goodbye_and_stale_expiry_remove_candidates_without_retaining_apps() {
     let c = Candidate {
         machine_id: Some("b".into()),
         name: "B".into(),
-        endpoint: "https://192.168.0.3:1356/".into(),
+        endpoint: "https://192.168.0.3:7463/".into(),
         source: Source::Lan,
         last_seen: 100,
     };
@@ -355,9 +356,9 @@ async fn relay_fixture() -> (
                         let location = if req.uri().path().ends_with("/foreign") {
                             "http://other.localhost:9999/wrong-machine"
                         } else if req.uri().path().ends_with("/protocol-relative") {
-                            "//web.localhost:1355/done?q=remote"
+                            "//web.localhost:7462/done?q=remote"
                         } else {
-                            "http://web.localhost:1355/done?q=remote"
+                            "http://web.localhost:7462/done?q=remote"
                         };
                         response
                             .headers_mut()
@@ -445,7 +446,7 @@ async fn actual_relay_preserves_route_and_app_auth_but_rejects_browser_cross_ori
         .unwrap()
         .ends_with("/v1/apps/web/proxy/where?q=yes"));
     assert!(data["origin"].is_null());
-    assert_eq!(data["app_origin"], "http://web.localhost:1355");
+    assert_eq!(data["app_origin"], "http://web.localhost:7462");
     assert_eq!(data["app_auth"], "Basic app-credential");
     assert_eq!(
         data["app_host"],
@@ -542,4 +543,32 @@ async fn actual_browser_websocket_passes_through_pinned_tls_relay_to_machine_b()
     assert_eq!(message.to_text().unwrap(), "machine-b-echo");
     relay.abort();
     backend.abort();
+}
+#[test]
+fn slugs_are_readable_unique_and_stable() {
+    assert_eq!(slug("Akshits-Mac-mini.local"), "akshits-mac-mini");
+    assert_eq!(slug("Mac mini"), "mac-mini");
+    assert_eq!(slug("  !!  "), "peer");
+    let named = |id: &str, name: &str, s: &str| {
+        let mut p = fixture_peer("https://127.0.0.1:7463/".into(), "a".repeat(64));
+        p.machine = Machine {
+            id: id.into(),
+            name: name.into(),
+        };
+        p.slug = s.into();
+        p
+    };
+    let mut all = vec![
+        named("1", "Mac mini", ""),
+        named("2", "Mac mini", ""),
+        named("3", "Bad", "Has Spaces"),
+    ];
+    assign_slugs(&mut all);
+    let slugs: Vec<_> = all.iter().map(|p| p.slug.clone()).collect();
+    assert_eq!(slugs, ["mac-mini", "mac-mini-2", "bad"]);
+    // Removing the first machine never renames the second; a newcomer gets a free name.
+    let mut rest = vec![all[1].clone(), named("4", "Mac mini", "")];
+    assign_slugs(&mut rest);
+    assert_eq!(rest[0].slug, "mac-mini-2");
+    assert_eq!(rest[1].slug, "mac-mini");
 }

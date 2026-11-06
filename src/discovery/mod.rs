@@ -1,6 +1,8 @@
 //! Opt-in discovery agent lifecycle and shared browser actions.
 pub mod client;
 pub mod commands;
+pub mod gateway;
+pub mod pairing;
 pub mod server;
 pub mod types;
 
@@ -182,15 +184,8 @@ fn relay_key(peer: &str, app: &str) -> String {
 /// Start a loopback browser transport. The agent URL is never opened directly.
 pub async fn app_url(app: &str, peer: Option<&str>) -> Result<String> {
     if let Some(peer_id) = peer {
-        let peers = client::peers()?;
-        let matches: Vec<_> = peers
-            .iter()
-            .filter(|p| p.machine.id == peer_id || p.machine.name == peer_id)
-            .collect();
-        if matches.len() != 1 {
-            bail!("peer must identify exactly one paired machine")
-        }
-        let peer_id = &matches[0].machine.id;
+        let selected = client::find_peer(peer_id)?;
+        let peer_id = &selected.machine.id;
         let all = client::snapshot(false).await?;
         let remote = all
             .peers
@@ -221,6 +216,15 @@ pub async fn app_url(app: &str, peer: Option<&str>) -> Result<String> {
                     .unwrap_or("remote app access is disabled on this machine")
             )
         }
+        // Readable, stable URL served by the local proxy: APP.MACHINE.localhost.
+        if let Some(name) = gateway::hostname_app(&found.name) {
+            if !all.local.proxy_running {
+                bail!("the local proxy is stopped; start it with `porch proxy start` to open apps on {}", selected.machine.name)
+            }
+            let settings = crate::state::proxy_settings()?;
+            return Ok(settings.url(&format!("{name}.{}", selected.slug)));
+        }
+        // Path-routed apps cannot be named in a hostname; use a dedicated relay.
         let _lock = lock("discovery.relay.lock")?;
         // A reconnect or renewed enrollment must not reuse a relay holding an old
         // endpoint or revoked bearer. Store only a digest, never another token copy.

@@ -13,10 +13,18 @@ use tokio::io::AsyncReadExt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    Open { app: String, peer: Option<String> },
-    Copy { app: String, peer: Option<String> },
+    Open {
+        app: String,
+        peer: Option<String>,
+    },
+    Copy {
+        app: String,
+        peer: Option<String>,
+    },
     StartProxy,
     StopProxy,
+    /// Show a pairing code (host side of `porch pair`) in the menu.
+    Pair,
     Refresh,
     Reconnect,
     Quit,
@@ -43,6 +51,7 @@ impl Action {
             Self::StartProxy => vec!["proxy".into(), "start".into()],
             Self::StopProxy => vec!["proxy".into(), "stop".into()],
             Self::Reconnect => vec!["peers".into(), "refresh".into()],
+            Self::Pair => vec!["pair".into(), "--no-wait".into(), "--json".into()],
             Self::Refresh | Self::Quit => return None,
         };
         Some(args)
@@ -189,7 +198,7 @@ pub fn menu_model(
             local,
         ));
         if snapshot.peers.is_empty() {
-            entries.push(Entry::text("No paired machines; use porch peers add"));
+            entries.push(Entry::text("No paired machines yet; choose Pair a device…"));
         }
         for peer in snapshot.peers.iter().take(50) {
             let sources = peer
@@ -224,7 +233,9 @@ pub fn menu_model(
             entries.push(Entry::group(peer.machine.name.clone(), apps));
         }
         if !snapshot.candidates.is_empty() {
-            let mut found = vec![Entry::text("Pair in a terminal with porch peers add")];
+            let mut found = vec![Entry::text(
+                "Choose Pair a device… on one machine, then run porch pair CODE on the other",
+            )];
             for candidate in snapshot.candidates.iter().take(30) {
                 found.push(Entry::text(format!(
                     "{}: {}",
@@ -250,6 +261,7 @@ pub fn menu_model(
         }));
     }
     entries.extend([
+        Entry::action("Pair a device…", Action::Pair, true),
         Entry::action("Refresh apps", Action::Refresh, true),
         Entry::action("Reconnect discovery", Action::Reconnect, true),
         Entry::separator(),
@@ -325,6 +337,19 @@ async fn invoke(cli: &Path, args: &[String]) -> Result<Vec<u8>> {
     result
 }
 
+/// The code stays valid in the agent after the CLI returns; show it in the menu.
+fn pairing_notice(out: &[u8]) -> String {
+    let code = serde_json::from_slice::<serde_json::Value>(out)
+        .ok()
+        .and_then(|v| v["code"].as_str().map(str::to_owned))
+        .filter(|c| c.len() == 6 && c.bytes().all(|b| b.is_ascii_digit()));
+    match code {
+        Some(code) => format!(
+            "Pairing code {code} — on the other machine run: porch pair {code} (valid 5 minutes)"
+        ),
+        None => "Porch did not return a pairing code".into(),
+    }
+}
 enum Update {
     Snapshot(Result<Snapshot, String>),
     Notice(String),
@@ -375,6 +400,7 @@ fn worker_with_intervals(
                     let reconnect = action == Action::Reconnect;
                     if let Some(args) = action.cli_args() {
                         let message = match runtime.block_on(invoke(&cli, &args)) {
+                            Ok(out) if action == Action::Pair => pairing_notice(&out),
                             Ok(_) => match action {
                                 Action::Copy { .. } => "URL copied".to_owned(),
                                 Action::Open { .. } => "Opened in browser".to_owned(),
@@ -713,7 +739,8 @@ mod tests {
                     id: "peer-stable-id".into(),
                     name: "Workbench".into(),
                 },
-                endpoint: "https://192.168.1.9:1356".into(),
+                slug: "workbench".into(),
+                endpoint: "https://192.168.1.9:7463".into(),
                 sources: vec![Source::Lan, Source::Tailscale],
                 last_seen: 1,
                 catalog: Some(catalog(true)),
@@ -857,6 +884,25 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn pair_a_device_runs_host_side_and_shows_the_code() {
+        let entries = menu_model(Some(&snapshot()), None, None);
+        let pair = entries
+            .iter()
+            .find(|e| e.action == Some(Action::Pair))
+            .expect("Pair a device… menu item");
+        assert_eq!(pair.label, "Pair a device…");
+        assert!(pair.enabled);
+        assert_eq!(
+            Action::Pair.cli_args().unwrap(),
+            vec!["pair", "--no-wait", "--json"]
+        );
+        let notice = pairing_notice(br#"{"version":1,"code":"482913","expires":1}"#);
+        assert!(notice.contains("482913") && notice.contains("porch pair 482913"));
+        assert!(!pairing_notice(b"{}").contains("porch pair "));
+        let shown = menu_model(Some(&snapshot()), None, Some(&notice));
+        assert!(shown.iter().any(|e| e.label.contains("482913")));
+    }
     #[test]
     fn labels_do_not_inject_shortcuts_or_control_characters() {
         assert_eq!(clean_label("A&B\nC\t"), "A&&BC");

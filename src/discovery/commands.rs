@@ -42,6 +42,88 @@ pub enum Command {
         port: u16,
     },
 }
+/// Pair two machines. Run `porch pair` on one to show a code, then
+/// `porch pair CODE` on the other. Both can then open each other's apps.
+#[derive(Args, Debug)]
+pub struct PairArgs {
+    /// The 6-digit code shown by `porch pair` on the other machine.
+    pub code: Option<String>,
+    /// The other machine's name or IP, when it is not discovered automatically.
+    #[arg(long)]
+    pub host: Option<String>,
+    /// Advanced: share on this private IP instead of choosing automatically.
+    #[arg(long)]
+    pub bind: Option<String>,
+    /// Advanced: discovery agent port.
+    #[arg(long, default_value_t=DEFAULT_PORT, value_parser=clap::value_parser!(u16).range(1..))]
+    pub port: u16,
+    /// Show a code and return immediately instead of waiting (for scripts and the tray).
+    #[arg(long)]
+    pub no_wait: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+pub async fn pair(args: PairArgs) -> Result<()> {
+    if let Some(code) = args.code {
+        if args.no_wait {
+            bail!("--no-wait applies when showing a code")
+        }
+        let peer =
+            super::pairing::join(&code, args.host.as_deref(), args.bind.as_deref(), args.port)
+                .await?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({"version":PROTOCOL_VERSION,"machine":peer.machine,"slug":peer.slug,"endpoint":peer.endpoint,"url":super::pairing::url_template(&peer.slug)})
+            );
+        } else {
+            println!("Paired with {}", peer.machine.name);
+            eprintln!(
+                "Open its apps at {} (porch list --all shows them).",
+                super::pairing::url_template(&peer.slug)
+            );
+        }
+        return Ok(());
+    }
+    if args.host.is_some() {
+        bail!("--host is used with a code: porch pair CODE --host NAME-OR-IP")
+    }
+    let shown = super::pairing::show(args.bind.as_deref(), args.port).await?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({"version":PROTOCOL_VERSION,"code":shown.code,"expires":shown.expires,"machine":shown.machine,"endpoint":shown.endpoint})
+        );
+    } else {
+        println!("Pairing code: {}", shown.code);
+        eprintln!(
+            "On the other machine run:  porch pair {}\n{} is sharing on {}. The code works once and expires in 5 minutes.",
+            shown.code,
+            shown.machine.name,
+            shown.endpoint.trim_end_matches('/')
+        );
+    }
+    if args.no_wait {
+        return Ok(());
+    }
+    if !args.json {
+        eprintln!("Waiting for the other machine… (Ctrl-C to cancel)");
+    }
+    let name = super::pairing::wait(&shown.id).await?;
+    println!("Paired with {name}");
+    Ok(())
+}
+pub async fn unpair(machine: &str) -> Result<()> {
+    let (peer, reached) = super::pairing::unpair(machine).await?;
+    println!("Unpaired {}", peer.machine.name);
+    if !reached {
+        eprintln!(
+            "{} was unreachable; run `porch unpair` there too. Its access to this machine is already revoked.",
+            peer.machine.name
+        );
+    }
+    Ok(())
+}
 #[derive(Args, Debug)]
 pub struct Peers {
     #[arg(long)]
@@ -59,7 +141,7 @@ pub enum PeerCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Enroll using a fingerprint obtained through a trusted channel and one-time token.
+    /// Advanced/automation: enroll with a fingerprint and one-time token (see `porch pair`).
     #[command(alias = "trust")]
     Add {
         endpoint: String,
@@ -87,7 +169,7 @@ pub async fn run(command: Command) -> Result<()> {
                 advertise: !no_advertise,
             })
             .await?;
-            eprintln!("Porch discovery enabled. Pair peers with `porch discovery fingerprint` and `porch discovery pair-token`.");
+            eprintln!("Porch discovery enabled. Pair a machine with `porch pair`.");
         }
         Command::Serve => serve().await?,
         Command::Disable => {
@@ -206,6 +288,7 @@ pub fn print_snapshot(snapshot: Snapshot, json: bool) -> Result<()> {
     for app in &snapshot.local.apps {
         println!("  {}  {:?}  {}", app.name, app.health, app.local_url);
     }
+    let settings = crate::state::proxy_settings().unwrap_or_default();
     for peer in &snapshot.peers {
         println!(
             "{} ({}) · {:?}",
@@ -220,10 +303,17 @@ pub fn print_snapshot(snapshot: Snapshot, json: bool) -> Result<()> {
                     "  {}  {:?}  {}",
                     app.name,
                     app.health,
-                    if app.remote_access {
-                        "open with --peer"
+                    if !app.remote_access {
+                        app.unavailable_reason
+                            .clone()
+                            .unwrap_or_else(|| "local only".into())
+                    } else if let (Some(name), false) = (
+                        super::gateway::hostname_app(&app.name),
+                        peer.slug.is_empty(),
+                    ) {
+                        settings.url(&format!("{name}.{}", peer.slug))
                     } else {
-                        app.unavailable_reason.as_deref().unwrap_or("local only")
+                        format!("porch open {} --peer {}", app.name, peer.machine.id)
                     }
                 );
             }
@@ -233,13 +323,15 @@ pub fn print_snapshot(snapshot: Snapshot, json: bool) -> Result<()> {
         }
     }
     if !snapshot.candidates.is_empty() {
-        println!("Discovered agents (pair before reading their apps):");
+        println!(
+            "Discovered machines (pair with `porch pair` on them, then `porch pair CODE` here):"
+        );
         for c in &snapshot.candidates {
             println!("  {}  {}  {:?}", c.name, c.endpoint, c.source);
         }
     }
     if snapshot.peers.is_empty() {
-        println!("No paired peers. Use `porch peers add --help`.");
+        println!("No paired machines. Run `porch pair` on one machine and `porch pair CODE` on the other.");
     }
     for warning in &snapshot.warnings {
         eprintln!("Porch discovery: {warning}");
