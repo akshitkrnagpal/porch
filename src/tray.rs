@@ -163,6 +163,82 @@ fn app_entry(app: &App, peer: Option<&str>, proxy_running: bool) -> Entry {
     )
 }
 /// A pure model makes enabled states and action routing testable without a display.
+/// What the tray mark shows: solid or dimmed apps under the roof, plus a
+/// badge when a paired machine is reachable. Artwork lives in `assets/icon`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IconState {
+    pub proxy_running: bool,
+    pub peers: bool,
+}
+
+impl IconState {
+    /// Before the first refresh nothing is known, so show the stopped mark
+    /// rather than claiming the proxy is up.
+    pub fn from_snapshot(snapshot: Option<&Snapshot>) -> Self {
+        snapshot.map_or(
+            Self {
+                proxy_running: false,
+                peers: false,
+            },
+            |snapshot| Self {
+                proxy_running: snapshot.local.proxy_running,
+                peers: snapshot
+                    .peers
+                    .iter()
+                    .any(|peer| peer.catalog.is_some() && peer.error.is_none()),
+            },
+        )
+    }
+
+    /// Raw 8-bit RGBA artwork and its square edge in pixels. macOS gets an 18pt
+    /// @2x black template; Linux gets the light grayscale mark at 32px.
+    pub fn artwork(self) -> (&'static [u8], u32) {
+        macro_rules! art {
+            ($platform:literal, $size:literal) => {
+                match (self.proxy_running, self.peers) {
+                    (true, false) => include_bytes!(concat!(
+                        "../assets/icon/rgba/",
+                        $platform,
+                        "-running-",
+                        $size,
+                        ".rgba"
+                    ))
+                    .as_slice(),
+                    (false, false) => include_bytes!(concat!(
+                        "../assets/icon/rgba/",
+                        $platform,
+                        "-stopped-",
+                        $size,
+                        ".rgba"
+                    ))
+                    .as_slice(),
+                    (true, true) => include_bytes!(concat!(
+                        "../assets/icon/rgba/",
+                        $platform,
+                        "-peers-",
+                        $size,
+                        ".rgba"
+                    ))
+                    .as_slice(),
+                    (false, true) => include_bytes!(concat!(
+                        "../assets/icon/rgba/",
+                        $platform,
+                        "-peers-stopped-",
+                        $size,
+                        ".rgba"
+                    ))
+                    .as_slice(),
+                }
+            };
+        }
+        if cfg!(target_os = "macos") {
+            (art!("macos", "36"), 36)
+        } else {
+            (art!("linux", "32"), 32)
+        }
+    }
+}
+
 pub fn menu_model(
     snapshot: Option<&Snapshot>,
     error: Option<&str>,
@@ -441,7 +517,8 @@ mod native {
     };
 
     pub struct Ui {
-        _tray: TrayIcon,
+        tray: TrayIcon,
+        icon_state: IconState,
         menu: Menu,
         actions: HashMap<String, Action>,
         model: Vec<Entry>,
@@ -449,32 +526,9 @@ mod native {
         error: Option<String>,
         notice: Option<String>,
     }
-    fn icon() -> Result<Icon> {
-        // A 2x template mark: porch roof, two posts and a welcoming open doorway.
-        let mut pixels = vec![0u8; 32 * 32 * 4];
-        for y in 0..32usize {
-            for x in 0..32usize {
-                let roof_y = 6 + x.abs_diff(16) / 2;
-                let roof = (5..=27).contains(&x) && y.abs_diff(roof_y) <= 1;
-                let posts =
-                    ((8..=10).contains(&x) || (22..=24).contains(&x)) && (15..=26).contains(&y);
-                let step = (6..=26).contains(&x) && (26..=28).contains(&y);
-                let door = ((14..=15).contains(&x) || (19..=20).contains(&x))
-                    && (18..=25).contains(&y)
-                    || (14..=20).contains(&x) && (17..=18).contains(&y);
-                if roof || posts || step || door {
-                    let i = (y * 32 + x) * 4;
-                    #[cfg(target_os = "linux")]
-                    {
-                        pixels[i] = 53;
-                        pixels[i + 1] = 139;
-                        pixels[i + 2] = 190;
-                    }
-                    pixels[i + 3] = 255;
-                }
-            }
-        }
-        Ok(Icon::from_rgba(pixels, 32, 32)?)
+    fn icon(state: IconState) -> Result<Icon> {
+        let (pixels, size) = state.artwork();
+        Ok(Icon::from_rgba(pixels.to_vec(), size, size)?)
     }
     fn fill_menu(menu: &Menu, entries: &[Entry]) -> Result<HashMap<String, Action>> {
         fn append(
@@ -518,13 +572,15 @@ mod native {
             let builder = TrayIconBuilder::new()
                 .with_tooltip("Porch — your dev apps")
                 .with_menu(Box::new(menu.clone()));
+            let icon_state = IconState::from_snapshot(None);
             #[cfg(target_os = "macos")]
-            let builder = builder.with_icon_templated(icon()?);
+            let builder = builder.with_icon_templated(icon(icon_state)?);
             #[cfg(target_os = "linux")]
-            let builder = builder.with_icon(icon()?);
+            let builder = builder.with_icon(icon(icon_state)?);
             let tray = builder.build().context("create native Porch menu")?;
             Ok(Self {
-                _tray: tray,
+                tray,
+                icon_state,
                 menu,
                 actions,
                 model,
@@ -547,6 +603,19 @@ mod native {
                 changed = true;
             }
             if changed {
+                let icon_state = IconState::from_snapshot(self.snapshot.as_ref());
+                if icon_state != self.icon_state {
+                    #[cfg(target_os = "macos")]
+                    let result = icon(icon_state)
+                        .and_then(|icon| Ok(self.tray.set_icon_templated(Some(icon))?));
+                    #[cfg(target_os = "linux")]
+                    let result =
+                        icon(icon_state).and_then(|icon| Ok(self.tray.set_icon(Some(icon))?));
+                    match result {
+                        Ok(()) => self.icon_state = icon_state,
+                        Err(error) => eprintln!("Porch: update icon: {error:#}"),
+                    }
+                }
                 let model = menu_model(
                     self.snapshot.as_ref(),
                     self.error.as_deref(),
@@ -793,6 +862,44 @@ mod tests {
             .children
             .iter()
             .any(|entry| entry.label.contains("sharing is off")));
+    }
+    #[test]
+    fn icon_reflects_proxy_and_reachable_peers() {
+        let state = |running, peers| IconState {
+            proxy_running: running,
+            peers,
+        };
+        assert_eq!(IconState::from_snapshot(None), state(false, false));
+        let mut snap = snapshot();
+        assert_eq!(IconState::from_snapshot(Some(&snap)), state(true, true));
+        snap.local.proxy_running = false;
+        assert_eq!(IconState::from_snapshot(Some(&snap)), state(false, true));
+        // A paired machine that cannot be reached does not earn the badge.
+        snap.peers[0].error = Some("timed out".into());
+        assert_eq!(IconState::from_snapshot(Some(&snap)), state(false, false));
+        snap.peers[0].error = None;
+        snap.peers[0].catalog = None;
+        assert_eq!(IconState::from_snapshot(Some(&snap)), state(false, false));
+    }
+    #[test]
+    fn every_icon_state_has_distinct_square_rgba_artwork() {
+        let mut seen = Vec::new();
+        for running in [true, false] {
+            for peers in [true, false] {
+                let (pixels, size) = IconState {
+                    proxy_running: running,
+                    peers,
+                }
+                .artwork();
+                assert_eq!(pixels.len(), (size * size * 4) as usize);
+                assert!(
+                    pixels.chunks(4).any(|px| px[3] == 255),
+                    "mark is opaque somewhere"
+                );
+                assert!(!seen.contains(&pixels), "states must look different");
+                seen.push(pixels);
+            }
+        }
     }
     #[test]
     fn stopped_proxy_empty_error_and_quit_are_clear() {

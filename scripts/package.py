@@ -8,25 +8,17 @@ import struct
 import sys
 import tarfile
 import tempfile
-import zlib
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def icon_png(size):
-    raw = bytearray()
-    for y in range(size):
-        raw.append(0)
-        for x in range(size):
-            nx, ny = x * 32 / size, y * 32 / size
-            roof = 5 <= nx <= 27 and abs(ny - (6 + abs(nx - 16) / 2)) <= 1
-            posts = (8 <= nx <= 10 or 22 <= nx <= 24) and 15 <= ny <= 26
-            step = 6 <= nx <= 26 and 26 <= ny <= 28
-            door = ((14 <= nx <= 15 or 19 <= nx <= 20) and 18 <= ny <= 25 or 14 <= nx <= 20 and 17 <= ny <= 18)
-            raw.extend((53, 139, 190, 255) if roof or posts or step or door else (0, 0, 0, 0))
-    def chunk(kind, data):
-        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff)
-    return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 6, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b'')
+def icns():
+    """Porch.icns from the committed app tile PNGs (see assets/icon/gen.py)."""
+    blocks = b''
+    for kind, size in ((b'ic08', 256), (b'ic09', 512), (b'ic10', 1024)):
+        png = (ROOT / f'assets/icon/app-tile-{size}.png').read_bytes()
+        blocks += kind + struct.pack('>I', len(png) + 8) + png
+    return b'icns' + struct.pack('>I', len(blocks) + 8) + blocks
 
 
 def bundle(destination, binaries, version):
@@ -43,9 +35,7 @@ def bundle(destination, binaries, version):
                 'LSMinimumSystemVersion': '12.0'}
     with open(contents / 'Info.plist', 'wb') as output:
         plistlib.dump(metadata, output)
-    icon = icon_png(256)
-    block = b'ic08' + struct.pack('>I', len(icon) + 8) + icon
-    (contents / 'Resources/Porch.icns').write_bytes(b'icns' + struct.pack('>I', len(block) + 8) + block)
+    (contents / 'Resources/Porch.icns').write_bytes(icns())
 
 
 def main():
