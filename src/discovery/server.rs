@@ -618,6 +618,7 @@ fn catalog(dir: &Path, machine: Machine, share: bool) -> Result<Catalog> {
     let data: State = read(&dir.join("state.json"))?.unwrap_or_default();
     let settings: ProxySettings = read(&dir.join("proxy.json"))?.unwrap_or_default();
     let proxy_running = running(dir);
+    let procs = crate::health::processes();
     let apps = data
         .routes
         .iter()
@@ -630,10 +631,13 @@ fn catalog(dir: &Path, machine: Machine, share: bool) -> Result<Catalog> {
                 id: route_id(&machine, &route.name),
                 name: route.name.clone(),
                 local_url: route_url(&settings, &route.name),
-                health: if !alive {
-                    Health::Stopped
-                } else {
-                    Health::Unknown
+                // Same check as `porch list`, so the menu agrees with the CLI.
+                health: match crate::health::evaluate(&data, route, &procs) {
+                    crate::health::Health::Ok => Health::Healthy,
+                    crate::health::Health::NotListening => Health::Unreachable,
+                    crate::health::Health::Stopped | crate::health::Health::Dead { .. } => {
+                        Health::Stopped
+                    }
                 },
                 remote_access,
                 unavailable_reason: if !alive {
