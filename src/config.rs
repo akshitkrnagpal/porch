@@ -1246,7 +1246,9 @@ try {{
   var fs = require("fs"), path = require("path");
   var entries = JSON.parse(fs.readFileSync({}, "utf8"));
   var normalize = function(p) {{
-    var resolved = fs.realpathSync(p);
+    // The JS realpath implementation preserves Windows 8.3 aliases (RUNNER~1).
+    // Native realpath expands them, matching Rust canonicalize.
+    var resolved = fs.realpathSync.native(p);
     return process.platform === "win32" ? resolved.toLowerCase() : resolved;
   }};
   var cwd = normalize(process.cwd());
@@ -1312,6 +1314,8 @@ mod turbo_loader_tests {
                 ("_PORCH_COMMAND".into(), r#"["npm","run","dev"]"#.into()),
             ]),
         );
+        // On Windows TEMP commonly contains an 8.3 alias, while the manifest
+        // canonicalizes it to its long name. Exercise both representations.
         let (_, options) = write_turbo_manifest_at(&state, &entries).unwrap();
         let result = Command::new("node")
             .arg(&record)
