@@ -42,3 +42,11 @@ macOS Accessibility and Screen Recording are denied to agent-desktop. A native m
 The CI workflow runs the complete headless regression suite on native macOS and Linux, plus dedicated native tray builds/clippy/menu tests on both platforms. Linux installs GTK3/Ayatana AppIndicator development dependencies and checks both no-DISPLAY tray failure and absence of desktop library linkage in the ordinary CLI. The private artifact workflow builds and packages both architectures without publishing a release. Workflow definitions alone are not passing-run evidence; observed run links/results are appended below.
 
 Still required: a real enrolled Tailscale pair, physical two-host LAN discovery/opening, Linux desktop/indicator rendering (including GNOME extension behavior), macOS rendered menu interactions, explicit login-startup behavior, and app-specific OAuth/CORS/absolute-origin compatibility. No public tunnel was created; no unrelated Tailscale Serve/Funnel configuration was modified. Browser access uses a distinct local HTTP origin with a pinned HTTPS remote hop, rather than preserving the original browser HTTPS origin.
+
+
+Observed native results for implementation commit `5ed3d7ac31e5c38b0543094061cef00b3e882f3d`:
+
+- [CI: all four native jobs passed](https://github.com/akshitkrnagpal/porch/actions/runs/42175889572): complete headless regressions/release builds on macOS and Linux; native tray clippy, five menu/worker tests, three packaging tests and release builds on both; Linux no-DISPLAY failure and headless CLI desktop-linkage check passed.
+- [Private build artifacts: both architectures passed](https://github.com/akshitkrnagpal/porch/actions/runs/42175939494): release-profile full regression suite, CLI/tray binaries and installable archives for `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`. Artifact names are `porch-aarch64-apple-darwin` and `porch-x86_64-unknown-linux-gnu`. No PR or public release was created.
+
+The follow-up documentation commit records this evidence and clarifies that revocation applies to subsequent requests; Disable closes existing transports. It does not change executable code.

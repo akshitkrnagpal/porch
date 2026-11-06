@@ -133,7 +133,7 @@ cargo test --all-targets
 cargo build --release
 ```
 
-CI definitions target Ubuntu and macOS; Windows is deferred. A workflow definition is not evidence that those runners have passed; current local acceptance was performed on macOS. The manual artifact workflow builds native Linux x86_64, macOS ARM64, binaries and optional native desktop packages without creating a public GitHub Release, signing, or notarizing them.
+CI definitions target Ubuntu and macOS; Windows is deferred. A workflow definition is not evidence that those runners have passed; current local acceptance was performed on macOS. The manual artifact workflow builds native Linux x86_64 and macOS ARM64 binaries and optional native desktop packages without creating a public GitHub Release, signing, or notarizing them.
 
 Configuration lookup prefers `porch.json`, then the package `porch` key, then `portless.json`, then the package `portless` key. A native package key can override app fields from the file, consistent with leaf package overrides. A malformed selected native configuration is an error, never a reason to fall back to legacy settings. Legacy child environment names are also emitted for migration.
 

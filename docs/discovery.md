@@ -57,13 +57,13 @@ The browser-facing hop is local HTTP, including when the original proxy uses HTT
 
 ```sh
 porch discovery status --json
-porch discovery revoke       # On B: revoke all clients and outstanding invitations immediately.
+porch discovery revoke       # On B: invalidate all client credentials and outstanding invitations.
 porch peers remove ID       # On A: forget trust; does not revoke credentials on B.
 porch discovery disconnect  # On A: stop local browser relays, leaving apps/proxy running.
 porch discovery disable     # On B: stop exposure; apps/proxy keep running.
 ```
 
-Disable retains the machine identity, certificate and enrollment history so re-enabling does not silently change trust. Use Revoke to invalidate credentials. The discovery agent is a separate user process; it is not automatically re-enabled at login. Changing network interfaces requires explicit reconfiguration of the bound address. The tray periodically refreshes its model and exposes connection errors and disabled/local-only apps.
+Disable retains the machine identity, certificate and enrollment history so re-enabling does not silently change trust. Revoke rejects subsequent requests and new WebSocket handshakes; already-started streams can continue until they close. Disable the agent to terminate active transports as well, and Revoke before re-enabling if access must stay revoked. The discovery agent is a separate user process; it is not automatically re-enabled at login. Changing network interfaces requires explicit reconfiguration of the bound address. The tray periodically refreshes its model and exposes connection errors and disabled/local-only apps.
 
 ## Wire protocol and evidence
 
