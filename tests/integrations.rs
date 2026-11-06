@@ -654,3 +654,125 @@ fn stalled_external_helper_has_bounded_lifetime() {
         .unwrap();
     assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
 }
+
+#[test]
+fn hosts_permissions_are_actionable_and_localhost_hints_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = Sandbox::new();
+    fs::set_permissions(s.dir.join("hosts"), fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(s
+        .cmd()
+        .env("PORCH_SYNC_HOSTS", "1")
+        .args(["proxy", "start", "--no-tls", "--tld", "test"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let out = s
+        .cmd()
+        .env("PORCH_SYNC_HOSTS", "1")
+        .args(["alias", "app", "45678"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("porch hosts sync"),
+        "permission guidance missing: {stderr}"
+    );
+    assert!(
+        !stderr.contains("403"),
+        "permission is not an authentication failure: {stderr}"
+    );
+    let token = fs::read_to_string(s.dir.join("state/proxy.hosts-sync-token")).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let r = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("http://127.0.0.1:{}/_porch/hosts-sync", s.port))
+            .header("x-porch-hosts-sync-token", token.trim())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 409);
+        assert!(r.text().await.unwrap().contains("porch hosts sync"));
+    });
+    s.ok(&["proxy", "stop"]);
+    assert!(s
+        .cmd()
+        .env("PORCH_SYNC_HOSTS", "1")
+        .args(["proxy", "start", "--no-tls", "--tld", "localhost"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    for (name, first) in [("one", true), ("two", false)] {
+        let out = s
+            .cmd()
+            .env("PORCH_SYNC_HOSTS", "1")
+            .args(["alias", name, "45678"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Hosts sync:"),
+            "localhost route should use browser resolution: {stderr}"
+        );
+        assert_eq!(
+            stderr.contains("Browsers resolve .localhost"),
+            first,
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn doctor_does_not_call_a_foreign_listener_ready() {
+    use std::io::{Read, Write};
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = Sandbox::new();
+    fs::write(
+        s.dir.join("state/proxy.json"),
+        serde_json::to_vec(&porch::state::ProxySettings {
+            port: s.port,
+            tls: false,
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    for name in [
+        "node",
+        "openssl",
+        "docker",
+        "tailscale",
+        "ngrok",
+        "cloudflared",
+    ] {
+        s.fake(name, "print('fixture version')");
+    }
+    let listener = std::net::TcpListener::bind(("127.0.0.1", s.port)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            if let Ok((mut c, _)) = listener.accept() {
+                c.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                    .unwrap();
+                let mut buf = [0; 4096];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+    let out = s.ok(&["doctor"]);
+    server.join().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("foreign/unverified listener"), "{stdout}");
+    assert!(!stdout.contains("proxy listener: reachable"), "{stdout}");
+}

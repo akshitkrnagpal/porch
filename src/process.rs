@@ -9,7 +9,20 @@ use tokio::process::{Child, Command};
 pub fn configure(command: &mut Command) {
     command.kill_on_drop(true);
     #[cfg(unix)]
-    command.process_group(0);
+    // A new process group inside our controlling session is a background group:
+    // reads and terminal-mode changes can stop it with SIGTTIN/SIGTTOU. A new
+    // session keeps inherited terminal descriptors usable without job-control
+    // stops, matching Node's detached launch semantics. setsid also makes the
+    // child its process-group leader, so TreeGuard and forwarded signals still
+    // address the complete application group.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     #[cfg(windows)]
     command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
 }

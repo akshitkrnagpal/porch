@@ -477,3 +477,103 @@ http.server.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),Server).serve_forev
         String::from_utf8_lossy(&takeover.stderr)
     );
 }
+
+#[test]
+fn proxy_and_app_refuse_wildcard_port_collisions() {
+    for ipv6 in [false, true] {
+        let domain = if ipv6 {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        };
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+                .unwrap();
+        // Match real servers that enable reuse on macOS, including dual-stack [::].
+        socket.set_reuse_address(true).unwrap();
+        if ipv6 {
+            socket.set_only_v6(false).unwrap();
+        }
+        let addr: std::net::SocketAddr = if ipv6 { "[::]:0" } else { "0.0.0.0:0" }.parse().unwrap();
+        socket.bind(&addr.into()).unwrap();
+        socket.listen(16).unwrap();
+        let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+        let s = Sandbox::new();
+        let out = s.run(&[
+            "proxy",
+            "start",
+            "--no-tls",
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ]);
+        assert!(
+            !out.status.success(),
+            "proxy silently shared {} wildcard port {}",
+            if ipv6 { "dualstack" } else { "IPv4" },
+            port
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("unavailable"));
+        s.ok(&["proxy", "start", "--no-tls"]);
+        let out = s.run(&["collision", "--app-port", &port.to_string(), "--", "true"]);
+        assert!(
+            !out.status.success(),
+            "app silently shared wildcard port {port}"
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("unavailable"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn proxy_recovers_after_accept_fd_exhaustion() {
+    let script = r#"
+import os,resource,socket,subprocess,sys,tempfile,time
+with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
+ with socket.socket() as s:
+  s.bind(('127.0.0.1',0));port=s.getsockname()[1]
+ env=os.environ.copy();env.update(PORCH_STATE_DIR=root,PORCH_SYNC_HOSTS='0',PORCH_SKIP_TRUST='1')
+ def limit():resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
+ with open(root+'/log','w+') as log:
+  child=subprocess.Popen([sys.argv[1],'proxy','start','--foreground','--no-tls','--bind','127.0.0.1','--port',str(port)],env=env,stdout=log,stderr=log,preexec_fn=limit)
+  sockets=[]
+  try:
+   deadline=time.monotonic()+10
+   while not os.path.exists(root+'/proxy.ready'):
+    assert child.poll() is None,'proxy exited before ready'
+    assert time.monotonic()<deadline,'proxy never ready'
+    time.sleep(.02)
+   for i in range(110):
+    c=socket.create_connection(('127.0.0.1',port),timeout=2)
+    c.sendall(b'GET / HTTP/1.1\r\n');sockets.append(c)
+   time.sleep(.3)
+   for c in sockets:c.close()
+   sockets=[]
+   assert child.poll() is None,'accept error terminated daemon'
+   deadline=time.monotonic()+5
+   while True:
+    try:
+     with socket.create_connection(('127.0.0.1',port),timeout=1) as c:
+      c.sendall(b'GET / HTTP/1.1\r\nHost: unknown.localhost\r\nConnection: close\r\n\r\n')
+      c.settimeout(1);reply=c.recv(4096)
+      if b'404' in reply:break
+    except (OSError,TimeoutError):pass
+    assert time.monotonic()<deadline,'listener did not recover after freeing descriptors'
+   log.flush();log.seek(0);assert 'accept failed' in log.read(),'fixture failed to exhaust accept descriptors'
+  finally:
+   for c in sockets:c.close()
+   if child.poll() is None:child.terminate()
+   try:child.wait(timeout=5)
+   except subprocess.TimeoutExpired:child.kill();child.wait()
+"#;
+    let out = Command::new("python3")
+        .args(["-c", script, env!("CARGO_BIN_EXE_porch")])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

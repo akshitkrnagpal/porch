@@ -91,7 +91,7 @@ async fn actual_http_tls_h2_ws_streaming_routing_and_redirects() {
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { "hello" }))
         .route("/headers", axum::routing::get(|h:header::HeaderMap| async move {
-            serde_json::json!({"host":h.get("host").unwrap().to_str().unwrap(),"proto":h.get("x-forwarded-proto").unwrap().to_str().unwrap(),"hops":h.get("x-portless-hops").unwrap().to_str().unwrap(),"port":h.get("x-forwarded-port").unwrap().to_str().unwrap()}).to_string()
+            serde_json::json!({"host":h.get("host").unwrap().to_str().unwrap(),"proto":h.get("x-forwarded-proto").unwrap().to_str().unwrap(),"hops":h.get("x-portless-hops").unwrap().to_str().unwrap(),"porch_hops":h.get("x-porch-hops").unwrap().to_str().unwrap(),"port":h.get("x-forwarded-port").unwrap().to_str().unwrap()}).to_string()
         }))
         .route("/sse", axum::routing::get(|| async {
             let events=futures_util::stream::unfold(0,|n| async move {
@@ -213,6 +213,7 @@ with context.wrap_socket(socket.create_connection(('127.0.0.1',int(sys.argv[2]))
         assert_eq!(h["host"], format!("app.localhost:{port}"));
         assert_eq!(h["proto"], if tls { "https" } else { "http" });
         assert_eq!(h["hops"], "1");
+        assert_eq!(h["porch_hops"], "1");
         assert_eq!(h["port"], port.to_string());
         let start = Instant::now();
         let mut stream = client

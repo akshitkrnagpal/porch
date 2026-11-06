@@ -6,7 +6,6 @@ use fs2::FileExt;
 use std::{
     collections::BTreeMap,
     fs,
-    net::TcpListener,
     path::PathBuf,
     process::{Command, Stdio},
     time::Duration,
@@ -322,7 +321,7 @@ pub async fn run() -> Result<i32> {
                 if o.foreground {
                     if s.tls {
                         state::load()?;
-                        crate::tls::config(s.cert.clone(), s.key.clone())?;
+                        crate::tls::config_for_settings(&s)?;
                     }
                     trust_if_needed(&s, o.skip_trust).await?;
                     return foreground(s).await.map(|_| 0);
@@ -605,7 +604,26 @@ fn settings_args(s: &ProxySettings) -> Vec<String> {
     }
     a
 }
-async fn start_proxy(mut s: ProxySettings, skip_trust: bool) -> Result<()> {
+fn authenticate_sudo(interactive: bool, port: u16) -> Result<()> {
+    let guidance = format!("port {port} requires administrator privileges; run `porch proxy start` in a terminal to complete sudo setup, or choose `porch proxy start --unprivileged --port 1355 --no-tls` explicitly");
+    let mut command = Command::new("sudo");
+    if !interactive {
+        command.arg("-n");
+    }
+    command.arg("-v");
+    if !interactive {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
+    let status = command.status().with_context(|| guidance.clone())?;
+    if !status.success() {
+        bail!("{guidance}");
+    }
+    Ok(())
+}
+async fn start_proxy(s: ProxySettings, skip_trust: bool) -> Result<()> {
     let _startup = startup_lock().await?;
     if proxy_running() {
         let actual = state::proxy_settings()?;
@@ -616,16 +634,18 @@ async fn start_proxy(mut s: ProxySettings, skip_trust: bool) -> Result<()> {
         return Ok(());
     }
     // Detect privilege requirements before detaching; never leave a false ready marker.
-    let bind = s.bind.as_deref().unwrap_or(if s.lan || s.unprivileged {
-        "0.0.0.0"
-    } else {
-        "127.0.0.1"
-    });
-    let needs_privilege = match TcpListener::bind((bind, s.port)) {
-        Ok(_) => false,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => true,
-        Err(e) => return Err(e).context("proxy port unavailable"),
-    };
+    let mut needs_privilege = false;
+    let mut privileged_port = s.port;
+    for port in std::iter::once(s.port).chain(s.redirect_port.filter(|p| s.tls && *p != s.port)) {
+        match crate::sockets::reserve(port) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                needs_privilege = true;
+                privileged_port = port;
+            }
+            Err(e) => return Err(e).with_context(|| format!("proxy port {port} unavailable")),
+        }
+    }
     let mut elevated = false;
     if needs_privilege {
         if s.unprivileged {
@@ -634,20 +654,28 @@ async fn start_proxy(mut s: ProxySettings, skip_trust: bool) -> Result<()> {
                 s.port
             )
         }
-        let sudo = Command::new("sudo")
-            .args(["-n", "true"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        match sudo {Ok(status) if status.success()=>elevated=true,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{s.port=1355;s.redirect_port=None;eprintln!("sudo unavailable; using port 1355")},_=>bail!("port {} requires privileges; run proxy start interactively with sudo or choose --port 1355",s.port)}
+        use std::io::IsTerminal;
+        authenticate_sudo(
+            std::io::stdin().is_terminal() && std::env::var_os("CI").is_none(),
+            privileged_port,
+        )?;
+        elevated = true;
     }
     state::load()?;
     let _ = fs::remove_file(state::dir().join("proxy.ready"));
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(state::dir().join("proxy.log"))?;
+    let mut log_options = fs::OpenOptions::new();
+    log_options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        log_options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let log = log_options.open(state::dir().join("proxy.log"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        log.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
     let exe = std::env::current_exe()?;
     let mut c = if elevated {
         let mut c = Command::new("sudo");
@@ -1104,7 +1132,7 @@ async fn sync_hosts() {
 struct Lease {
     name: String,
     owner: u32,
-    listener: Option<TcpListener>,
+    listener: Option<crate::sockets::Reservation>,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -1147,8 +1175,7 @@ fn reserve(
             if used.contains(&port) {
                 bail!("app port {port} is already reserved by another route")
             }
-            TcpListener::bind(("127.0.0.1", port))
-                .with_context(|| format!("app port {port} unavailable"))?
+            crate::sockets::reserve(port).with_context(|| format!("app port {port} unavailable"))?
         } else {
             let start = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -1157,10 +1184,10 @@ fn reserve(
             (0..1000)
                 .map(|i| 4000 + (start + i) % 1000)
                 .filter(|p| !used.contains(p) && ![4045, 4190].contains(p))
-                .find_map(|p| TcpListener::bind(("127.0.0.1", p)).ok())
+                .find_map(|p| crate::sockets::reserve(p).ok())
                 .context("all app ports 4000-4999 are occupied")?
         };
-        let port = listener.local_addr()?.port();
+        let port = listener.port()?;
         state::remove_route(s, &name);
         s.routes.push(Route {
             name: name.clone(),
@@ -1170,7 +1197,7 @@ fn reserve(
         s.owners.insert(name.clone(), identity);
         Ok(listener)
     })?;
-    let port = listener.local_addr()?.port();
+    let port = listener.port()?;
     Ok((
         port,
         Lease {
@@ -1582,6 +1609,9 @@ fn clean_state() -> Result<()> {
             "proxy.hosts-sync-token",
             "service.json",
             "tls.lock",
+            "tls-profile-version",
+            "proxy.hosts-capability",
+            "hosts-localhost-hint",
         ]
         .contains(&n.as_ref())
             || n.starts_with("dev-manifest-")
@@ -1728,7 +1758,7 @@ fn clean_needs_elevation() -> bool {
             && std::env::var_os("PORCH_TRUST_DIR").is_none()
             && (state::dir().join("trust.json").exists()
                 || state::dir().join("service.json").exists()
-                || enabled("SYNC_HOSTS") != Some(false))
+                || crate::integrations::has_managed_hosts())
     }
     #[cfg(not(unix))]
     {
@@ -1785,4 +1815,106 @@ fn child_program(
     }
     let _ = cwd;
     crate::process::resolve_program(program, paths)
+}
+
+#[cfg(all(test, unix))]
+mod elevation_tests {
+    use super::*;
+    #[test]
+    #[ignore = "invoked by the isolated PTY acceptance harness"]
+    fn sudo_prompt_child() {
+        use std::io::IsTerminal;
+        let result = authenticate_sudo(std::io::stdin().is_terminal(), 443);
+        if std::env::var_os("PORCH_SUDO_EXPECT_FAILURE").is_some() {
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(message.contains("terminal"), "{message}");
+            assert!(
+                message.contains("--unprivileged --port 1355 --no-tls"),
+                "{message}"
+            );
+            println!("ELEVATION_FAILURE_OK");
+        } else {
+            result.unwrap();
+            println!("ELEVATION_OK");
+        }
+    }
+    #[test]
+    fn unattended_or_missing_sudo_offers_explicit_setup_choices() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("porch-no-sudo-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        for installed in [false, true] {
+            if installed {
+                fs::write(
+                    root.join("sudo"),
+                    "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -v ] || exit 99\nexit 1\n",
+                )
+                .unwrap();
+                fs::set_permissions(root.join("sudo"), fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "cli::elevation_tests::sudo_prompt_child",
+                    "--nocapture",
+                ])
+                .env("PATH", &root)
+                .env("PORCH_SUDO_EXPECT_FAILURE", "1")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(String::from_utf8_lossy(&out.stdout).contains("ELEVATION_FAILURE_OK"));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn fresh_sudo_credentials_prompt_with_a_terminal() {
+        let script = r#"
+import os,pty,select,sys,tempfile,time,signal
+with tempfile.TemporaryDirectory(prefix='porch-sudo-') as root:
+ shim=root+'/sudo'
+ with open(shim,'w') as f:
+  f.write('#!/usr/bin/env python3\nimport sys,os\nassert sys.argv[1:]==["-v"],sys.argv\nassert sys.stdin.isatty()\nprint("password:",flush=True)\nassert input()=="fixture-password"\n')
+ os.chmod(shim,0o755)
+ pid,fd=pty.fork()
+ if pid==0:
+  os.environ['PATH']=root+':'+os.environ['PATH']
+  os.execv(sys.argv[1],[sys.argv[1],'--ignored','--exact','cli::elevation_tests::sudo_prompt_child','--nocapture'])
+ data=b''; sent=False; deadline=time.monotonic()+10
+ try:
+  while time.monotonic()<deadline:
+   if select.select([fd],[],[],.1)[0]:
+    try: chunk=os.read(fd,65536)
+    except OSError: break
+    if not chunk: break
+    data+=chunk
+    if b'password:' in data and not sent:
+     os.write(fd,b'fixture-password\n'); sent=True
+   done,status=os.waitpid(pid,os.WNOHANG)
+   if done: break
+  assert b'ELEVATION_OK' in data,data.decode(errors='replace')
+ finally:
+  try: os.kill(pid,signal.SIGKILL)
+  except ProcessLookupError: pass
+  try: os.waitpid(pid,0)
+  except ChildProcessError: pass
+  os.close(fd)
+"#;
+        let out = Command::new("python3")
+            .args(["-c", script])
+            .arg(std::env::current_exe().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

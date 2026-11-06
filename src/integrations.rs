@@ -229,6 +229,64 @@ fn hosts(action: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Capability probe only: open for writing without modifying the hosts file.
+pub fn hosts_sync_capable() -> bool {
+    let path = hosts_path();
+    if fs::symlink_metadata(&path).map_or(true, |m| m.file_type().is_symlink()) {
+        return false;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).is_ok()
+}
+#[derive(Debug)]
+pub struct InvalidHostsToken;
+impl std::fmt::Display for InvalidHostsToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid hosts sync token")
+    }
+}
+impl std::error::Error for InvalidHostsToken {}
+fn localhost_hosts_hint(settings: &crate::state::ProxySettings) -> Result<bool> {
+    if settings.lan
+        || !settings
+            .tlds
+            .iter()
+            .all(|t| t == "localhost" || t.ends_with(".localhost"))
+    {
+        return Ok(false);
+    }
+    let path = crate::state::dir().join("hosts-localhost-hint");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    match options.open(&path) {
+        Ok(_) => {
+            crate::state::inherit_owner(&path)?;
+            eprintln!("Browsers resolve .localhost without hosts entries; for other clients run `sudo porch hosts sync` if needed.");
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(true)
+}
+async fn hosts_response(response: reqwest::Response) -> Result<reqwest::Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status();
+    let diagnostic = response.text().await?;
+    bail!("hosts synchronization returned {status}: {diagnostic}")
+}
 pub fn auto_hosts_sync() -> Result<()> {
     if disabled("SYNC_HOSTS") || crate::state::proxy_settings()?.unprivileged {
         return Ok(());
@@ -297,7 +355,7 @@ pub fn verify_hosts_sync(token: &str, challenge: &str, proof: &str) -> bool {
 }
 pub fn authenticated_hosts_sync(token: &str) -> Result<()> {
     if !constant_eq(&hosts_sync_token()?, token) {
-        bail!("invalid hosts sync token");
+        return Err(InvalidHostsToken.into());
     }
     auto_hosts_sync()
 }
@@ -305,10 +363,27 @@ pub async fn request_hosts_sync() -> Result<()> {
     if disabled("SYNC_HOSTS") || crate::state::proxy_settings()?.unprivileged {
         return Ok(());
     }
-    if auto_hosts_sync().is_ok() {
+    let direct_error = match auto_hosts_sync() {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    let settings = crate::state::proxy_settings()?;
+    if localhost_hosts_hint(&settings)? {
         return Ok(());
     }
-    let settings = crate::state::proxy_settings()?;
+    // Written by this daemon before readiness. Avoid sending a doomed request
+    // to a user-owned proxy with no hosts-file write capability.
+    if let Ok(bytes) = fs::read(crate::state::dir().join("proxy.hosts-capability")) {
+        if let Ok(capability) = serde_json::from_slice::<Value>(&bytes) {
+            let ready =
+                fs::read_to_string(crate::state::dir().join("proxy.ready")).unwrap_or_default();
+            if capability["pid"].as_u64() == ready.trim().parse::<u64>().ok()
+                && capability["writable"] == false
+            {
+                return Err(direct_error).context("the running proxy cannot write the hosts file; run `sudo porch hosts sync` for custom domains, or use --unprivileged with .localhost");
+            }
+        }
+    }
     let token = fs::read_to_string(crate::state::dir().join("proxy.hosts-sync-token"))?;
     let mut random = [0u8; 32];
     getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("secure random: {e}"))?;
@@ -329,12 +404,14 @@ pub async fn request_hosts_sync() -> Result<()> {
         if settings.tls { "https" } else { "http" },
         settings.port
     );
-    let response = client
-        .head(&url)
-        .header("x-porch-hosts-sync-challenge", &challenge)
-        .send()
-        .await?
-        .error_for_status()?;
+    let response = hosts_response(
+        client
+            .head(&url)
+            .header("x-porch-hosts-sync-challenge", &challenge)
+            .send()
+            .await?,
+    )
+    .await?;
     let proof = response
         .headers()
         .get("x-porch-hosts-sync-proof")
@@ -343,12 +420,14 @@ pub async fn request_hosts_sync() -> Result<()> {
     if !verify_hosts_sync(token.trim(), &challenge, proof) {
         bail!("proxy failed hosts sync identity challenge");
     }
-    client
-        .post(url)
-        .header("x-porch-hosts-sync-token", token.trim())
-        .send()
-        .await?
-        .error_for_status()?;
+    hosts_response(
+        client
+            .post(url)
+            .header("x-porch-hosts-sync-token", token.trim())
+            .send()
+            .await?,
+    )
+    .await?;
     Ok(())
 }
 
@@ -890,6 +969,9 @@ fn untrust() -> Result<()> {
     fs::remove_file(path)?;
     Ok(())
 }
+pub fn has_managed_hosts() -> bool {
+    fs::read_to_string(hosts_path()).is_ok_and(|s| s.contains("# porch-start"))
+}
 pub fn clean() -> Result<()> {
     // Trust removal must succeed before the coordinator deletes the CA and state.
     prune_shares(true)?;
@@ -897,7 +979,7 @@ pub fn clean() -> Result<()> {
     if crate::state::dir().join("service.json").exists() {
         service("uninstall", &[])?;
     }
-    if fs::read_to_string(hosts_path()).is_ok_and(|s| s.contains("# porch-start")) {
+    if has_managed_hosts() {
         hosts("clean")?;
     }
     Ok(())
@@ -2114,15 +2196,65 @@ async fn doctor() -> Result<()> {
         settings.lan,
         settings.unprivileged
     );
-    match tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::net::TcpStream::connect(("127.0.0.1", settings.port)),
-    )
-    .await
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let identity = fs::read(crate::state::dir().join("proxy.identity"))
+        .ok()
+        .and_then(|v| serde_json::from_slice::<crate::state::ProcessIdentity>(&v).ok());
+    let ready = fs::read_to_string(crate::state::dir().join("proxy.ready")).unwrap_or_default();
+    let owned_ready = identity.as_ref().is_some_and(|i| {
+        crate::state::matches(i) && ready.trim().parse::<u32>().ok() == Some(i.pid)
+    });
+    let token =
+        fs::read_to_string(crate::state::dir().join("proxy.hosts-sync-token")).unwrap_or_default();
+    let challenge = "ab".repeat(32);
+    for address in ["127.0.0.1", "[::1]"] {
+        let response = client
+            .head(format!(
+                "http://{address}:{}/_porch/hosts-sync",
+                settings.port
+            ))
+            .header("host", "localhost")
+            .header("x-porch-hosts-sync-challenge", &challenge)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let proof = response
+                    .headers()
+                    .get("x-porch-hosts-sync-proof")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let authenticated = verify_hosts_sync(token.trim(), &challenge, proof);
+                let disabled = settings.unprivileged
+                    && response.status() == reqwest::StatusCode::CONFLICT
+                    && response.headers().contains_key("x-porch");
+                if owned_ready && (authenticated || disabled) {
+                    println!("proxy listener {address}: Porch ready (identity verified)");
+                } else {
+                    println!("proxy listener {address}: foreign/unverified listener; port collision or stale daemon state");
+                }
+            }
+            Err(e) => {
+                println!("proxy listener {address}: unavailable ({e}); run porch proxy start")
+            }
+        }
+    }
+    #[cfg(unix)]
+    if let Ok(output) = Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{}", settings.port), "-sTCP:LISTEN"])
+        .output()
     {
-        Ok(Ok(_)) => println!("proxy listener: reachable"),
-        _ => println!("proxy listener: unavailable; run porch proxy start"),
-    };
+        if output.status.success() {
+            println!(
+                "listeners on proxy port:\n{}",
+                String::from_utf8_lossy(&output.stdout).trim()
+            );
+        }
+    }
     for r in state.routes {
         let owner = state.owners.get(&r.name).map(crate::state::matches);
         println!(

@@ -38,7 +38,7 @@ porch proxy status
 
 Proxy options are `--port`/`-p`, `--https`, `--no-tls`, `--foreground`, `--skip-trust`, `--unprivileged`, `--lan`, `--ip`, repeatable/comma-separated `--tld`, `--wildcard`, paired `--cert`/`--key`, and `--state-dir`. Porch also provides explicit `--bind` and `--redirect-port` overrides. A custom certificate implies TLS.
 
-Normal listeners bind IPv4 and IPv6 loopback. LAN mode binds both wildcard addresses and uses `.local` names. Unprivileged mode may also require wildcard binding, but the proxy rejects non-loopback peers unless LAN is enabled. Unsupported low-port binding produces an actionable error. Where standard binding needs privileges, daemon startup uses available sudo authorization or reports the requirement; absence of sudo permits the 1355 fallback.
+Normal listeners bind IPv4 and IPv6 loopback. LAN mode binds both wildcard addresses and uses `.local` names. Unprivileged mode may also require wildcard binding, but the proxy rejects non-loopback peers unless LAN is enabled. Unsupported low-port binding produces an actionable error. Where binding needs privileges, interactive startup runs `sudo -v` before detaching. Unattended startup uses cached sudo authorization or gives explicit terminal-setup and `--unprivileged --port 1355 --no-tls` choices. Missing sudo never silently changes settings. Listeners and app reservations use exclusive non-reuse binds across IPv4/IPv6 wildcard interfaces; occupied ports are refused or skipped. `doctor` verifies daemon identity and HTTP readiness and lists other listeners where lsof is available.
 
 HTTPS supports HTTP/1.1 and HTTP/2. The proxy streams request/response bodies, forwards WebSocket Upgrade and RFC 8441 extended CONNECT, preserves forwarding metadata, and detects recursive proxy loops. Plain HTTP requests on a TLS listener redirect to HTTPS; an additional redirect listener can be configured. Unknown configured hosts receive a structured 404; unrelated domains receive 421. HTML and JSON error responses include a useful error code.
 
@@ -58,6 +58,8 @@ Aliases also accept HTTP/HTTPS upstream URLs. `remove`/`rm` and `routes` are add
 
 ## Configuration and workspaces
 
+Every caller selects one source per directory: `porch.json`, then `package.json` `porch`, then `portless.json`, then `package.json` `portless`. A malformed selected source fails explicitly; lower-priority sources are fallbacks, not merged overrides.
+
 | Field | Meaning |
 | --- | --- |
 | `name` | Base hostname; inferred when absent |
@@ -69,13 +71,13 @@ Aliases also accept HTTP/HTTPS upstream URLs. `remove`/`rm` and `routes` are add
 | `worktree.prefix` | `last-segment` (default) or `branch` |
 | `worktree.hostnameTemplate` | Template containing `{worktree}`, optionally `{name}` |
 
-A package's `porch` value can be a name string or app settings object. CLI selections take priority; leaf package settings override workspace app entries. Worktree fields merge from root to leaf. Long generated labels receive a stable hash suffix. Linked worktrees on feature branches get a prefix; the main checkout and default branches do not.
+A package's `porch` value can be a name string or app settings object. CLI selections take priority; leaf package settings override workspace app entries. Worktree fields merge from root to leaf. Direct leaf launches inherit root worktree settings and matching `apps` entries, but not root name/appPort/script. A root name supplies the project domain, so packages infer `web.shop` and `api.shop`. At the workspace root, the root script remains the coordinator default. Long generated labels receive a stable hash suffix. Linked worktrees on feature branches get a prefix; the main checkout and default branches do not.
 
 Workspace discovery reads `pnpm-workspace.yaml` or array/object `package.json` workspaces and supports single-segment star patterns and exclusions. Unlisted apps infer `<package>.<project>` using the common npm scope, then root name/directory fallback. Known build-only commands such as `tsc` and `tsup` run as tasks without routes. Duplicate generated app names fail before launch.
 
 Package managers are resolved from `packageManager` and ancestor lockfiles: npm, pnpm, yarn, and bun. Package scripts execute through the package manager, preserving shell semantics and lifecycle hooks. Local and ancestor `node_modules/.bin` directories are added to PATH.
 
-With `turbo.json`/`turbo.jsonc`, Porch reserves package routes and runs the root task command once. A per-launch Node preload supplies each package's environment without replacing the Turbo graph. It also supplies required framework flags to Node framework CLIs. Package wrappers using `dev: porch` with `porch.script: dev:app` inherit the reserved environment and avoid a second route owner. Use `porch -- --filter=web` to pass arguments to the root Turbo runner. Setting `turbo: false` uses direct concurrent spawning.
+With `turbo.json`/`turbo.jsonc`, Porch reserves package routes and runs the root task command once. A per-launch Node preload supplies each package's environment without replacing the Turbo graph. It also supplies required framework flags to Node framework CLIs. Package wrappers using `dev: porch` with `porch.script: dev:app` inherit the reserved environment and avoid a second route owner. Use `porch -- --filter=web` to pass arguments to the root Turbo runner. Setting `turbo: false` uses direct concurrent spawning. Explicit named Turbo graph commands (including root `pnpm run dev` scripts that invoke Turbo) are rejected at multi-package roots: use bare `porch` or coordinator filtering to retain separate ports.
 
 Framework detection covers Vite, VitePress, VitePlus (`vp`), React Router, Rsbuild, Astro, Angular (`ng`), React Native, Expo, and Wrangler. It recognizes package runners and one level of package-script indirection. Existing port/host choices are preserved. Build/non-server commands receive no server flags. Compound scripts, trailing comments, and framework `--` boundaries are deliberately left to the package manager rather than appending flags to the wrong command. Expo in LAN mode receives neither an injected HOST variable nor a forced localhost host flag.
 
@@ -134,3 +136,10 @@ cargo build --release
 CI definitions target Ubuntu, macOS, and Windows. A workflow definition is not evidence that those runners have passed; current local acceptance was performed on macOS. The manual artifact workflow builds native Linux x86_64, macOS ARM64, and Windows x86_64 binaries without creating a public GitHub Release, signing, or notarizing them.
 
 Configuration lookup prefers `porch.json`, then the package `porch` key, then `portless.json`, then the package `portless` key. A native package key can override app fields from the file, consistent with leaf package overrides. A malformed selected native configuration is an error, never a reason to fall back to legacy settings. Legacy child environment names are also emitted for migration.
+
+
+## Certificate issuance and hosts capability
+
+Automatic TLS issuance accepts configured TLDs, registered route names, and `.local` in LAN mode; unrelated SNI is rejected before certificate creation, including previously cached names after removal. Leaves have hostname CN/SAN, serverAuth EKU and at most 365 days validity. New local CAs have at most 3650 days validity and pathLen=0. Persisted roots/keys are retained byte-for-byte to preserve installed trust, with profile-v2 leaves taking effect after daemon restart and a one-time legacy-root hint. DNS NameConstraints are not fixed on the root because domains can change; the running resolver enforces the issuance boundary. Replacing a legacy root requires explicit cleanup and renewed trust setup. Real trusted-CA Safari/Chrome/Firefox behavior remains unverified.
+
+Automatic hosts updates use the daemon's recorded write capability to avoid requesting writes from an incapable proxy. Custom-domain permission errors retain setup guidance; authentication failures remain separate 403 responses, while write failures return 409. Browser `.localhost` resolution needs no hosts entries, so failure yields one hint per state directory. Other clients may still require explicit `sudo porch hosts sync`. The loopback challenge/proof, token and Origin protections apply unchanged.

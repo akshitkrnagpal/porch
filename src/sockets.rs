@@ -1,0 +1,61 @@
+//! Exclusive TCP reservations. Never enable SO_REUSEADDR on live listeners.
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+};
+
+fn ipv6_unavailable(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL | libc::EPROTONOSUPPORT)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(e.raw_os_error(), Some(10047 | 10049))
+    }
+}
+pub fn bind(addr: SocketAddr, v6_only: bool) -> io::Result<TcpListener> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(v6_only)?;
+    }
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
+/// Hold both address families, including wildcard interfaces, until the app starts.
+#[derive(Debug)]
+pub struct Reservation {
+    v4: TcpListener,
+    _v6: Option<TcpListener>,
+}
+impl Reservation {
+    pub fn port(&self) -> io::Result<u16> {
+        Ok(self.v4.local_addr()?.port())
+    }
+}
+pub fn reserve(port: u16) -> io::Result<Reservation> {
+    let v4 = bind(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        false,
+    )?;
+    let port = v4.local_addr()?.port();
+    let v6 = match bind(
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+        true,
+    ) {
+        Ok(l) => Some(l),
+        Err(e) if ipv6_unavailable(&e) => None,
+        Err(e) => return Err(e),
+    };
+    Ok(Reservation { v4, _v6: v6 })
+}

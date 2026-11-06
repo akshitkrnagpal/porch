@@ -21,7 +21,9 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&o.stdout).trim().to_owned())
 }
 
-/// Missing configuration is an empty object. Invalid explicit files are errors.
+/// Resolve one directory, without merging competing sources. Native settings win:
+/// porch.json > package.json porch > portless.json > package.json portless.
+/// Missing configuration is an empty object. Invalid selected files are errors.
 pub fn load(cwd: &Path) -> Result<Value> {
     if let Some(config) = config_file(&cwd.join("porch.json"))? {
         return Ok(config);
@@ -253,22 +255,23 @@ pub fn detect_worktree_prefix(cwd: &Path, style: &str) -> Option<String> {
     }
     None
 }
-/// Root worktree defaults survive app overrides; other root fields do not when apps exists.
+/// Root worktree defaults survive app overrides. Per-app root fields only apply
+/// in the configuration directory; descendants inherit only a matching apps entry.
 pub fn resolve_app_config(config: &Value, config_dir: &Path, package_dir: &Path) -> Value {
     let mut out = json!({});
-    if let Some(apps) = config.get("apps") {
+    if config_dir == package_dir {
+        for k in ["name", "script", "appPort", "proxy", "turbo"] {
+            if let Some(v) = config.get(k) {
+                out[k] = v.clone();
+            }
+        }
+    } else if let Some(apps) = config.get("apps") {
         if let Ok(rel) = package_dir.strip_prefix(config_dir) {
             for p in rel.ancestors().filter(|p| !p.as_os_str().is_empty()) {
                 if let Some(app) = apps.get(p.to_string_lossy().replace('\\', "/")) {
                     out = app.clone();
                     break;
                 }
-            }
-        }
-    } else {
-        for k in ["name", "script", "appPort", "proxy"] {
-            if let Some(v) = config.get(k) {
-                out[k] = v.clone();
             }
         }
     }
@@ -576,18 +579,7 @@ pub fn effective_config(cwd: &Path) -> Result<Value> {
     let root_app = resolve_app_config(&config, &root, cwd);
     let leaf = if root != cwd { load(cwd)? } else { json!({}) };
     let leaf = resolve_app_config(&leaf, cwd, cwd);
-    let mut out = merge_config(&root_app, &leaf);
-    // The package key is closest to the script, even when a root apps entry exists.
-    if let Some(pkg) = read_json(&cwd.join("package.json")).and_then(|v| {
-        v.get("porch").cloned().or_else(|| {
-            (!cwd.join("porch.json").exists())
-                .then(|| v.get("portless").cloned())
-                .flatten()
-        })
-    }) {
-        let pkg = package_settings(pkg)?;
-        out = merge_config(&out, &resolve_app_config(&pkg, cwd, cwd));
-    }
+    let out = merge_config(&root_app, &leaf);
     validate_config(&out)?;
     Ok(out)
 }
@@ -634,6 +626,52 @@ fn env_app_port() -> Result<Option<u16>> {
         .transpose()
 }
 
+fn workspace_package_name(root: &Path, pkg: &WorkspacePackage, project: &str) -> String {
+    let name = pkg
+        .name
+        .as_deref()
+        .map(sanitize_for_hostname)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            sanitize_for_hostname(
+                &pkg.dir
+                    .strip_prefix(root)
+                    .unwrap_or(&pkg.dir)
+                    .to_string_lossy(),
+            )
+        });
+    if name == project {
+        name
+    } else {
+        format!("{name}.{project}")
+    }
+}
+
+fn runs_workspace_graph(command: &[String], cwd: &Path) -> bool {
+    let Some(executable) = command.first().map(|s| basename(s)) else {
+        return false;
+    };
+    if executable == "turbo" {
+        return true;
+    }
+    if !["npm", "pnpm", "yarn", "bun", "npx", "pnpx", "bunx"].contains(&executable) {
+        return false;
+    }
+    if command.iter().skip(1).any(|s| basename(s) == "turbo") {
+        return true;
+    }
+    let script = if command.get(1).is_some_and(|s| s == "run") {
+        command.get(2)
+    } else if ["pnpm", "yarn", "bun"].contains(&executable) {
+        command.get(1).filter(|s| !s.starts_with('-'))
+    } else {
+        None
+    };
+    script
+        .and_then(|script| resolve_script_raw(script, cwd))
+        .is_some_and(|raw| split_command(&raw).iter().any(|s| basename(s) == "turbo"))
+}
+
 /// Resolve bare, inferred and named execution into actual package-manager commands.
 pub fn launch_plans(
     cwd: &Path,
@@ -653,39 +691,12 @@ pub fn launch_plans(
         let project = workspace_project_name(&cwd, &packages)?;
         let mut plans = Vec::new();
         for pkg in &packages {
-            let mut app = effective_config(&pkg.dir)?;
-            // At a workspace root, name is the project domain. Only an apps
-            // entry or leaf config may rename one package.
-            if root_config.get("apps").is_none()
-                && root_config.get("name").is_some()
-                && resolve_app_config(&load(&pkg.dir)?, &pkg.dir, &pkg.dir)
-                    .get("name")
-                    .is_none()
-            {
-                app.as_object_mut().unwrap().remove("name");
-            }
+            let app = effective_config(&pkg.dir)?;
             let target_script = script.or(app["script"].as_str()).unwrap_or(default_script);
             let Some(raw) = resolve_script_raw(target_script, &pkg.dir) else {
                 continue;
             };
-            let inferred = pkg
-                .name
-                .as_deref()
-                .map(sanitize_for_hostname)
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| {
-                    sanitize_for_hostname(
-                        &pkg.dir
-                            .strip_prefix(&cwd)
-                            .unwrap_or(&pkg.dir)
-                            .to_string_lossy(),
-                    )
-                });
-            let inferred = if inferred == project {
-                inferred
-            } else {
-                format!("{inferred}.{project}")
-            };
+            let inferred = workspace_package_name(&cwd, pkg, &project);
             let base = app["name"].as_str().unwrap_or(&inferred);
             plans.push(LaunchPlan {
                 cwd: pkg.dir.clone(),
@@ -709,10 +720,21 @@ pub fn launch_plans(
             return Ok(plans);
         }
     }
+    let inferred = if let Some(root) = root.as_deref().filter(|root| *root != cwd) {
+        let packages = discover_workspace_packages(root);
+        if let Some(pkg) = packages.iter().find(|pkg| cwd.starts_with(&pkg.dir)) {
+            let project = workspace_project_name(root, &packages)?;
+            workspace_package_name(root, pkg, &project)
+        } else {
+            infer_name(&cwd)?
+        }
+    } else {
+        infer_name(&cwd)?
+    };
     let base = name
         .map(str::to_owned)
         .or_else(|| config["name"].as_str().map(str::to_owned))
-        .unwrap_or(infer_name(&cwd)?);
+        .unwrap_or(inferred);
     let script = script.or(config["script"].as_str()).unwrap_or("dev");
     let command = match command {
         Some(c) if !c.is_empty() => c,
@@ -723,6 +745,16 @@ pub fn launch_plans(
             )
         })?,
     };
+    if root.as_deref() == Some(cwd.as_path())
+        && discover_workspace_packages(&cwd).len() > 1
+        && runs_workspace_graph(&command, &cwd)
+    {
+        bail!(
+            "an explicit workspace Turbo command can start multiple apps with one PORT; \
+             use bare `porch` so each app gets its own route and port, or \
+             `porch -- --filter=<package>` to filter the workspace coordinator"
+        );
+    }
     Ok(vec![LaunchPlan {
         cwd: cwd.clone(),
         name: configured_name(&cwd, &base, prefix)?,

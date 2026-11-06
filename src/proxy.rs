@@ -249,8 +249,20 @@ fn hosts_request(
                 r
             }
             Err(e) => error(
-                StatusCode::FORBIDDEN,
-                "hosts_sync_failed",
+                if e.downcast_ref::<crate::integrations::InvalidHostsToken>()
+                    .is_some()
+                {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::CONFLICT
+                },
+                if e.downcast_ref::<crate::integrations::InvalidHostsToken>()
+                    .is_some()
+                {
+                    "forbidden"
+                } else {
+                    "hosts_sync_unavailable"
+                },
                 &e.to_string(),
                 host,
                 false,
@@ -344,8 +356,8 @@ async fn forward(
     }
     let hops = req
         .headers()
-        .get("x-portless-hops")
-        .or_else(|| req.headers().get("x-porch-hops"))
+        .get("x-porch-hops")
+        .or_else(|| req.headers().get("x-portless-hops"))
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
@@ -545,10 +557,12 @@ async fn forward(
                 .unwrap_or(if secure { 443 } else { 80 })
                 .to_string(),
         ),
+        ("x-porch-hops", (hops + 1).to_string()),
         ("x-portless-hops", (hops + 1).to_string()),
     ] {
         if (name == "x-forwarded-for"
             || name == "x-portless-hops"
+            || name == "x-porch-hops"
             || !req.headers().contains_key(name))
             && value.parse::<header::HeaderValue>().is_ok()
         {
@@ -627,24 +641,10 @@ async fn forward(
     }
 }
 fn listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
-    let domain = if addr.is_ipv6() {
-        socket2::Domain::IPV6
-    } else {
-        socket2::Domain::IPV4
-    };
-    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    // Windows SO_REUSEADDR permits overlapping live listeners.
-    #[cfg(not(windows))]
-    socket.set_reuse_address(true)?;
-    if addr.is_ipv6() {
-        socket.set_only_v6(true)?;
-    }
-    socket.set_nonblocking(true)?;
-    socket
-        .bind(&addr.into())
-        .with_context(|| format!("binding proxy {addr}"))?;
-    socket.listen(1024)?;
-    Ok(tokio::net::TcpListener::from_std(socket.into())?)
+    let listener =
+        crate::sockets::bind(addr, true).with_context(|| format!("binding proxy {addr}"))?;
+    listener.set_nonblocking(true)?;
+    Ok(tokio::net::TcpListener::from_std(listener)?)
 }
 fn unavailable_ipv6(addr: SocketAddr, error: &anyhow::Error) -> bool {
     #[cfg(unix)]
@@ -681,7 +681,15 @@ async fn listen(
 ) -> Result<()> {
     let mut connections = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = tokio::select! { result=listener.accept()=>result?, _=connections.join_next(), if !connections.is_empty()=>continue };
+        let accepted = tokio::select! { result=listener.accept()=>result, _=connections.join_next(), if !connections.is_empty()=>continue };
+        let (stream, peer) = match accepted {
+            Ok(connection) => connection,
+            Err(e) => {
+                eprintln!("Porch accept failed: {e}; retrying");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let context = context.clone();
         let acceptor = acceptor.clone();
         connections.spawn(async move {
@@ -739,11 +747,19 @@ pub async fn serve(
     .await
 }
 pub async fn serve_config(settings: ProxySettings) -> Result<()> {
+    // Check every interface before opening our own listeners. A listener on an
+    // unrelated family/interface must never be mistaken for this proxy.
+    drop(crate::sockets::reserve(settings.port).context("proxy port unavailable")?);
+    if let Some(port) = settings
+        .redirect_port
+        .filter(|p| settings.tls && *p != settings.port)
+    {
+        drop(crate::sockets::reserve(port).context("redirect port unavailable")?);
+    }
     let acceptor = if settings.tls {
-        Some(tokio_rustls::TlsAcceptor::from(crate::tls::config(
-            settings.cert.clone(),
-            settings.key.clone(),
-        )?))
+        Some(tokio_rustls::TlsAcceptor::from(
+            crate::tls::config_for_settings(&settings)?,
+        ))
     } else {
         None
     };
@@ -799,6 +815,12 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
             }
         }
     }
+    crate::state::atomic_write(
+        "proxy.hosts-capability",
+        &serde_json::to_vec(&serde_json::json!({
+            "pid": std::process::id(), "writable": crate::integrations::hosts_sync_capable()
+        }))?,
+    )?;
     let token = Arc::new(crate::integrations::hosts_sync_token()?);
     let settings = Arc::new(settings);
     let mut tasks = tokio::task::JoinSet::new();

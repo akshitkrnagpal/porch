@@ -104,7 +104,7 @@ fn workspace_launches_servers_and_build_tasks_with_leaf_overrides() {
     assert!(!plans.iter().find(|p| p.name == "types.org").unwrap().proxy);
     let one = launch_plans(&f.0.join("apps/web"), None, None, None, Some("")).unwrap();
     assert_eq!(one.len(), 1);
-    assert_eq!(one[0].name, "web");
+    assert_eq!(one[0].name, "web.org");
 }
 #[test]
 fn workspace_collisions_fail_before_launch() {
@@ -519,4 +519,317 @@ fn root_name_sets_workspace_project_domain_without_colliding_packages() {
         plans.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
         vec!["api.shop", "web.shop"]
     );
+}
+
+#[test]
+fn leaf_does_not_inherit_workspace_root_app_settings() {
+    let f = Fixture::new();
+    f.write("package.json", json!({"workspaces":["apps/*"],"porch":{"name":"shop","appPort":4901,"script":"start","worktree":{"prefix":"branch"}}}));
+    for app in ["web", "api"] {
+        f.write(
+            &format!("apps/{app}/package.json"),
+            json!({"name":app,"scripts":{"dev":"node server.js","start":"node wrong.js"}}),
+        );
+        let config = effective_config(&f.0.join(format!("apps/{app}"))).unwrap();
+        assert!(config.get("name").is_none(), "root name leaked: {config}");
+        assert!(
+            config.get("appPort").is_none(),
+            "root port leaked: {config}"
+        );
+        assert!(
+            config.get("script").is_none(),
+            "root script leaked: {config}"
+        );
+        assert_eq!(config["worktree"]["prefix"], "branch");
+        let plan =
+            launch_plans(&f.0.join(format!("apps/{app}")), None, None, None, Some("")).unwrap();
+        assert_eq!(plan[0].name, format!("{app}.shop"));
+        assert_eq!(plan[0].command, args(&["npm", "run", "dev"]));
+        assert!(plan[0].app_port.is_none());
+    }
+    let root = launch_plans(&f.0, None, None, None, Some("")).unwrap();
+    assert_eq!(
+        root.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        vec!["api.shop", "web.shop"]
+    );
+    assert!(root.iter().all(|p| p.app_port.is_none()));
+    assert!(root
+        .iter()
+        .all(|p| p.command == args(&["npm", "run", "start"])));
+}
+
+#[test]
+fn all_config_callers_follow_the_same_source_precedence() {
+    for (file, porch_key, portless_key, expected) in [
+        (Some("porch.json"), Some("dev"), Some("legacy"), "start"),
+        (None, Some("dev"), Some("legacy"), "dev"),
+        (Some("portless.json"), None, Some("legacy"), "start"),
+        (None, None, Some("legacy"), "legacy"),
+    ] {
+        let f = Fixture::new();
+        let mut package = json!({"workspaces":["apps/*"],"scripts":{"dev":"turbo dev","start":"turbo start","legacy":"turbo legacy"}});
+        if let Some(script) = porch_key {
+            package["porch"] = json!({"script":script});
+        }
+        if let Some(script) = portless_key {
+            package["portless"] = json!({"script":script});
+        }
+        f.write("package.json", package);
+        f.write("turbo.json", json!({"tasks":{}}));
+        if let Some(file) = file {
+            f.write(file, json!({"script":"start"}));
+        }
+        f.write("apps/web/package.json", json!({"name":"web","scripts":{"dev":"node dev.js","start":"node start.js","legacy":"node legacy.js"}}));
+        assert_eq!(load(&f.0).unwrap()["script"], expected);
+        assert_eq!(
+            effective_config(&f.0).unwrap()["script"],
+            expected,
+            "{file:?}"
+        );
+        assert_eq!(
+            turbo_command(&f.0, None).unwrap().unwrap(),
+            args(&["npm", "run", expected])
+        );
+        assert_eq!(
+            launch_plans(&f.0, None, None, None, Some("")).unwrap()[0].command,
+            args(&["npm", "run", expected])
+        );
+    }
+}
+
+#[test]
+fn leaf_sources_override_matching_root_app_with_the_same_precedence() {
+    for (file, native, legacy, expected) in [
+        (Some("porch.json"), Some("dev"), Some("legacy"), "start"),
+        (Some("portless.json"), Some("dev"), Some("legacy"), "dev"),
+        (Some("portless.json"), None, Some("legacy"), "start"),
+        (None, None, Some("legacy"), "legacy"),
+        (None, None, None, "root"),
+    ] {
+        let f = Fixture::new();
+        f.write("package.json", json!({"workspaces":["apps/*"]}));
+        f.write("porch.json", json!({"name":"shop","worktree":{"prefix":"branch","hostnameTemplate":"{worktree}-{name}"},"apps":{"apps/web":{"script":"root","name":"root-web","appPort":4901}}}));
+        let mut package = json!({"name":"web","scripts":{"root":"node root.js","start":"node start.js","dev":"node dev.js","legacy":"node legacy.js"}});
+        if let Some(script) = native {
+            package["porch"] = json!({"script":script,"name":script,"appPort":4902,"worktree":{"prefix":"last-segment"}});
+        }
+        if let Some(script) = legacy {
+            package["portless"] = json!({"script":script,"name":script,"appPort":4902,"worktree":{"prefix":"last-segment"}});
+        }
+        f.write("apps/web/package.json", package);
+        if let Some(file) = file {
+            f.write(&format!("apps/web/{file}"), json!({"script":"start","name":"start","appPort":4902,"worktree":{"prefix":"last-segment"}}));
+        }
+        let leaf = f.0.join("apps/web");
+        let local = load(&leaf).unwrap();
+        let effective = effective_config(&leaf).unwrap();
+        if expected == "root" {
+            assert!(local.get("script").is_none());
+        } else {
+            assert_eq!(local["script"], expected);
+        }
+        assert_eq!(effective["script"], expected);
+        assert_eq!(
+            effective["name"],
+            if expected == "root" {
+                "root-web"
+            } else {
+                expected
+            }
+        );
+        assert_eq!(
+            effective["appPort"],
+            if expected == "root" { 4901 } else { 4902 }
+        );
+        assert_eq!(
+            effective["worktree"]["hostnameTemplate"],
+            "{worktree}-{name}"
+        );
+        assert_eq!(
+            effective["worktree"]["prefix"],
+            if expected == "root" {
+                "branch"
+            } else {
+                "last-segment"
+            }
+        );
+        for dir in [&leaf, &f.0] {
+            let plan = launch_plans(dir, None, None, None, Some("")).unwrap();
+            assert_eq!(plan[0].command, args(&["npm", "run", expected]));
+            assert_eq!(plan[0].name, effective["name"].as_str().unwrap());
+        }
+        assert!(turbo_command(&leaf, None).unwrap().is_none());
+    }
+}
+
+#[test]
+fn malformed_native_configuration_is_not_hidden_by_package_or_legacy_fallbacks() {
+    let f = Fixture::new();
+    f.write(
+        "package.json",
+        json!({"workspaces":["apps/*"],"porch":{"script":"dev"},"portless":{"script":"start"}}),
+    );
+    f.write("portless.json", json!({"script":"start"}));
+    f.write("turbo.json", json!({"tasks":{}}));
+    f.write(
+        "apps/web/package.json",
+        json!({"name":"web","scripts":{"dev":"node x"}}),
+    );
+    fs::write(f.0.join("porch.json"), "{").unwrap();
+    assert!(load(&f.0).unwrap_err().to_string().contains("porch.json"));
+    assert!(effective_config(&f.0)
+        .unwrap_err()
+        .to_string()
+        .contains("porch.json"));
+    assert!(effective_config(&f.0.join("apps/web"))
+        .unwrap_err()
+        .to_string()
+        .contains("porch.json"));
+    assert!(launch_plans(&f.0, None, None, None, Some(""))
+        .unwrap_err()
+        .to_string()
+        .contains("porch.json"));
+    assert!(turbo_command(&f.0, None)
+        .unwrap_err()
+        .to_string()
+        .contains("porch.json"));
+}
+
+#[cfg(unix)]
+#[test]
+fn simultaneous_leaf_launches_keep_distinct_workspace_routes_and_ports() {
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+    struct Running {
+        children: Vec<Child>,
+        state: PathBuf,
+    }
+    impl Drop for Running {
+        fn drop(&mut self) {
+            for child in &mut self.children {
+                unsafe {
+                    libc::kill(child.id() as i32, libc::SIGTERM);
+                }
+                let _ = child.wait();
+            }
+            let _ = Command::new(env!("CARGO_BIN_EXE_porch"))
+                .args(["proxy", "stop"])
+                .env("PORCH_STATE_DIR", &self.state)
+                .env("PORCH_SYNC_HOSTS", "0")
+                .output();
+        }
+    }
+    let f = Fixture::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let root_app_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    f.write("package.json", json!({"workspaces":["apps/*"],"porch":{"name":"shop","appPort":root_app_port,"script":"wrong"}}));
+    let mut running = Running {
+        children: Vec::new(),
+        state: f.0.join("state"),
+    };
+    for app in ["web", "api"] {
+        f.write(
+            &format!("apps/{app}/package.json"),
+            json!({"name":app,"scripts":{"dev":"node server.cjs","wrong":"node missing.cjs"}}),
+        );
+        fs::write(f.0.join(format!("apps/{app}/server.cjs")), r#"const fs=require('fs');require('http').createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT),'127.0.0.1',()=>fs.writeFileSync('ready.json',JSON.stringify({port:process.env.PORT,url:process.env.PORCH_URL||process.env.PORTLESS_URL})))"#).unwrap();
+        running.children.push(
+            Command::new(env!("CARGO_BIN_EXE_porch"))
+                .current_dir(f.0.join(format!("apps/{app}")))
+                .env("PORCH_STATE_DIR", &running.state)
+                .env("PORCH_PORT", proxy_port.to_string())
+                .env("PORCH_HTTPS", "0")
+                .env("PORCH_SYNC_HOSTS", "0")
+                .env("PORCH_PREFIX", "")
+                .env("CI", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !["web", "api"]
+        .iter()
+        .all(|app| f.0.join(format!("apps/{app}/ready.json")).exists())
+    {
+        for child in &mut running.children {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "leaf launcher exited before its server became ready"
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "leaf launches did not both become ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let captures: Vec<serde_json::Value> = ["web", "api"]
+        .iter()
+        .map(|app| {
+            let capture: serde_json::Value = serde_json::from_slice(
+                &fs::read(f.0.join(format!("apps/{app}/ready.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                capture["url"],
+                format!("http://{app}.shop.localhost:{proxy_port}")
+            );
+            capture
+        })
+        .collect();
+    assert_ne!(captures[0]["port"], captures[1]["port"]);
+    let routes: serde_json::Value =
+        serde_json::from_slice(&fs::read(running.state.join("state.json")).unwrap()).unwrap();
+    assert_eq!(routes["routes"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn explicit_workspace_graph_commands_reject_a_shared_app_port() {
+    let f = Fixture::new();
+    f.write(
+        "package.json",
+        json!({"workspaces":["apps/*"],"scripts":{"dev":"turbo run dev"}}),
+    );
+    f.write("turbo.json", json!({"tasks":{"dev":{"persistent":true}}}));
+    for app in ["web", "api"] {
+        f.write(
+            &format!("apps/{app}/package.json"),
+            json!({"name":app,"scripts":{"dev":"vite"}}),
+        );
+    }
+    for command in [
+        args(&["pnpm", "run", "dev"]),
+        args(&["npm", "run", "dev"]),
+        args(&["yarn", "dev"]),
+        args(&["bun", "run", "dev"]),
+        args(&["turbo", "run", "dev"]),
+        args(&["pnpm", "exec", "turbo", "run", "dev"]),
+        args(&["turbo", "run", "dev", "--filter=*"]),
+    ] {
+        let error = launch_plans(&f.0, Some(command.clone()), Some("shop"), None, Some(""))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bare `porch`"), "{command:?}: {error}");
+    }
+    assert_eq!(
+        launch_plans(&f.0, None, None, None, Some(""))
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(launch_plans(
+        &f.0,
+        Some(args(&["node", "server.js"])),
+        Some("single"),
+        None,
+        Some("")
+    )
+    .is_ok());
 }
