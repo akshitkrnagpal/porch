@@ -69,7 +69,7 @@ pub async fn run(fix: bool, yes: bool) -> Result<()> {
         }
     } else if !cli::proxy_running() {
         let settings = state::proxy_settings()?;
-        if !ports::available(settings.port) {
+        if ports::has_listener(settings.port) {
             let problem = format!(
                 "proxy port {} is used by {}",
                 settings.port,

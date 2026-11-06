@@ -65,7 +65,7 @@ fn choose_port(
     interactive: bool,
 ) -> Result<u16> {
     let mut port = wanted;
-    if !ours && !ports::available(port) {
+    if !ours && ports::has_listener(port) {
         let who = ports::describe_owner(port);
         let next = ports::next_free(port.max(ports::FIRST_UNPRIVILEGED_PORT));
         if explicit {

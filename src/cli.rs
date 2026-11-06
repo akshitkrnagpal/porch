@@ -815,7 +815,14 @@ pub(crate) async fn start_proxy(
             needs_privilege = true;
         }
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            s = move_off_busy_port(s, port_explicit)?;
+            let port = s.port;
+            let released = tokio::task::spawn_blocking(move || {
+                crate::ports::wait_released(port, Duration::from_secs(60))
+            })
+            .await?;
+            if !released {
+                s = move_off_busy_port(s, port_explicit)?;
+            }
         }
         Err(e) => {
             return Err(e).with_context(|| {

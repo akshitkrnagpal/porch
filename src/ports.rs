@@ -187,6 +187,34 @@ pub fn available(port: u16) -> bool {
     crate::sockets::reserve(port).is_ok()
 }
 
+/// Is a live listener (not merely lingering TIME_WAIT connections) holding `port`?
+/// Recently closed proxy connections can keep a port unbindable for ~30s.
+pub fn has_listener(port: u16) -> bool {
+    !available(port)
+        && (owner(port).is_some()
+            || accepts(port)
+            || accepts_on(SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 1], port))))
+}
+
+/// Wait until `port` can be bound, for ports held only by closing connections.
+pub fn wait_released(port: u16, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut announced = false;
+    loop {
+        if available(port) {
+            return true;
+        }
+        if has_listener(port) || std::time::Instant::now() >= deadline {
+            return false;
+        }
+        if !announced {
+            eprintln!("Waiting for port {port} to be released by recently closed connections...");
+            announced = true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// The next bindable port after `after`, skipping Porch's reserved discovery port.
 pub fn next_free(after: u16) -> Option<u16> {
     (after.checked_add(1)?..=after.saturating_add(200))
@@ -240,6 +268,16 @@ mod tests {
         assert_eq!(found[0].name, "node");
         assert_eq!(found[2].pid, 10);
         assert!(is_porch(&found[1]));
+    }
+    #[test]
+    fn live_listener_is_distinguished_from_a_free_port() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        assert!(has_listener(port));
+        assert!(!wait_released(port, Duration::from_millis(100)));
+        drop(held);
+        assert!(!has_listener(port));
+        assert!(wait_released(port, Duration::from_secs(1)));
     }
     #[test]
     fn next_free_skips_discovery_and_busy_ports() {
