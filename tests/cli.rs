@@ -76,7 +76,9 @@ impl Sandbox {
     fn write_server(&self) {
         std::fs::write(
             self.root.join("server.py"),
-            r#"import os,json,http.server
+            r#"import os,json,http.server,socket
+# HTTPServer resolves its server name during bind; keep this fixture independent of runner DNS.
+socket.getfqdn=lambda name: "localhost"
 open('child-env.json','w').write(json.dumps(dict(os.environ)))
 class Server(http.server.BaseHTTPRequestHandler):
  def do_GET(self):
@@ -415,7 +417,8 @@ fn self_daemonized_server_inherits_route_until_explicit_takeover() {
     let s = Sandbox::new();
     std::fs::write(
         s.root.join("daemon.py"),
-        r#"import os,http.server
+        r#"import os,http.server,socket
+socket.getfqdn=lambda name: "localhost"
 pid=os.fork()
 if pid:os._exit(0)
 os.setsid()
