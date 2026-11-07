@@ -35,8 +35,9 @@ jobs:
       - run: cargo test --no-fail-fast --all-targets
       - run: cargo build --release
   windows:
-    # Windows support is in progress: the CLI must build and lint clean, and
-    # smoke-start without state. Unit tests run for signal only until they pass.
+    # The CLI and tray must build and lint clean, the CLI must smoke-start
+    # without state, and packaging must work. Unit tests run for signal only
+    # until they pass on Windows.
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v7
@@ -50,11 +51,18 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-${{ runner.os }}-windows-${{ hashFiles('Cargo.lock') }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --features tray --all-targets -- -D warnings
       - run: cargo build --release --bin porch
+      - run: cargo build --release --features tray --bin porch-tray
       - name: CLI starts without existing state
         shell: pwsh
         run: target/release/porch.exe --state-dir "$env:RUNNER_TEMP/porch-smoke" list --json
+      - run: python scripts/test_packaging.py
+      - run: python scripts/package.py --target x86_64-pc-windows-msvc --binaries target/release
       - name: Unit tests (not yet required)
         continue-on-error: true
         run: cargo test --no-fail-fast --lib

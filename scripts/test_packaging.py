@@ -27,6 +27,7 @@ formula = load('porch_formula', ROOT / 'scripts/render_formula.py')
 
 
 class PackageTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'inodes and Unix modes')
     def test_atomic_install_keeps_old_open_inode_and_executable_mode(self):
         with tempfile.TemporaryDirectory(prefix='porch-install-test-') as temporary:
             root = Path(temporary)
@@ -89,6 +90,25 @@ class PackageTests(unittest.TestCase):
                 self.assertTrue(any(name.endswith('/LICENSE') for name in names))
             self.assertTrue((output / 'Porch.app/Contents/Info.plist').exists())
 
+    def test_windows_package_ships_executables_without_login_script(self):
+        with tempfile.TemporaryDirectory(prefix='porch-windows-archive-test-') as temporary:
+            root = Path(temporary)
+            binaries, output = root / 'bin', root / 'out'
+            binaries.mkdir()
+            for name in ['porch.exe', 'porch-tray.exe']:
+                (binaries / name).write_bytes(b'test binary')
+            subprocess.run([sys.executable, str(ROOT / 'scripts/package.py'), '--target', 'x86_64-pc-windows-msvc',
+                            '--binaries', str(binaries), '--output', str(output)], check=True, capture_output=True)
+            archive, = output.glob('*.tar.gz')
+            self.assertTrue(archive.name.endswith('-x86_64-pc-windows-msvc.tar.gz'))
+            with tarfile.open(archive) as tar:
+                names = tar.getnames()
+            for expected in ['/porch.exe', '/porch-tray.exe', '/install.py', '/LICENSE']:
+                self.assertTrue(any(name.endswith(expected) for name in names), expected)
+            self.assertFalse(any(name.endswith('/porch-login') or 'Porch.app' in name for name in names))
+            self.assertFalse((output / 'Porch.app').exists())
+
+    @unittest.skipIf(os.name == 'nt', 'Unix package layout and shell PATH hint')
     def test_install_from_archive_into_isolated_prefix(self):
         with tempfile.TemporaryDirectory(prefix='porch-archive-install-') as temporary:
             root = Path(temporary)
@@ -130,14 +150,22 @@ class PackageTests(unittest.TestCase):
                 installer.extract_archive(archive, root / 'x')
             self.assertFalse((root / 'escape').exists())
 
+    @unittest.skipIf(os.name == 'nt', 'Unix shell PATH hint')
     def test_path_hint(self):
         home = Path.home()
-        self.assertIsNone(installer.path_hint(home / '.local/bin', f'/usr/bin:{home}/.local/bin'))
-        self.assertIsNone(installer.path_hint(home / '.local/bin', '/usr/bin:~/.local/bin'))
-        self.assertEqual(installer.path_hint(home / '.local/bin', '/usr/bin'),
+        self.assertIsNone(installer.path_hint(home / '.local/bin', f'/usr/bin:{home}/.local/bin', windows=False))
+        self.assertIsNone(installer.path_hint(home / '.local/bin', '/usr/bin:~/.local/bin', windows=False))
+        self.assertEqual(installer.path_hint(home / '.local/bin', '/usr/bin', windows=False),
                          'export PATH="$HOME/.local/bin:$PATH"')
-        self.assertEqual(installer.path_hint(Path('/opt/porch/bin'), '/usr/bin'),
+        self.assertEqual(installer.path_hint(Path('/opt/porch/bin'), '/usr/bin', windows=False),
                          'export PATH="/opt/porch/bin:$PATH"')
+
+    def test_windows_path_hint_is_case_insensitive_powershell(self):
+        bin_dir = Path('/Users/me/AppData/Local/Programs/Porch/bin')
+        self.assertIsNone(installer.path_hint(bin_dir, f'/windows;{bin_dir}', windows=True))
+        hint = installer.path_hint(bin_dir, '/windows', windows=True)
+        self.assertIn("SetEnvironmentVariable('Path', ", hint)
+        self.assertIn(f"'{bin_dir};'", hint)
 
 
 class FormulaTests(unittest.TestCase):

@@ -402,7 +402,7 @@ pub fn cli_path() -> Result<PathBuf> {
     let installed = if cfg!(windows) {
         let base = std::env::var_os("LOCALAPPDATA")
             .context("LOCALAPPDATA is unavailable; set PORCH_BIN to the CLI")?;
-        PathBuf::from(base).join(r"Programs\Porch").join(&cli)
+        PathBuf::from(base).join(r"Programs\Porch\bin").join(&cli)
     } else {
         let home =
             std::env::var_os("HOME").context("HOME is unavailable; set PORCH_BIN to the CLI")?;
