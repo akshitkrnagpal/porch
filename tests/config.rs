@@ -324,16 +324,13 @@ fn worktree_prefix_uses_last_segment_and_template_with_real_git() {
 #[cfg(unix)]
 #[test]
 fn framework_script_forwarding_reaches_real_package_manager_children() {
-    use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
     fs::create_dir_all(f.0.join("node_modules/.bin")).unwrap();
     let shim = f.0.join("node_modules/.bin/vite");
-    fs::write(
+    common::write_executable(
         &shim,
         "#!/bin/sh\nexec node \"$PORCH_CAPTURE_SCRIPT\" \"$@\"\n",
-    )
-    .unwrap();
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let capture = f.0.join("capture.cjs");
     fs::write(&capture,"require('fs').writeFileSync(process.env.PORCH_CAPTURE_FILE, JSON.stringify(process.argv.slice(2)))").unwrap();
     let record = f.0.join("record.json");
@@ -448,11 +445,9 @@ fn turbo_workspace_flow(wrapper: bool) {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("../vite/bin/vite.js", bin.join("vite")).unwrap();
-            use std::os::unix::fs::PermissionsExt;
             let path = p.join("vite.js");
             let raw = fs::read_to_string(&path).unwrap();
-            fs::write(&path, format!("#!/usr/bin/env node\n{raw}")).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            common::write_executable(&path, &format!("#!/usr/bin/env node\n{raw}"));
         }
     }
     let port = common::free_port();

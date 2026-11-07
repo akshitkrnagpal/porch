@@ -223,18 +223,19 @@ fn autostart_hint() {
     }
 }
 pub async fn unpair(machine: &str, json: bool) -> Result<()> {
-    let (peer, reached) = super::pairing::unpair(machine).await?;
+    let (peer, unreached) = super::pairing::unpair(machine).await?;
     if json {
-        println!(
-            "{}",
-            serde_json::json!({"version":PROTOCOL_VERSION,"machine":peer.machine,"reached":reached})
-        );
+        let mut out = serde_json::json!({"version":PROTOCOL_VERSION,"machine":peer.machine,"reached":unreached.is_none()});
+        if let Some(reason) = &unreached {
+            out["error"] = reason.as_str().into();
+        }
+        println!("{out}");
         return Ok(());
     }
     println!("Unpaired {}", peer.machine.name);
-    if !reached {
+    if let Some(reason) = unreached {
         eprintln!(
-            "{} was unreachable; run `porch unpair` there too. Its access to this machine is already revoked.",
+            "{} was unreachable ({reason}); run `porch unpair` there too. Its access to this machine is already revoked.",
             peer.machine.name
         );
     }

@@ -231,3 +231,39 @@ pub fn refused_port() -> (socket2::Socket, u16) {
     let port = socket.local_addr().unwrap().as_socket().unwrap().port();
     (socket, port)
 }
+
+/// Create an executable at `path` that this process never holds open for
+/// writing.
+///
+/// A file this multi-threaded process writes is copied, still open for
+/// writing, into any child another test forks at that moment, and stays that
+/// way until the child execs. Running the file in that window fails with
+/// "Text file busy" (ETXTBSY). Only a `cp` child writes the executable here;
+/// the source this process writes is never executed.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn write_executable(path: &std::path::Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let source = path.with_file_name(format!(
+        ".{}.source-{}-{}",
+        path.file_name().unwrap().to_string_lossy(),
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&source, contents).unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_file(path);
+    let status = std::process::Command::new("cp")
+        .arg(&source)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "cp {} {}",
+        source.display(),
+        path.display()
+    );
+    std::fs::remove_file(&source).unwrap();
+}

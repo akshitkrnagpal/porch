@@ -1431,7 +1431,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn worker_discovers_initially_refreshes_and_dispatches_real_cli_arguments() {
-        use std::{fs, os::unix::fs::PermissionsExt};
+        use std::fs;
         let directory = std::env::temp_dir().join(format!(
             "porch-tray-worker-{}-{}",
             std::process::id(),
@@ -1442,8 +1442,7 @@ mod tests {
         let log = directory.join("calls");
         let quoted_log = format!("'{}'", log.display().to_string().replace('\'', "'\"'\"'"));
         let json = serde_json::to_string(&snapshot()).unwrap();
-        fs::write(&cli, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n")).unwrap();
-        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_executable(&cli, &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"));
         // Discovery is due far less often than the catalog poll, so catalog
         // refreshes happen in between even when each CLI call is slow.
         let (commands, updates) =
@@ -1554,7 +1553,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn proxy_switch_gets_fresh_state_before_it_settles() {
-        use std::{fs, os::unix::fs::PermissionsExt};
+        use std::fs;
         let directory = std::env::temp_dir().join(format!(
             "porch-tray-toggle-{}-{}",
             std::process::id(),
@@ -1563,12 +1562,10 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let cli = directory.join("porch");
         let json = serde_json::to_string(&snapshot()).unwrap();
-        fs::write(
+        crate::test_support::write_executable(
             &cli,
-            format!("#!/bin/sh\ncase \"$1\" in proxy) exit 0;; esac\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"),
-        )
-        .unwrap();
-        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+            &format!("#!/bin/sh\ncase \"$1\" in proxy) exit 0;; esac\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"),
+        );
         let (commands, updates) =
             worker_with_intervals(cli, Duration::from_secs(60), Duration::from_secs(60));
         assert!(matches!(
@@ -1594,7 +1591,7 @@ mod tests {
     /// running proxy, and return the CLI calls and the settled update.
     #[cfg(unix)]
     fn rapid_flips(flips: usize) -> (String, Update) {
-        use std::{fs, os::unix::fs::PermissionsExt};
+        use std::fs;
         let directory = std::env::temp_dir().join(format!(
             "porch-tray-flips-{flips}-{}-{}",
             std::process::id(),
@@ -1606,12 +1603,10 @@ mod tests {
         let quoted_log = format!("'{}'", log.display());
         let json = serde_json::to_string(&snapshot()).unwrap();
         // The first discovery is slow, so every flip queues up behind it.
-        fs::write(
+        crate::test_support::write_executable(
             &cli,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncase \"$1\" in peers) sleep 0.5;; proxy) exit 0;; esac\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"),
-        )
-        .unwrap();
-        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncase \"$1\" in peers) sleep 0.5;; proxy) exit 0;; esac\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"),
+        );
         let (commands, updates) =
             worker_with_intervals(cli, Duration::from_secs(60), Duration::from_secs(60));
         for flip in 0..flips {

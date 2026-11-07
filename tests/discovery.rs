@@ -549,7 +549,7 @@ async fn code_pairing_is_mutual_and_apps_open_at_readable_urls_with_websockets()
     let unpaired: Value =
         serde_json::from_str(&ok(&a, &["unpair", "node-b", "--json"]).await).unwrap();
     assert_eq!(unpaired["machine"]["name"], "node-b");
-    assert_eq!(unpaired["reached"], true);
+    assert_eq!(unpaired["reached"], true, "{unpaired}");
     let left: Snapshot = serde_json::from_str(&ok(&a, &["list", "--all", "--json"]).await).unwrap();
     assert!(left.peers.is_empty());
     let right: Snapshot =
@@ -728,7 +728,6 @@ async fn shown_codes_report_status_and_cancel_for_the_tray() {
 /// proves the plist starts a working agent, not just that a file was written.
 #[cfg(unix)]
 fn fake_launchctl(bin: &Path) {
-    use std::os::unix::fs::PermissionsExt;
     let script = r#"#!/usr/bin/env python3
 import os, plistlib, signal, subprocess, sys
 log = os.environ["FAKE_LAUNCHCTL_LOG"]
@@ -753,8 +752,7 @@ elif a[0] == "bootout":
 "#;
     std::fs::create_dir_all(bin).unwrap();
     let path = bin.join("launchctl");
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&path, script);
 }
 #[cfg(unix)]
 #[tokio::test]

@@ -2246,17 +2246,14 @@ mod elevation_tests {
     }
     #[test]
     fn unattended_or_missing_sudo_offers_explicit_setup_choices() {
-        use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("porch-no-sudo-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         for installed in [false, true] {
             if installed {
-                fs::write(
-                    root.join("sudo"),
+                crate::test_support::write_executable(
+                    &root.join("sudo"),
                     "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = -v ] || exit 99\nexit 1\n",
-                )
-                .unwrap();
-                fs::set_permissions(root.join("sudo"), fs::Permissions::from_mode(0o700)).unwrap();
+                );
             }
             let out = Command::new(std::env::current_exe().unwrap())
                 .args([

@@ -26,4 +26,4 @@ pub mod tray;
 extern crate self as porch;
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
-mod test_ports;
+mod test_support;

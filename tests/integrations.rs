@@ -44,10 +44,8 @@ impl Sandbox {
         Self { dir, path, port }
     }
     fn fake(&self, name: &str, script: &str) {
-        use std::os::unix::fs::PermissionsExt;
         let p = self.dir.join("bin").join(name);
-        fs::write(&p,format!("#!/usr/bin/env python3\nimport os,sys,json,time\na=sys.argv[1:]\nwith open(os.environ['PORCH_TEST_LOG'],'a') as f:f.write(json.dumps([os.path.basename(sys.argv[0])]+a)+'\\n')\n{script}\n")).unwrap();
-        fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+        common::write_executable(&p,&format!("#!/usr/bin/env python3\nimport os,sys,json,time\na=sys.argv[1:]\nwith open(os.environ['PORCH_TEST_LOG'],'a') as f:f.write(json.dumps([os.path.basename(sys.argv[0])]+a)+'\\n')\n{script}\n"));
     }
     fn cmd(&self) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_porch"));

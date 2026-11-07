@@ -1130,14 +1130,38 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_binary(path: &Path, version: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        fs::write(path, format!("#!/bin/sh\necho porch {version}\n")).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(path, &format!("#!/bin/sh\necho porch {version}\n"));
     }
 
     #[cfg(unix)]
     #[test]
     fn atomic_replacement_keeps_running_inode_and_rolls_back() {
+        // `replace_executable` writes the new binary and then runs it, as a
+        // real self-update does in a process that starts nothing else
+        // meanwhile. Here other tests start processes in parallel; one that
+        // forks while the binary is open for writing keeps it open until it
+        // execs, and running it then fails with "Text file busy". So the
+        // body runs alone, in a fresh copy of this test binary.
+        const ISOLATED: &str = "PORCH_TEST_ISOLATED_REPLACEMENT";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update::tests::atomic_replacement_keeps_running_inode_and_rolls_back",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         use std::io::Read;
         use std::os::unix::fs::MetadataExt;
         let dir = temp("replace-test");

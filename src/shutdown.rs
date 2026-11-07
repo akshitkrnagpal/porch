@@ -82,8 +82,31 @@ mod imp {
         }
     }
 
+    /// Windows treats a group id that names no live process on this console
+    /// like 0: the event then reaches every process sharing the console,
+    /// including this one, the user's shell and every other app in it. A
+    /// child that has already exited (even one whose handle is still open, so
+    /// its id is not reused) must therefore never be signaled. The handle held
+    /// across the check also keeps the id from naming a new process.
     pub fn interrupt_group(group: u32) -> bool {
-        unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group) != 0 }
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE: u32 = 259;
+        if group == 0 {
+            return false;
+        }
+        unsafe {
+            let leader = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, group);
+            if leader.is_null() {
+                return false;
+            }
+            let mut code = 0;
+            let running = GetExitCodeProcess(leader, &mut code) != 0 && code == STILL_ACTIVE;
+            let sent = running && GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group) != 0;
+            CloseHandle(leader);
+            sent
+        }
     }
 }
 

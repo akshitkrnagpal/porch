@@ -299,11 +299,11 @@ mod tests {
     fn live_listener_is_distinguished_from_a_free_port() {
         // A private slot port: an ephemeral one, once released, can be taken by
         // a parallel test before the free-port assertions run.
-        let port = crate::test_ports::free_port();
+        let port = crate::test_support::free_port();
         // Held by a child process: a listener in this process could outlive
         // its drop inside a child that another test forks at that moment.
         #[cfg(unix)]
-        let (held, _) = crate::test_ports::ChildListener::bind("127.0.0.1", port, false).unwrap();
+        let (held, _) = crate::test_support::ChildListener::bind("127.0.0.1", port, false).unwrap();
         #[cfg(not(unix))]
         let held = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
         assert!(has_listener(port));
@@ -316,7 +316,7 @@ mod tests {
         // bound to one address, so the port would count as available there.)
         #[cfg(unix)]
         {
-            let (_bound, refused) = crate::test_ports::refused_port();
+            let (_bound, refused) = crate::test_support::refused_port();
             assert!(!available(refused));
             assert!(!has_listener(refused));
             assert!(!wait_released(refused, Duration::from_millis(100)));
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn next_free_skips_discovery_and_busy_ports() {
         // The probes stay inside this test's private slot.
-        let busy = crate::test_ports::free_port();
+        let busy = crate::test_support::free_port();
         let _held = crate::sockets::reserve(busy).unwrap();
         let next = next_free(busy - 1);
         assert!(next.is_some_and(|p| p > busy && p < busy + 200), "{next:?}");

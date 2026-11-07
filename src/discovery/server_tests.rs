@@ -107,7 +107,7 @@ fn catalog_health_matches_porch_list() {
     let up_port = up.local_addr().unwrap().port();
     // Held, never listening: the health probe is refused and cannot reach a
     // parallel test's listener on a reused ephemeral port.
-    let (_down, down_port) = crate::test_ports::refused_port();
+    let (_down, down_port) = crate::test_support::refused_port();
     let route = |name: &str, port: u16| Route {
         name: name.into(),
         target: format!("http://127.0.0.1:{port}"),
