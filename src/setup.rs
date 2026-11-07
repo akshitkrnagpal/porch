@@ -11,10 +11,10 @@ pub struct SetupArgs {
     /// Accept the defaults (current settings) without prompting.
     #[arg(long, short = 'y')]
     pub yes: bool,
-    /// Proxy port (default 7462, or 443 with --https).
+    /// Proxy port (default 7462, for HTTP and HTTPS alike).
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     pub port: Option<u16>,
-    /// Opt in to HTTPS on port 443 (needs sudo and trusting a local CA).
+    /// Opt in to HTTPS with a local CA trusted for your user (no sudo).
     #[arg(long, conflicts_with = "no_https")]
     pub https: bool,
     /// Use plain HTTP without sudo (the default).
@@ -57,13 +57,7 @@ fn on_off(v: bool) -> &'static str {
 }
 
 /// Choose a proxy port, explaining and avoiding conflicts unless explicitly chosen.
-fn choose_port(
-    wanted: u16,
-    explicit: bool,
-    ours: bool,
-    https: &mut bool,
-    interactive: bool,
-) -> Result<u16> {
+fn choose_port(wanted: u16, explicit: bool, ours: bool, interactive: bool) -> Result<u16> {
     let mut port = wanted;
     if !ours && ports::has_listener(port) {
         let who = ports::describe_owner(port);
@@ -75,10 +69,12 @@ fn choose_port(
             )
         }
         if port < ports::FIRST_UNPRIVILEGED_PORT {
-            println!("Port {port} is used by {who}, so HTTPS on {port} is not possible right now.");
-            *https = false;
+            println!(
+                "Port {port} is used by {who}; using port {} instead.",
+                ports::DEFAULT_PROXY_PORT
+            );
             port = ports::DEFAULT_PROXY_PORT;
-            return choose_port(port, false, false, https, interactive);
+            return choose_port(port, false, false, interactive);
         }
         let Some(next) = next else {
             bail!("no free port near {port}; run `porch setup --port <free port>`")
@@ -86,7 +82,7 @@ fn choose_port(
         println!("Port {port} is used by {who}; using port {next} instead.");
         port = next;
     }
-    if interactive && !*https {
+    if interactive {
         if let Some(answer) = read_line(&format!("Proxy port [{port}]: ")) {
             if !answer.is_empty() {
                 match answer.parse::<u16>() {
@@ -123,13 +119,13 @@ pub async fn run(a: SetupArgs) -> Result<()> {
     }
 
     // 1. HTTPS opt-in (default: current choice; plain HTTP for new installs).
-    let mut https = if a.https {
+    let https = if a.https {
         true
     } else if a.no_https {
         false
     } else {
         confirm(
-            "Use HTTPS on port 443? This needs sudo once and adds a local certificate authority to your trust store.",
+            "Use HTTPS? Porch adds a local certificate authority to your user's trust store (no sudo; macOS asks for your password or Touch ID).",
             current.tls,
             interactive,
         )
@@ -138,14 +134,15 @@ pub async fn run(a: SetupArgs) -> Result<()> {
     // 2. Port, with conflict detection.
     let env_port = state::env("PORT").and_then(|p| p.parse::<u16>().ok());
     let explicit = a.port.or(env_port);
-    let default_port = match (https, current.tls) {
-        (true, true) | (false, false) => current.port,
-        (true, false) => 443,
-        (false, true) => ports::DEFAULT_PROXY_PORT,
+    // Keep the current port unless it is the other protocol's privileged standard port.
+    let default_port = if https != current.tls && current.port < ports::FIRST_UNPRIVILEGED_PORT {
+        ports::DEFAULT_PROXY_PORT
+    } else {
+        current.port
     };
     let wanted = explicit.unwrap_or(default_port);
     let ours = running && current.port == wanted;
-    let port = choose_port(wanted, explicit.is_some(), ours, &mut https, interactive)?;
+    let port = choose_port(wanted, explicit.is_some(), ours, interactive)?;
 
     // 3. Start at login (reuses the service integration).
     let service_installed = state::dir().join("service.json").exists();
