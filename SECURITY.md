@@ -1,6 +1,6 @@
 # Security policy
 
-Porch runs a local proxy and, once you pair machines, an authenticated discovery service on your private network. Reports about either are very welcome.
+Porch runs a local proxy and, once you pair machines, an authenticated discovery service on your private network. Please report security problems in either.
 
 ## Reporting a vulnerability
 

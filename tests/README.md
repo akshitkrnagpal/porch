@@ -1,23 +1,34 @@
-# Acceptance tests
+# Tests
 
-Run `cargo test --all-targets`. Tests use unique temporary state and loopback listeners. Real process fixtures require Node.js/npm, Python 3, and Git. POSIX shell/process-group fixtures are gated to Unix where applicable.
+Run `cargo test --all-targets`. Each test uses its own temporary state directory and loopback listeners. Tests that start real processes need Node.js with npm, Python 3 and Git.
 
-| File | Observable coverage |
-| --- | --- |
-| `cli.rs` | Static aliases and browser URLs, human/JSON list, malformed flags, concurrent route writers, actual child HTTP/verified HTTPS forwarding with proxy auto-start/readiness, concurrent launches, Node CA environment, self-daemon route transfer, bare/inferred/named launch, exit codes, bypass, persisted daemon settings, bind failure, orphan process cleanup |
-| `pty.rs` | Controlling-PTY stty raw, Node raw mode, Ctrl-C/TERM forwarding, descendant cleanup, real Turbo 2 TUI and two live HTTP routes |
-| `lifecycle.rs` | Delayed/ignored-signal fixed-port force takeover, leaderless orphan grandchildren, blocked-port refusal, stale reservation recovery, scoped alias removal over real HTTP |
-| `config.rs` | Package/workspace/config precedence, duplicate hostnames, actual linked Git worktree, framework/runners/server-only flags, 22 real npm/shell argv cases, Expo LAN behavior, root Turbo command selection, real CLI workspace runner and two package processes, Node preload and wrapper recursion handling |
-| `network.rs` | Actual IPv4/IPv6 sockets, HTTP/HTTPS/h2, generated CA verification, WS/WSS, extended CONNECT WebSocket frames, delayed streamed events, routing/TLD/wildcard/alias semantics, redirects, structured errors, recursive loop detection, authenticated hosts sync |
-| `integrations.rs` | Fake Docker Compose model and published-port reconciliation, project scoping, all three OS service definitions, temporary hosts safety, Tailscale/ngrok/Cloudflare readiness/URL/process ownership, recorded trust installation/removal |
+| File | What it covers | Platforms |
+| --- | --- | --- |
+| `cli.rs` | Aliases and URLs, human and JSON `list`, bad flags, concurrent route writers, forwarding to a real app over HTTP and verified HTTPS, proxy auto-start, concurrent launches, `NODE_EXTRA_CA_CERTS`, handing a route to a daemon, named and inferred launches, exit codes, `PORCH=0`, saved proxy settings, bind failures, orphan cleanup | All; some cases macOS and Linux only |
+| `network.rs` | IPv4 and IPv6 sockets, HTTP, HTTPS and HTTP/2, the generated CA, WebSocket over HTTP and HTTPS, extended CONNECT, streamed responses, routing, TLDs, wildcards and aliases, redirects, error pages, proxy loops, authenticated hosts-file sync | All |
+| `discovery.rs` | Two Porch instances pairing by code and by token, opening each other's apps (including WebSockets), wrong codes, rogue hosts, refusing the old pairing exchange, cancelling a shown code, discovery autostart | All; autostart on macOS and Linux only |
+| `config.rs` | Configuration precedence, duplicate names, a real linked Git worktree, frameworks and package runners, real npm and shell command shapes, Expo LAN, Turbo at the root, launching two workspace packages, the Node preload | macOS, Linux |
+| `first_run.rs` | Default port and no-sudo mode, busy and explicit ports, the listen warning, stale route cleanup, proxy upgrades, `porch setup` and `porch doctor --fix` | macOS, Linux |
+| `lifecycle.rs` | Force takeover of a fixed port (including apps that ignore signals), orphaned grandchildren, refusing a blocked port, recovering stale reservations, removing scoped aliases | macOS, Linux |
+| `pty.rs` | Raw mode on a controlling terminal, Ctrl-C and TERM forwarding, descendant cleanup, the real Turbo 2 TUI with two live routes | macOS, Linux |
+| `integrations.rs` | Docker Compose with a fake `docker`, launchd, systemd and Task Scheduler entries, the hosts file, Tailscale, ngrok and Cloudflare, installing and removing trust | macOS, Linux |
 
-Unit tests additionally exercise configuration validation, hostname truncation, routing scores, headers/errors, TLS PEM/certificate issuance, host authentication proofs, service serialization, and MCP framing/profiles/arguments.
+Unit tests in `src/` cover configuration validation, name shortening, route scoring, headers and error pages, PEM handling and certificate issuance, hosts-file authentication, service files, and MCP framing, profiles and arguments.
 
-External integration tests place fake executables on an isolated PATH and point hosts/service/trust paths at temporary fixtures. These tests inspect generated arguments/files and owned subprocess cleanup; they do not assert that a real OS administrator operation, Docker Engine, provider account, or remote machine accepted the operation.
+## External tools
 
-Native startup after boot, system/browser trust installation, live Docker, authenticated provider registration, physical LAN multicast resolution, and real network-interface transitions need separate platform/service verification. Ordinary CI must not mutate real hosts, trust, or startup resources or create public tunnels. New integration tests should retain deadline-based readiness checks and cleanup on failure.
+Tests for Docker, Tailscale, ngrok, Cloudflare, service managers and trust stores put fake executables on a private PATH and point hosts, service and trust paths at temporary files. They check the arguments and files Porch produces and that it cleans up the processes it starts. They don't show that a real system, Docker Engine, provider account or remote machine accepted the change.
 
-A port a test hands to Porch (proxy, discovery agent, or `--app-port`) must come from `common::free_port()`, never from binding `127.0.0.1:0` and dropping the listener: that returns an ephemeral port the OS can give to another test or an outbound connection before Porch binds it. Each `free_port()` result is the base of a private 256-port slot below the ephemeral ranges, so Porch's next-free-port probes never touch another test's port. Wait for an observable outcome (a route, a log line, a ready file) rather than racing a fixture's fixed lifetime.
+Start at boot, real system and browser trust, live Docker, provider sign-up, LAN multicast and network interface changes all need checking on a real machine. CI must never change real hosts, trust or startup settings, or open public tunnels.
 
+## Writing tests
 
-CI installs Turbo 2.6.3 and sets `PORCH_TEST_TURBO_REQUIRED=1` for mandatory real TUI coverage. Locally set `PORCH_TEST_TURBO=/absolute/path/to/turbo` if it is not on PATH; without Turbo 2, the core PTY cases run and the Turbo case reports a skip. Fresh sudo acceptance uses a prompt shim attached to a PTY and never invokes real sudo or privileged ports. Collision tests hold wildcard IPv4 and dual-stack IPv6 listeners; the accept-error fixture lowers only its child daemon's descriptor limit. Hosts permission fixtures are temporary read-only files.
+Get any port you hand to Porch (proxy, discovery agent or `--app-port`) from `common::free_port()`. Don't bind `127.0.0.1:0` and drop the listener: the OS can give that port to another test or an outgoing connection before Porch binds it. Each `free_port()` result is the start of a private 256-port range below the OS's ephemeral range, so Porch's search for the next free port never reaches another test's ports.
+
+Wait for something you can observe (a route, a log line, a ready file) with a deadline, rather than relying on a fixture running for a fixed time, and clean up even when the test fails.
+
+## Turbo and sudo
+
+CI installs Turbo 2.6.3 and sets `PORCH_TEST_TURBO_REQUIRED=1`, so the real Turbo TUI test must run. Locally, set `PORCH_TEST_TURBO=/absolute/path/to/turbo` if `turbo` isn't on your PATH. Without Turbo 2, the other terminal tests still run and the Turbo test reports a skip.
+
+Tests never run real sudo or bind privileged ports; the sudo flow uses a fake prompt attached to a terminal. Port-collision tests hold wildcard IPv4 and dual-stack IPv6 listeners, the accept-error test lowers the file descriptor limit of its own proxy only, and hosts-file permission tests use temporary read-only files.

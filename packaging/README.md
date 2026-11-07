@@ -1,20 +1,18 @@
-# Porch CLI and native menu
+# Release archives
 
-The archive contains `porch`, `porch-tray`, `porch-login`, and `install.py`. The
-macOS archives (`aarch64-apple-darwin`, `x86_64-apple-darwin`) also include
-`Porch.app`. Linux x86_64 uses a GTK 3 / AppIndicator tray. Windows x86_64 (preview) ships
-`porch.exe` and `porch-tray.exe`, a notification-area app, without `porch-login`.
-Archives are attached to tagged GitHub Releases with a `SHA256SUMS` file; they
-are not signed or notarized. `homebrew/porch.rb` is the Homebrew formula
-template rendered by `scripts/render_formula.py` for each release.
+Each release archive contains:
 
-For LAN/Tailscale enrollment, security, and the wire protocol, see the
-[two-machine guide](docs/discovery.md) included in the archive (or
-[repository guide](../docs/discovery.md) in a source checkout).
+- macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`): `porch`, `porch-tray`, `porch-login`, `install.py` and `Porch.app`.
+- Linux (`x86_64-unknown-linux-gnu`): `porch`, `porch-tray` (a GTK 3 / AppIndicator tray), `porch-login` and `install.py`.
+- Windows (`x86_64-pc-windows-msvc`, preview): `porch.exe`, `porch-tray.exe` (a notification-area app) and `install.py`. There is no `porch-login` on Windows.
 
-## Install and launch
+Archives are attached to tagged GitHub Releases along with a `SHA256SUMS` file. They aren't signed or notarized. `homebrew/porch.rb` is the Homebrew formula template that `scripts/render_formula.py` fills in for each release.
 
-Extract the archive, enter its directory, then run:
+To pair machines over your LAN or Tailscale, see the [guide to apps across machines](docs/discovery.md) included in the archive ([`../docs/discovery.md`](../docs/discovery.md) in a source checkout).
+
+## Install
+
+Extract the archive, change into its folder, and run:
 
 ```sh
 python3 install.py
@@ -22,65 +20,38 @@ python3 install.py
 python3 install.py --archive porch-VERSION-TARGET.tar.gz
 ```
 
-This installs binaries in `~/.local/bin`, using a temporary file, fsync, and
-rename rather than truncating a running executable. On macOS it also installs
-`~/Applications/Porch.app`. If `~/.local/bin` is not on PATH, the installer
-prints the exact `export PATH=...` line to add. Later updates: `porch
-self-update`. Existing apps,
-proxy sessions, discovery sharing, trust stores, hosts files, and login startup
-are unchanged. `--cli-only` installs just the headless CLI; `--prefix PATH` and
-`--app-dir PATH` select user-controlled destinations.
+On macOS and Linux this installs the binaries in `~/.local/bin`, and on macOS also `~/Applications/Porch.app`. On Windows (`py install.py`) the binaries go to `%LOCALAPPDATA%\Programs\Porch\bin`. If the folder isn't on your PATH, the installer prints the line to add. It writes each binary to a temporary file and renames it into place, so a running copy is never overwritten mid-write.
 
-macOS:
+Installing doesn't touch running apps, the proxy, sharing, trust stores, the hosts file or login startup. `--cli-only` installs only the CLI, and `--prefix PATH` and `--app-dir PATH` change where files go. To update later, run `porch self-update`.
+
+## Launch the menu
 
 ```sh
-open ~/Applications/Porch.app
-# Or: porch tray
+open ~/Applications/Porch.app    # macOS
+porch tray                       # macOS, Linux or Windows; same as running porch-tray directly
 ```
 
-Linux with a graphical session and a tray host:
+The roof icon opens a menu with local apps, paired machines grouped by machine, their health, **Open in browser**, **Copy URL**, **Refresh apps**, **Reconnect discovery** and a switch to start or stop the proxy. **Quit Porch menu** closes only the menu: apps, the proxy and the discovery agent keep running. If a CLI action fails, the error appears in the menu. Actions that need sudo have to be run in a terminal.
 
-```sh
-porch tray
-# Or: porch-tray
-```
+The tray runs CLI commands in a background thread and keeps all UI work on the main thread. `PORCH_STATE_DIR` or `porch-tray --state-dir DIR` points it at a different state directory. It looks for the CLI next to itself, then at `~/.local/bin/porch` (`%LOCALAPPDATA%\Programs\Porch\bin\porch.exe` on Windows); set `PORCH_BIN` to override.
 
-The roof icon opens a native menu: local apps, grouped paired machines, health,
-Open in browser, Copy URL, Refresh apps, Reconnect discovery, and proxy start or
-stop. Quit Porch menu closes only the menu process. App processes, the proxy,
-and an explicitly enabled discovery agent continue. A failed CLI action appears
-in the menu; proxy privilege prompts must be completed in a terminal.
+macOS may ask you to approve an unsigned app downloaded from the internet in System Settings → Privacy & Security; Porch doesn't bypass Gatekeeper. A bundle you build yourself opens with `open dist/Porch.app`.
 
-The tray polls the CLI in a background Tokio worker; native UI work stays on the
-OS main thread. `PORCH_STATE_DIR` or `porch-tray --state-dir DIR` selects an
-isolated state directory. The CLI is resolved beside the tray, then at
-`~/.local/bin/porch`; `PORCH_BIN` explicitly overrides it.
+## Linux desktop requirements
 
-Downloaded unsigned macOS bundles may require the normal macOS Open / Privacy &
-Security approval. Porch does not bypass Gatekeeper. A locally built bundle can
-be launched with `open dist/Porch.app`.
+The `porch` CLI doesn't link GTK or AppIndicator and works without a display. Only `porch-tray` needs them. Prebuilt Linux binaries need glibc 2.39 or newer; build from source on older distributions.
 
-## Linux dependencies and desktop limits
-
-Headless `porch` does not link GTK or AppIndicator and works without DISPLAY.
-Only `porch-tray` needs these desktop libraries. Prebuilt Linux GNU artifacts
-require glibc 2.39 or newer; build from source on older distributions.
-Debian/Ubuntu build dependencies:
+Build dependencies on Debian and Ubuntu:
 
 ```sh
 sudo apt-get install libgtk-3-dev libayatana-appindicator3-dev libdbus-1-dev
 ```
 
-Runtime packages on Ubuntu 24.04 are `libgtk-3-0t64` and
-`libayatana-appindicator3-1` (older Debian/Ubuntu use `libgtk-3-0`). A session
-D-Bus and a StatusNotifier/AppIndicator host are also required. KDE and many
-other desktops include one. GNOME usually needs an AppIndicator/KStatusNotifier
-extension. The tray exits with a CLI fallback hint when no graphical session or
-tray host is present; it never substitutes a full-page browser dashboard.
+At runtime, Ubuntu 24.04 needs `libgtk-3-0t64` and `libayatana-appindicator3-1` (`libgtk-3-0` on older Debian and Ubuntu), plus a session D-Bus and a StatusNotifier/AppIndicator host. KDE and most other desktops include one; GNOME usually needs the AppIndicator extension. Without a graphical session or tray host, the tray exits and suggests the equivalent CLI commands.
 
-## Optional login startup
+## Start the menu at login
 
-Nothing installs login startup by default. After installation, explicitly run:
+Nothing starts at login unless you ask. On macOS and Linux:
 
 ```sh
 porch-login enable
@@ -88,15 +59,9 @@ porch-login status
 porch-login disable
 ```
 
-macOS uses only `~/Library/LaunchAgents/dev.porch.tray.plist` and logs to
-`~/Library/Logs/Porch/tray.log`. Enabling starts the menu in the current user GUI
-session; disabling unloads that menu. Linux writes only a marked
-`$XDG_CONFIG_HOME/autostart/porch-tray.desktop` (default `~/.config/autostart`)
-for the next graphical login; disabling does not terminate the current tray.
-Neither option enables app sharing or changes the proxy. `--binary ABSOLUTE_PATH`
-selects the menu executable. macOS records an explicit `PORCH_STATE_DIR` when
-set while enabling. Custom Linux state can be supplied by the desktop session
-environment or by launching the tray manually.
+On macOS this writes `~/Library/LaunchAgents/dev.porch.tray.plist`, logs to `~/Library/Logs/Porch/tray.log`, and starts the menu right away; `disable` unloads it. On Linux it writes `$XDG_CONFIG_HOME/autostart/porch-tray.desktop` (default `~/.config/autostart`), which takes effect at your next login; `disable` removes it but doesn't quit a running tray. Neither turns on sharing or changes the proxy. `--binary ABSOLUTE_PATH` picks a different tray executable. On macOS, a `PORCH_STATE_DIR` set when you run `enable` is saved in the LaunchAgent. On Linux, set it in your desktop session's environment or start the tray by hand.
+
+This only starts the menu. To start the proxy or the discovery agent at login, use `porch service install` or `porch discovery autostart enable`.
 
 ## Build and package
 
@@ -104,14 +69,11 @@ environment or by launching the tray manually.
 cargo build --release --bin porch
 cargo build --release --features tray --bin porch-tray
 python3 scripts/package.py --target aarch64-apple-darwin
-# Intel Mac: --target x86_64-apple-darwin; Linux: --target x86_64-unknown-linux-gnu
+# Intel Mac: --target x86_64-apple-darwin
+# Linux: --target x86_64-unknown-linux-gnu
+# Windows: --target x86_64-pc-windows-msvc
 ```
 
-The package script creates `dist/porch-VERSION-TARGET.tar.gz`, and on macOS also
-`dist/Porch.app`. Cross-target builds can use `--binaries target/TARGET/release`.
-The CI tray job compiles each native platform, checks menu model/actions, and
-runs a Linux no-DISPLAY fallback. The release workflow publishes a GitHub
-Release only for a pushed `v*` tag matching `Cargo.toml`; a manual run only
-uploads workflow artifacts. Physical Linux desktop visibility,
-macOS rendered menu interaction, and login startup behavior require native GUI
-verification; compilation/model tests alone do not establish those observations.
+The script creates `dist/porch-VERSION-TARGET.tar.gz`, and on macOS also `dist/Porch.app`. For a cross-compiled build, pass `--binaries target/TARGET/release`.
+
+CI builds the tray on macOS, Linux and Windows, tests the menu contents and actions, and checks that the Linux tray fails cleanly without a display. The release workflow publishes a GitHub Release only for a pushed `v*` tag that matches the version in `Cargo.toml`; running it by hand only uploads build artifacts. Whether the tray icon actually shows on a Linux desktop, how the macOS menu behaves when clicked, and whether login startup works still have to be checked by hand on a real desktop.
