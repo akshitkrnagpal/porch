@@ -92,7 +92,11 @@ fn catalog_keeps_identity_stable_and_reports_local_only_routes_without_leaking_t
     let remote = catalog(&dir, m, true).unwrap();
     assert!(remote.apps[0].remote_access);
     assert_eq!(local.apps[0].id, remote.apps[0].id);
-    assert!(!serde_json::to_string(&remote).unwrap().contains("9000"));
+    // Only the apps can carry a route's target. The whole catalog also holds
+    // a timestamp and hashed ids, where the digits "9000" turn up by chance.
+    let apps = serde_json::to_string(&remote.apps).unwrap();
+    assert!(!apps.contains("127.0.0.1"), "{apps}");
+    assert!(!apps.contains(":9000"), "{apps}");
     let _ = fs::remove_dir_all(dir);
 }
 #[test]
