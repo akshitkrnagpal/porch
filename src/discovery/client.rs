@@ -927,31 +927,73 @@ fn strip_hop_headers(headers: &mut header::HeaderMap) {
         headers.remove(name);
     }
 }
-fn rewrite_location(value: &str, context: &RelayContext) -> Result<String> {
-    let parsed = if value.starts_with("//") {
-        context.local_app.join(value)
-    } else {
-        Url::parse(value)
+/// True when a redirect host would send the browser to a service on its own
+/// machine. Matches on the typed host so bracketed IPv6 literals (`[::1]`),
+/// IPv4-mapped/compatible IPv6, numeric IPv4 forms the URL parser normalizes
+/// (`0x7f.1`, `2130706433`), unspecified addresses and FQDN `localhost.` are all caught.
+fn is_local_redirect_host(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => {
+            let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+            host == "localhost" || host.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip
+                    .to_ipv4()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
+        None => false,
+    }
+}
+fn rewrite_location(value: &str, local_app: &Url, relay_url: &Url) -> Result<String> {
+    // Resolve the reference the way the browser will: against the relay page.
+    // WHATWG parsing treats backslashes, mixed slashes and leading whitespace in
+    // `\\host`, `/\host` or ` //host` as authority references, so a plain
+    // `Url::parse` or a `starts_with("//")` check is not enough to classify them.
+    let Ok(browser_target) = relay_url.join(value) else {
+        bail!("remote app sent an invalid redirect");
     };
-    let Ok(mut target) = parsed else {
+    if browser_target.origin() == relay_url.origin() {
+        // Relative references (and links back to this relay) stay as sent so the
+        // browser resolves them against the real request path.
         return Ok(value.into());
+    }
+    // The same reference as the remote app sees it, to recognise its own origin.
+    let Ok(target) = local_app.join(value) else {
+        bail!("remote app sent an invalid redirect");
     };
-    if target.origin() == context.local_app.origin() {
+    // Only rewrite when the reference names the app's authority itself, not when
+    // it merely inherits the app's origin (`http:path` is relative to an http
+    // base but an authority reference to the browser on an https relay).
+    let mut probe = local_app.clone();
+    probe.set_host(Some("porch-redirect-probe.invalid"))?;
+    let names_authority = probe
+        .join(value)
+        .is_ok_and(|probed| probed.host() == target.host());
+    // Rewrite whenever the browser would land on the app's origin, or the
+    // reference explicitly names the app's authority (e.g. `//app:port` on an
+    // https relay for an http app).
+    let same_app = if browser_target.origin() == local_app.origin() {
+        Some(browser_target.clone())
+    } else if names_authority && target.origin() == local_app.origin() {
+        Some(target)
+    } else {
+        None
+    };
+    if let Some(mut target) = same_app {
         target
-            .set_scheme(context.relay_url.scheme())
+            .set_scheme(relay_url.scheme())
             .map_err(|_| anyhow::anyhow!("invalid redirect"))?;
-        target.set_host(context.relay_url.host_str())?;
+        target.set_host(relay_url.host_str())?;
         target
-            .set_port(context.relay_url.port())
+            .set_port(relay_url.port())
             .map_err(|_| anyhow::anyhow!("invalid redirect"))?;
         return Ok(target.into());
     }
-    let local_host = target.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host.ends_with(".localhost")
-            || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
-    });
-    if local_host {
+    if is_local_redirect_host(&browser_target) {
         bail!("remote app redirected to a different loopback service; use a relative URL or the app's Porch URL");
     }
     Ok(value.into())
@@ -1093,7 +1135,7 @@ pub(super) async fn relay_request(
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
     {
-        let translated = match rewrite_location(location, &context) {
+        let translated = match rewrite_location(location, &context.local_app, &context.relay_url) {
             Ok(v) => v,
             Err(e) => return Ok(plain_error(StatusCode::BAD_GATEWAY, &e.to_string())),
         };
