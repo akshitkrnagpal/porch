@@ -11,7 +11,7 @@ pub struct SetupArgs {
     /// Accept the defaults (current settings) without prompting.
     #[arg(long, short = 'y')]
     pub yes: bool,
-    /// Proxy port (default 7462, for HTTP and HTTPS alike).
+    /// Proxy port (default: 80/443 when no sudo is needed, else 7462).
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     pub port: Option<u16>,
     /// Opt in to HTTPS with a local CA trusted for your user (no sudo).

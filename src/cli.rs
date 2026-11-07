@@ -2141,6 +2141,23 @@ async fn spawn_prepared(
                 style::url(Stderr, p.env.get("PORCH_URL").unwrap_or(&p.plan.name)),
                 style::dim(Stderr, &format!("-> {}", p.port.unwrap()))
             );
+            // Once, in a terminal: HTTPS is one command away and needs no sudo.
+            use std::io::IsTerminal;
+            let tip = state::dir().join("tip-https");
+            if std::io::stderr().is_terminal()
+                && std::env::var_os("CI").is_none()
+                && !p.env.get("PORCH_URL").is_some_and(|u| u.starts_with("https:"))
+                && !tip.exists()
+            {
+                let _ = state::atomic_write("tip-https", b"shown\n");
+                eprintln!(
+                    "{}",
+                    style::dim(
+                        Stderr,
+                        "Tip: `porch setup --https` serves your apps over HTTPS with a local CA trusted for you only (no sudo)."
+                    )
+                );
+            }
         }
     }
     // Keep the proxy up while this app runs: if it dies without a deliberate
