@@ -378,11 +378,11 @@ fn segment_matches(pat: &str, name: &str) -> bool {
     }
     rest.ends_with(last)
 }
+/// Upper bound on how deep a `**` segment may descend, so a pathological
+/// tree can never make discovery unbounded.
+const MAX_GLOBSTAR_DEPTH: usize = 32;
 pub fn discover_workspace_packages(root: &Path) -> Vec<WorkspacePackage> {
     use std::collections::BTreeSet;
-    /// Upper bound on how deep a `**` segment may descend, so a pathological
-    /// tree can never make discovery unbounded.
-    const MAX_GLOBSTAR_DEPTH: usize = 32;
     /// Real (non-symlinked) child directories of `dir`. Symlinks are never
     /// followed during wildcard expansion, which rules out traversal cycles.
     fn child_dirs(dir: &Path) -> impl Iterator<Item = (String, PathBuf)> {
@@ -699,6 +699,9 @@ mod tests {
         assert!(segment_matches("a*b*c", "aXbYc"));
         assert!(!segment_matches("a*b*c", "aXcYb"));
         assert!(!segment_matches("ab*b", "ab"));
+        assert!(segment_matches("a**b", "aXb"));
+        assert!(segment_matches("**", ".hidden"));
+        assert!(!segment_matches("a**b", "a"));
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -714,6 +717,14 @@ mod tests {
             ],
         );
         assert_eq!(discovered(&dir), ["", "app"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn globstar_depth_is_bounded() {
+        let at = |n: usize| format!("packages/{}", vec!["d"; n].join("/"));
+        let (inside, beyond) = (at(MAX_GLOBSTAR_DEPTH), at(MAX_GLOBSTAR_DEPTH + 1));
+        let dir = glob_fixture("bound", r#"["packages/**"]"#, &[&inside, &beyond]);
+        assert_eq!(discovered(&dir), [inside]);
         fs::remove_dir_all(dir).unwrap();
     }
     #[cfg(unix)]
