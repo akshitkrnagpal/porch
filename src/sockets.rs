@@ -28,7 +28,10 @@ pub fn bind(addr: SocketAddr, v6_only: bool) -> io::Result<TcpListener> {
         socket.set_only_v6(v6_only)?;
     }
     #[cfg(windows)]
-    exclusive(&socket)?;
+    {
+        wildcard_free(addr)?;
+        exclusive(&socket)?;
+    }
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     Ok(socket.into())
@@ -55,6 +58,45 @@ fn exclusive(socket: &socket2::Socket) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Windows lets a specific address bind succeed while another process holds
+/// the wildcard on that port, and then routes that address to us: we would
+/// take its traffic. Unix refuses such a bind. Probe the wildcard first; a
+/// plain (non-exclusive) probe still allows other specific addresses on the
+/// port, as Unix does.
+#[cfg(windows)]
+fn wildcard_free(addr: SocketAddr) -> io::Result<()> {
+    if addr.ip().is_unspecified() || addr.port() == 0 {
+        return Ok(());
+    }
+    let (domain, wildcard) = if addr.is_ipv6() {
+        (
+            socket2::Domain::IPV6,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), addr.port()),
+        )
+    } else {
+        (
+            socket2::Domain::IPV4,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), addr.port()),
+        )
+    };
+    let probe = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    if addr.is_ipv6() {
+        probe.set_only_v6(true)?;
+    }
+    match probe.bind(&wildcard.into()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "port {} is held on all interfaces by another process",
+                addr.port()
+            ),
+        )),
+        // Anything else (no IPv6, say) is for the real bind to report.
+        Err(_) => Ok(()),
+    }
 }
 
 /// Hold both address families, including wildcard interfaces, until the app starts.

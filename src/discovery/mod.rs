@@ -43,7 +43,16 @@ fn private_file(path: PathBuf) -> Result<fs::File> {
 }
 fn lock(name: &str) -> Result<fs::File> {
     crate::state::load()?;
-    let file = private_file(crate::state::dir().join(name))?;
+    // Not private_file: that opens append-only, and Windows refuses to lock a
+    // handle without read or write access.
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(crate::state::dir().join(name))?;
     file.try_lock_exclusive()
         .context("another Porch operation is in progress; retry shortly")?;
     Ok(file)
