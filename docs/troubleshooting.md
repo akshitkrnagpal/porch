@@ -110,7 +110,7 @@ server: { proxy: { "/api": { target: "http://api.localhost:7462", changeOrigin: 
 
 ### `curl: (6) Could not resolve host: web.localhost`, or a tool can't find `*.localhost`
 
-**Cause.** Browsers resolve every `*.localhost` name to loopback themselves. Some command-line tools, language runtimes and older resolvers ask the system resolver instead, which may not.
+**Cause.** Browsers resolve every `*.localhost` name to loopback themselves. Other tools ask the system resolver. macOS's resolver answers `*.localhost` too (both 127.0.0.1 and ::1), and so do Linux systems with systemd's `nss-myhostname`, but some minimal Linux images, containers and older Windows setups don't.
 
 **Fix.** Any of:
 
@@ -124,9 +124,9 @@ sudo porch hosts sync      # writes Porch's block in the hosts file for current 
 
 ### Safari can't open `web.localhost`
 
-**Cause.** Safari uses the system resolver rather than resolving `.localhost` itself.
+**Cause.** Safari uses the system resolver. On current macOS that resolver answers `*.localhost` itself, so this usually means a VPN, DNS profile or hosts-file entry overrides it.
 
-**Fix.** `sudo porch hosts sync`.
+**Fix.** `porch doctor` shows whether the name resolves. If it doesn't, check the VPN or DNS profile, or run `sudo porch hosts sync`.
 
 ### Custom TLD (`--tld test`, `--tld local.example.com`) doesn't resolve
 
