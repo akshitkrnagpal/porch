@@ -358,32 +358,84 @@ pub struct WorkspacePackage {
     pub scope: Option<String>,
     pub scripts: Value,
 }
+/// Matches one path segment against a pattern where `*` matches any run of
+/// characters (including none) within that segment.
+fn segment_matches(pat: &str, name: &str) -> bool {
+    let mut parts = pat.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts: Vec<&str> = parts.collect();
+    let Some(last) = parts.pop() else {
+        return rest.is_empty();
+    };
+    for mid in parts.into_iter().filter(|m| !m.is_empty()) {
+        match rest.find(mid) {
+            Some(i) => rest = &rest[i + mid.len()..],
+            None => return false,
+        }
+    }
+    rest.ends_with(last)
+}
+/// Upper bound on how deep a `**` segment may descend, so a pathological
+/// tree can never make discovery unbounded.
+const MAX_GLOBSTAR_DEPTH: usize = 32;
 pub fn discover_workspace_packages(root: &Path) -> Vec<WorkspacePackage> {
     use std::collections::BTreeSet;
-    fn expand(base: &Path, parts: &[&str], out: &mut BTreeSet<PathBuf>) {
-        if parts.is_empty() {
+    /// Real (non-symlinked) child directories of `dir`. Symlinks are never
+    /// followed during wildcard expansion, which rules out traversal cycles.
+    fn child_dirs(dir: &Path) -> impl Iterator<Item = (String, PathBuf)> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                e.file_type()
+                    .ok()?
+                    .is_dir()
+                    .then(|| (e.file_name().to_string_lossy().into_owned(), e.path()))
+            })
+    }
+    fn expand(base: &Path, parts: &[&str], depth: usize, out: &mut BTreeSet<PathBuf>) {
+        let Some((&pat, rest)) = parts.split_first() else {
             if base.is_dir() {
                 out.insert(base.to_owned());
             }
             return;
-        }
-        let pat = parts[0];
-        if let Some((pre, post)) = pat.split_once('*') {
-            if let Ok(entries) = fs::read_dir(base) {
-                for e in entries.flatten() {
-                    let n = e.file_name();
-                    let n = n.to_string_lossy();
-                    if e.file_type().is_ok_and(|t| t.is_dir())
-                        && n.starts_with(pre)
-                        && n.ends_with(post.trim_end_matches('*'))
-                    {
-                        expand(&e.path(), &parts[1..], out);
+        };
+        if pat == "**" {
+            // Zero directories: continue matching the rest at this level.
+            expand(base, rest, depth, out);
+            // One or more directories: descend, keeping `**` active. Dependency
+            // and hidden directories are never workspace packages.
+            if depth < MAX_GLOBSTAR_DEPTH {
+                for (name, path) in child_dirs(base) {
+                    if name != "node_modules" && !name.starts_with('.') {
+                        expand(&path, parts, depth + 1, out);
                     }
                 }
             }
+        } else if pat.contains('*') {
+            for (name, path) in child_dirs(base) {
+                if segment_matches(pat, &name) {
+                    expand(&path, rest, depth, out);
+                }
+            }
         } else {
-            expand(&base.join(pat), &parts[1..], out);
+            expand(&base.join(pat), rest, depth, out);
         }
+    }
+    fn segments(pattern: &str) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for seg in pattern.split('/').filter(|s| !s.is_empty() && *s != ".") {
+            // `a/**/**/b` is equivalent to `a/**/b`; collapsing keeps the
+            // search from revisiting the same directories.
+            if !(seg == "**" && out.last() == Some(&"**")) {
+                out.push(seg);
+            }
+        }
+        out
     }
     let mut included = BTreeSet::new();
     let mut excluded = BTreeSet::new();
@@ -393,7 +445,8 @@ pub fn discover_workspace_packages(root: &Path) -> Vec<WorkspacePackage> {
             .map_or((false, p.as_str()), |p| (true, p));
         expand(
             root,
-            &p.split('/').collect::<Vec<_>>(),
+            &segments(p),
+            0,
             if neg { &mut excluded } else { &mut included },
         );
     }
@@ -524,6 +577,163 @@ mod tests {
         assert_eq!(discover_workspace_packages(&dir).len(), 1);
         fs::write(dir.join("portless.json"), "{").unwrap();
         assert!(load(&dir).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn glob_fixture(tag: &str, workspaces: &str, packages: &[&str]) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("porch-glob-test-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            format!(r#"{{"workspaces":{workspaces}}}"#),
+        )
+        .unwrap();
+        for p in packages {
+            let d = dir.join(p);
+            fs::create_dir_all(&d).unwrap();
+            let name = d.file_name().unwrap().to_string_lossy().into_owned();
+            fs::write(d.join("package.json"), format!(r#"{{"name":"{name}"}}"#)).unwrap();
+        }
+        dir
+    }
+    fn discovered(root: &Path) -> Vec<String> {
+        discover_workspace_packages(root)
+            .iter()
+            .map(|p| {
+                p.dir
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+    #[test]
+    fn globstar_matches_any_depth() {
+        let dir = glob_fixture(
+            "depth",
+            r#"["packages/**"]"#,
+            &[
+                "packages",
+                "packages/a",
+                "packages/group/web",
+                "packages/x/y/z/deep",
+            ],
+        );
+        assert_eq!(
+            discovered(&dir),
+            [
+                "packages",
+                "packages/a",
+                "packages/group/web",
+                "packages/x/y/z/deep"
+            ]
+        );
+        let web = discover_workspace_packages(&dir)
+            .into_iter()
+            .find(|p| p.dir.ends_with("group/web"))
+            .unwrap();
+        assert_eq!(web.name.as_deref(), Some("web"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn globstar_in_the_middle_matches_zero_or_more_directories() {
+        let dir = glob_fixture(
+            "middle",
+            r#"["apps/**/svc-*"]"#,
+            &[
+                "apps/svc-a",
+                "apps/team/svc-b",
+                "apps/team/sub/svc-c",
+                "apps/team/other",
+            ],
+        );
+        assert_eq!(
+            discovered(&dir),
+            ["apps/svc-a", "apps/team/sub/svc-c", "apps/team/svc-b"]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn globstar_respects_exclusions() {
+        let dir = glob_fixture(
+            "exclude",
+            r#"["packages/**","!packages/legacy/**","!packages/**/fixtures"]"#,
+            &[
+                "packages/a",
+                "packages/legacy",
+                "packages/legacy/old",
+                "packages/b/fixtures",
+                "packages/c/d/fixtures",
+                "packages/c/d",
+            ],
+        );
+        assert_eq!(discovered(&dir), ["packages/a", "packages/c/d"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn overlapping_patterns_are_deduplicated() {
+        let dir = glob_fixture(
+            "dedupe",
+            r#"["packages/*","packages/**","./packages/**/**","packages/a/"]"#,
+            &["packages/a", "packages/b/c"],
+        );
+        assert_eq!(discovered(&dir), ["packages/a", "packages/b/c"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn single_star_stays_single_level() {
+        let dir = glob_fixture(
+            "single",
+            r#"["packages/*","tools/*-cli"]"#,
+            &[
+                "packages/a",
+                "packages/group/web",
+                "tools/x-cli",
+                "tools/x-lib",
+            ],
+        );
+        assert_eq!(discovered(&dir), ["packages/a", "tools/x-cli"]);
+        assert!(segment_matches("a*b*c", "aXbYc"));
+        assert!(!segment_matches("a*b*c", "aXcYb"));
+        assert!(!segment_matches("ab*b", "ab"));
+        assert!(segment_matches("a**b", "aXb"));
+        assert!(segment_matches("**", ".hidden"));
+        assert!(!segment_matches("a**b", "a"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn globstar_skips_dependency_and_hidden_directories() {
+        let dir = glob_fixture(
+            "skip",
+            r#"["**"]"#,
+            &[
+                "app",
+                "node_modules/dep",
+                "app/node_modules/dep",
+                ".cache/pkg",
+            ],
+        );
+        assert_eq!(discovered(&dir), ["", "app"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn globstar_depth_is_bounded() {
+        let at = |n: usize| format!("packages/{}", vec!["d"; n].join("/"));
+        let (inside, beyond) = (at(MAX_GLOBSTAR_DEPTH), at(MAX_GLOBSTAR_DEPTH + 1));
+        let dir = glob_fixture("bound", r#"["packages/**"]"#, &[&inside, &beyond]);
+        assert_eq!(discovered(&dir), [inside]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn globstar_does_not_follow_symlink_cycles() {
+        let dir = glob_fixture("cycle", r#"["packages/**"]"#, &["packages/a"]);
+        std::os::unix::fs::symlink(dir.join("packages"), dir.join("packages/a/loop")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("packages/root")).unwrap();
+        assert_eq!(discovered(&dir), ["packages/a"]);
         fs::remove_dir_all(dir).unwrap();
     }
 }
