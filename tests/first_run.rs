@@ -149,6 +149,7 @@ fn port_80_bindable_without_sudo() -> bool {
 #[test]
 fn fresh_install_uses_port_free_urls_only_when_no_sudo_is_needed() {
     let s = Sandbox::new();
+    let before = port_80_bindable_without_sudo();
     let out = s
         .command(&["get", "web", "--no-worktree"])
         .env("PORCH_CLEAN_URLS", "1")
@@ -156,9 +157,17 @@ fn fresh_install_uses_port_free_urls_only_when_no_sudo_is_needed() {
         .unwrap();
     assert!(out.status.success());
     let url = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    if port_80_bindable_without_sudo() {
+    // Port 80 can be taken or freed by other programs (or parallel tests)
+    // between Porch's check and ours, so require agreement only when the
+    // answer is the same before and after Porch decided.
+    let after = port_80_bindable_without_sudo();
+    assert!(
+        url == "http://web.localhost" || url == "http://web.localhost:7462",
+        "{url}"
+    );
+    if after && before {
         assert_eq!(url, "http://web.localhost");
-    } else {
+    } else if !after && !before {
         assert_eq!(url, "http://web.localhost:7462");
     }
     // Opting out keeps the high port.

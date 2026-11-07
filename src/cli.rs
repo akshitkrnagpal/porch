@@ -760,7 +760,19 @@ pub(crate) fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
     let sync_requested = enabled("SYNC_HOSTS") == Some(true);
     let fresh = !state::dir().join("proxy.json").exists();
     let mut clean = false;
-    if let Some(p) = explicit_port {
+    // Back to the port-free standard port after a temporary fallback.
+    // Only between runs: a running proxy keeps the port it has.
+    if explicit_port.is_none() && crate::ports::clean_urls_enabled() && !proxy_running() {
+        if let Some(p) = saved.preferred_port {
+            if crate::ports::clean_port_bindable(p) && (p == 443) == s.tls {
+                s.port = p;
+                clean = true;
+            }
+        }
+    }
+    if clean {
+        s.preferred_port = None;
+    } else if let Some(p) = explicit_port {
         if p == 0 {
             bail!("proxy port must be 1-65535; run `porch proxy start --port {DEFAULT_PROXY_PORT}`")
         }
@@ -791,6 +803,9 @@ pub(crate) fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
             s.port = standard;
             clean = true;
         }
+    }
+    if s.preferred_port == Some(s.port) {
+        s.preferred_port = None;
     }
     // Port and privilege mode are one choice: high ports never need sudo or
     // hosts-file edits (browsers resolve *.localhost natively), unless the user
@@ -930,12 +945,14 @@ pub(crate) fn move_off_busy_port(mut s: ProxySettings, explicit: bool) -> Result
         };
         if s.unprivileged {
             // A no-sudo standard port (port-free URLs) that something else
-            // took: fall back to the high port rather than failing.
+            // took: fall back to the high port for now, and remember to come
+            // back to the standard port once it is free again.
             s.port = fallback;
             s.redirect_port = None;
+            s.preferred_port = Some(port);
             state::save_proxy_settings(&s)?;
             eprintln!(
-                "Port {port} is used by {who}; Porch now uses port {fallback} (saved). Apps: {}. Free port {port} and run `porch setup` to get URLs without a port back.",
+                "Port {port} is used by {who}; Porch uses port {fallback} for now (apps: {}) and returns to port {port} on a later start once it's free.",
                 s.url("<name>")
             );
             return Ok(s);

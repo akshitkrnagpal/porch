@@ -832,6 +832,15 @@ fn upstream_alias_dials_loopback_with_its_own_host_and_verifies_tls() {
     let tls_port = common::free_port();
     let plain_port = common::free_port();
     let script = "import http.server,ssl,sys\nclass H(http.server.BaseHTTPRequestHandler):\n def do_GET(self):\n  b=('host='+str(self.headers.get('Host'))).encode();self.send_response(200);self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)\n def log_message(self,*a):pass\ns=http.server.HTTPServer(('127.0.0.1',int(sys.argv[1])),H)\nif sys.argv[2]=='tls':\n c=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);c.load_cert_chain('c.pem','k.pem');s.socket=c.wrap_socket(s.socket,server_side=True)\nprint('ready',flush=True)\ns.serve_forever()\n";
+    struct Servers(Vec<std::process::Child>);
+    impl Drop for Servers {
+        fn drop(&mut self) {
+            for server in &mut self.0 {
+                let _ = server.kill();
+                let _ = server.wait();
+            }
+        }
+    }
     let mut servers: Vec<_> = [(tls_port, "tls"), (plain_port, "plain")]
         .into_iter()
         .map(|(port, mode)| {
@@ -851,6 +860,7 @@ fn upstream_alias_dials_loopback_with_its_own_host_and_verifies_tls() {
         )
         .unwrap();
     }
+    let servers = Servers(servers);
     s.ok(&[
         "alias",
         "verified",
@@ -900,8 +910,5 @@ fn upstream_alias_dials_loopback_with_its_own_host_and_verifies_tls() {
             "host=api.internal:8080"
         );
     });
-    for mut server in servers {
-        let _ = server.kill();
-        let _ = server.wait();
-    }
+    drop(servers);
 }

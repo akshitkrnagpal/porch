@@ -43,7 +43,9 @@ fn certified(cert: &str, key: &str) -> Result<Arc<CertifiedKey>> {
 struct LocalResolver {
     ca_pem: String,
     ca_key: String,
-    cache: Mutex<HashMap<String, Arc<CertifiedKey>>>,
+    /// Issued certificates and when each was last used (least recently used
+    /// entries are evicted first).
+    cache: Mutex<HashMap<String, (Arc<CertifiedKey>, std::time::Instant)>>,
     settings: crate::state::ProxySettings,
     route_state: PathBuf,
 }
@@ -90,6 +92,27 @@ impl LocalResolver {
         )
     }
 }
+/// At most 30 new leaf certificates per 10 seconds, across all clients.
+fn issuance_allowed() -> bool {
+    use std::time::{Duration, Instant};
+    static RECENT: Mutex<std::collections::VecDeque<Instant>> =
+        Mutex::new(std::collections::VecDeque::new());
+    let Ok(mut recent) = RECENT.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    while recent
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(10))
+    {
+        recent.pop_front();
+    }
+    if recent.len() >= 30 {
+        return false;
+    }
+    recent.push_back(now);
+    true
+}
 impl ResolvesServerCert for LocalResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let name = hello
@@ -98,14 +121,26 @@ impl ResolvesServerCert for LocalResolver {
             .to_ascii_lowercase();
         self.authorize(&name).ok()?;
         let mut cache = self.cache.lock().ok()?;
-        if let Some(cert) = cache.get(&name) {
+        if let Some((cert, used)) = cache.get_mut(&name) {
+            *used = std::time::Instant::now();
             return Some(cert.clone());
+        }
+        // Each new name costs a key generation: cap the rate, so a client
+        // cycling random names can't burn CPU (names in use stay cached).
+        if !issuance_allowed() {
+            return None;
         }
         let cert = self.issue(&name).ok()?;
         if cache.len() >= 256 {
-            cache.clear();
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest);
+            }
         }
-        cache.insert(name, cert.clone());
+        cache.insert(name, (cert.clone(), std::time::Instant::now()));
         Some(cert)
     }
 }
@@ -154,7 +189,7 @@ fn set_validity(params: &mut CertificateParams, days: u64) {
 /// the TLDs configured when it is created. Browsers enforce these X.509 name
 /// constraints, so even a leaked CA key can't impersonate a real website.
 fn ca_permitted(settings: &crate::state::ProxySettings) -> Vec<String> {
-    let mut out: Vec<String> = ["localhost", "local", "test", "internal", "home.arpa", "lan"]
+    let mut out: Vec<String> = ["localhost", "local", "test", "internal", "home.arpa"]
         .into_iter()
         .map(str::to_owned)
         .collect();

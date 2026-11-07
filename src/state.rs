@@ -108,6 +108,10 @@ pub struct ProxySettings {
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
     pub redirect_port: Option<u16>,
+    /// The no-sudo standard port (80/443) to return to when it frees up,
+    /// after a busy moment made this run fall back to a high port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_port: Option<u16>,
 }
 impl Default for ProxySettings {
     fn default() -> Self {
@@ -123,6 +127,7 @@ impl Default for ProxySettings {
             cert: None,
             key: None,
             redirect_port: None,
+            preferred_port: None,
         }
     }
 }
@@ -531,6 +536,7 @@ pub fn live_routes() -> Result<std::sync::Arc<State>> {
     static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
     const LIVENESS_TTL: Duration = Duration::from_millis(750);
     let path = dir().join("state.json");
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let stamp = match fs::metadata(&path) {
         Ok(m) => Some(Stamp {
             path: path.clone(),
@@ -542,7 +548,6 @@ pub fn live_routes() -> Result<std::sync::Arc<State>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(c) = cache.as_ref() {
         let same_file = match (&c.stamp, &stamp) {
             (Some(a), Some(b)) => a == b,

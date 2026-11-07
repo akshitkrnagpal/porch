@@ -514,10 +514,13 @@ async fn forward(
             html,
         ));
     }
+    // Only a proxy on this machine can have forwarded this request before; a
+    // LAN client's hop count is ignored so it can't force a 508.
     let hops = req
         .headers()
         .get("x-porch-hops")
         .or_else(|| req.headers().get("x-portless-hops"))
+        .filter(|_| peer.ip().is_loopback())
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
@@ -949,9 +952,7 @@ async fn forward(
             marker(&mut r);
             Ok(r)
         }
-        Err(e)
-            if upstream_spec.as_ref().is_some_and(|u| u.tls)
-                && format!("{e:?}").to_ascii_lowercase().contains("certificate") =>
+        Err(e) if upstream_spec.as_ref().is_some_and(|u| u.tls) && certificate_error(&e) =>
         {
             Ok(error(
                 StatusCode::BAD_GATEWAY,
@@ -1382,4 +1383,31 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+/// Did the upstream TLS handshake fail on the backend's certificate?
+fn certificate_error(e: &(dyn std::error::Error + 'static)) -> bool {
+    let is_cert = |tls: &rustls::Error| {
+        matches!(
+            tls,
+            rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented
+        )
+    };
+    let mut source = Some(e);
+    while let Some(err) = source {
+        if let Some(tls) = err.downcast_ref::<rustls::Error>() {
+            return is_cert(tls);
+        }
+        // hyper-rustls nests the rustls error inside io::Error wrappers,
+        // which don't expose it through source().
+        let mut io = err.downcast_ref::<std::io::Error>();
+        while let Some(inner) = io.and_then(|e| e.get_ref()) {
+            if let Some(tls) = inner.downcast_ref::<rustls::Error>() {
+                return is_cert(tls);
+            }
+            io = inner.downcast_ref::<std::io::Error>();
+        }
+        source = err.source();
+    }
+    false
 }
