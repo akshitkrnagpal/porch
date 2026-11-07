@@ -184,8 +184,17 @@ mod tests {
         let joiner_key = joiner_finish(joiner, &msg_b).unwrap();
         assert!(!host_key.check_joiner_confirm(&pin, &joiner_key.joiner_confirm(&pin)));
         assert!(!joiner_key.check_host_confirm(&pin, &host_key.host_confirm(&pin)));
-        // The code itself is not derivable from the exchanged messages.
-        assert!(!msg_a.contains("123456") && !msg_b.contains("123456"));
+        // The messages carry only a group element, never the code, and are
+        // randomized: the same code never yields the same message, so a
+        // recorded exchange gives nothing to test guesses against offline.
+        // (Checking that the hex lacks "123456" proves nothing and fails by
+        // chance.)
+        for msg in [&msg_a, &msg_b] {
+            assert_eq!(msg.len(), 66, "{msg}");
+            assert!(msg.bytes().all(|b| b.is_ascii_hexdigit()), "{msg}");
+        }
+        let (_, again) = joiner_start(&pw);
+        assert_ne!(joiner_start(&pw).1, again);
     }
     #[test]
     fn malformed_messages_are_rejected() {

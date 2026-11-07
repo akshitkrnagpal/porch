@@ -120,6 +120,45 @@ impl Reservation {
         Ok(self.v4.local_addr()?.port())
     }
 }
+/// Whether `port` could be reserved right now, without accepting connections.
+///
+/// On Unix the probe binds both families but never listens. A child that
+/// another thread forks during the probe keeps a copy of the probe socket
+/// until it execs; a listening copy would look like a live listener to
+/// [`crate::ports::has_listener`], and a client connecting during the probe
+/// would be accepted and then reset. Bind conflicts do not depend on listening
+/// for sockets without `SO_REUSEADDR`, so the answer is the same as a
+/// reservation's. Windows sockets are never inherited, and Windows decides
+/// conflicts with listeners in mind, so the probe there is a reservation.
+pub fn probe(port: u16) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let socket = |addr: SocketAddr| -> io::Result<socket2::Socket> {
+            let domain = if addr.is_ipv6() {
+                socket2::Domain::IPV6
+            } else {
+                socket2::Domain::IPV4
+            };
+            let socket =
+                socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+            if addr.is_ipv6() {
+                socket.set_only_v6(true)?;
+            }
+            socket.bind(&addr.into())?;
+            Ok(socket)
+        };
+        let _v4 = socket(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))?;
+        match socket(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)) {
+            Ok(_) => Ok(()),
+            Err(e) if ipv6_unavailable(&e) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        reserve(port).map(drop)
+    }
+}
 pub fn reserve(port: u16) -> io::Result<Reservation> {
     let v4 = bind(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),

@@ -33,6 +33,11 @@ pub fn keep_std_handles_private() {
 }
 
 /// Put each application in an independent process tree before it starts.
+///
+/// On Windows the child starts suspended: `TreeGuard::new` puts it in its job
+/// and then lets it run, so nothing it starts can be outside the job. Always
+/// create the guard right after spawning (a child dropped before that is
+/// killed, `kill_on_drop`).
 pub fn configure(command: &mut Command) {
     command.kill_on_drop(true);
     #[cfg(unix)]
@@ -51,7 +56,56 @@ pub fn configure(command: &mut Command) {
         });
     }
     #[cfg(windows)]
-    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+    command.creation_flags(
+        windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
+            | windows_sys::Win32::System::Threading::CREATE_SUSPENDED,
+    );
+}
+
+/// Let a child created suspended (see `configure`) run: resume its threads.
+#[cfg(windows)]
+fn resume(pid: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+                THREADENTRY32,
+            },
+            Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
+        },
+    };
+    let mut resumed = 0;
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        let mut more = Thread32First(snapshot, &mut entry) != 0;
+        while more {
+            if entry.th32OwnerProcessID == pid {
+                let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                if !thread.is_null() {
+                    if ResumeThread(thread) != u32::MAX {
+                        resumed += 1;
+                    }
+                    CloseHandle(thread);
+                }
+            }
+            more = Thread32Next(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+    }
+    if resumed == 0 {
+        return Err(std::io::Error::other(format!(
+            "could not resume process {pid}"
+        )));
+    }
+    Ok(())
 }
 
 /// Dropping this guard terminates remaining processes in the owned tree.
@@ -145,8 +199,166 @@ impl TreeGuard {
             if unsafe { AssignProcessToJobObject(job, process.cast()) } == 0 {
                 return Err(std::io::Error::last_os_error()).context("assigning child process job");
             }
+            // Only now may it run (it was created suspended): everything it
+            // starts is in the job from its first instruction.
+            resume(child.id().context("child has already been reaped")?)
+                .context("starting child process")?;
             Ok(guard)
         }
+    }
+}
+
+/// Whether `pid` is a child of this process that has not been reaped yet
+/// (running, or exited and waiting to be reaped).
+#[cfg(unix)]
+fn unreaped(pid: libc::pid_t) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return true;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return false;
+        }
+    }
+}
+
+/// Wait for a child to exit without reaping it, and return its status.
+///
+/// A process group's id is the leader's pid. Until the leader is reaped, even
+/// as a zombie, that id cannot name another process or group, so signaling
+/// the group reaches only the leader's own tree. Once it is reaped, the id
+/// can be reused at once (a machine whose pid counter has wrapped reuses
+/// freed pids within milliseconds), and the same signal would reach an
+/// unrelated process group. Callers clean up the group after this returns
+/// and reap the child last, with `Child::wait`.
+pub async fn wait_exit(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let Some(pid) = child.id() else {
+            // Already reaped: its status is cached.
+            return child.wait().await;
+        };
+        let raw = tokio::task::spawn_blocking(move || -> std::io::Result<i32> {
+            let pid = pid as libc::pid_t;
+            let info = loop {
+                if let Some(info) = exited(pid)? {
+                    break info;
+                }
+                block_until_exit(pid)?;
+            };
+            #[cfg(target_os = "linux")]
+            let status = unsafe { info.si_status() };
+            #[cfg(not(target_os = "linux"))]
+            let status = info.si_status;
+            // Encode it like a wait status: exit code in the second byte,
+            // terminating signal in the low bits.
+            Ok(match info.si_code {
+                libc::CLD_EXITED => (status & 0xff) << 8,
+                libc::CLD_DUMPED => status | 0x80,
+                _ => status,
+            })
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        Ok(std::process::ExitStatus::from_raw(raw))
+    }
+    #[cfg(windows)]
+    {
+        // Job objects, not reusable ids, own the tree on Windows.
+        child.wait().await
+    }
+}
+
+/// The exit report of child `pid` if it has exited (not merely stopped),
+/// leaving it unreaped.
+#[cfg(unix)]
+fn exited(pid: libc::pid_t) -> std::io::Result<Option<libc::siginfo_t>> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let reported = unsafe { info.si_pid() } == pid;
+    #[cfg(not(target_os = "linux"))]
+    let reported = info.si_pid == pid;
+    // macOS also reports a stopped child here, despite asking only for exits.
+    let exit = matches!(
+        info.si_code,
+        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+    );
+    Ok((reported && exit).then_some(info))
+}
+
+/// Block until child `pid` exits (or something changes that may be an exit).
+#[cfg(target_os = "linux")]
+fn block_until_exit(pid: libc::pid_t) -> std::io::Result<()> {
+    // Linux reports only exits for WEXITED.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    let error = std::io::Error::last_os_error();
+    if result == 0 || error.raw_os_error() == Some(libc::EINTR) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+/// Block until child `pid` exits. kqueue's exit note, unlike waitid, ignores
+/// a child that is only stopped.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn block_until_exit(pid: libc::pid_t) -> std::io::Result<()> {
+    let queue = unsafe { libc::kqueue() };
+    if queue < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let change = libc::kevent {
+        ident: pid as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::kevent(queue, &change, 1, &mut event, 1, std::ptr::null()) };
+    let error = std::io::Error::last_os_error();
+    unsafe { libc::close(queue) };
+    // ESRCH: it exited before the note was registered; the caller re-checks.
+    if result >= 0 || matches!(error.raw_os_error(), Some(libc::EINTR | libc::ESRCH)) {
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
@@ -155,8 +367,10 @@ impl Drop for TreeGuard {
         #[cfg(unix)]
         {
             // A negative PID targets the application process group, including
-            // descendants that outlive their original parent.
-            if self.group > 0 {
+            // descendants that outlive their original parent. Only while the
+            // leader is unreaped does the id still name that group (see
+            // `wait_exit`); after an early reap it may name someone else's.
+            if self.group > 0 && unreaped(self.group) {
                 unsafe { libc::kill(-self.group, libc::SIGKILL) };
             }
         }
@@ -551,45 +765,37 @@ mod tests {
 
     #[tokio::test]
     async fn discovers_python_tcp_listener_for_state_user() {
-        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = reserve.local_addr().unwrap().port();
-        drop(reserve);
+        // Python picks its own port and reports it only once it is listening.
+        // Reserving a port, freeing it and probing it with connect() was racy:
+        // under parallel tests the OS reassigned the freed port, so the probe
+        // reached (and disturbed) another test's listener while Python's bind
+        // failed or came later, and the lookup saw no Python listener.
         let mut command = Command::new("python3");
         command
             .args([
                 "-c",
-                "import socket,sys,time; s=socket.socket(); s.bind(('127.0.0.1',int(sys.argv[1]))); s.listen(); time.sleep(60)",
-                &port.to_string(),
+                "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); print(s.getsockname()[1],flush=True); time.sleep(60)",
             ])
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         configure(&mut command);
         let mut child = command.spawn().unwrap();
         let pid = child.id().unwrap();
         let guard = TreeGuard::new(&child).unwrap();
-        let ready = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    return Err(format!("Python exited: {status}"));
-                }
-                if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                    .await
-                    .is_ok()
-                {
-                    return Ok(());
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            Duration::from_secs(30),
+            BufReader::new(child.stdout.take().unwrap()).read_line(&mut line),
+        )
         .await;
-        if !matches!(ready, Ok(Ok(()))) {
+        let Ok(port) = line.trim().parse::<u16>() else {
             drop(guard);
             let output = child.wait_with_output().await.unwrap();
             panic!(
-                "Python TCP listener failed to bind: {ready:?}; stderr: {}",
+                "Python TCP listener did not report its port: {read:?} {line:?}; stderr: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-        }
+        };
         assert_eq!(listening_process(port), Some(pid));
         drop(guard);
         child.wait().await.unwrap();

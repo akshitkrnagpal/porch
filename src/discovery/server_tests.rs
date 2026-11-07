@@ -105,11 +105,9 @@ fn catalog_health_matches_porch_list() {
     let m = machine(&dir).unwrap();
     let up = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let up_port = up.local_addr().unwrap().port();
-    let down_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // Held, never listening: the health probe is refused and cannot reach a
+    // parallel test's listener on a reused ephemeral port.
+    let (_down, down_port) = crate::test_support::refused_port();
     let route = |name: &str, port: u16| Route {
         name: name.into(),
         target: format!("http://127.0.0.1:{port}"),
@@ -828,7 +826,10 @@ async fn real_tls_code_exchange_is_mutual_single_use_and_stores_joiner() {
     let (code, x) = start(&f, &opened.code).await;
     assert_eq!(code, StatusCode::OK);
     let x = x.unwrap();
-    assert!(!x.host_msg.contains(&opened.code));
+    // Only a hex group element crosses the wire (a substring check for the
+    // code would fail by chance on random hex).
+    assert_eq!(x.host_msg.len(), 66, "{}", x.host_msg);
+    assert!(x.host_msg.bytes().all(|b| b.is_ascii_hexdigit()));
     // Credentials cannot skip the joiner's proof.
     let (code, _) = finish(&f, &x, None).await;
     assert_eq!(code, StatusCode::GONE, "finish before confirm");

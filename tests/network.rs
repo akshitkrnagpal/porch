@@ -5,10 +5,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::{header, Request};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use porch::state::{ProxySettings, Route};
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, protocol::Role, Message};
 
 use common::free_port;
@@ -83,19 +80,23 @@ async fn actual_http_tls_h2_ws_streaming_routing_and_redirects() {
     std::env::set_var("PORCH_SYNC_HOSTS", "0");
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let up = upstream.local_addr().unwrap().port();
+    let first_seen = Arc::new(tokio::sync::Notify::new());
+    let sse_first_seen = first_seen.clone();
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { "hello" }))
         .route("/headers", axum::routing::get(|h:header::HeaderMap| async move {
             serde_json::json!({"host":h.get("host").unwrap().to_str().unwrap(),"proto":h.get("x-forwarded-proto").unwrap().to_str().unwrap(),"hops":h.get("x-portless-hops").unwrap().to_str().unwrap(),"porch_hops":h.get("x-porch-hops").unwrap().to_str().unwrap(),"port":h.get("x-forwarded-port").unwrap().to_str().unwrap()}).to_string()
         }))
-        .route("/sse", axum::routing::get(|| async {
-            let events=futures_util::stream::unfold(0,|n| async move {
+        .route("/sse", axum::routing::get(move || { let first_seen = sse_first_seen.clone(); async move {
+            // The second event waits for the client to confirm the first, so
+            // the first can only have arrived if the proxy streamed it.
+            let events=futures_util::stream::unfold(0,move |n| { let first_seen=first_seen.clone(); async move {
                 if n>=2 { return None; }
-                if n==1 { tokio::time::sleep(Duration::from_millis(800)).await; }
+                if n==1 { first_seen.notified().await; }
                 Some((Ok::<_,std::convert::Infallible>(axum::response::sse::Event::default().data(if n==0 {"first"} else {"second"})), n+1))
-            });
+            }});
             axum::response::Sse::new(events)
-        }))
+        }}))
         .route("/ws", axum::routing::get(|ws:axum::extract::WebSocketUpgrade| async {
             ws.on_upgrade(|mut socket| async move {
                 while let Some(Ok(message))=socket.recv().await {
@@ -215,23 +216,37 @@ with context.wrap_socket(socket.create_connection(('127.0.0.1',int(sys.argv[2]))
         assert_eq!(h["hops"], "1");
         assert_eq!(h["porch_hops"], "1");
         assert_eq!(h["port"], port.to_string());
-        let start = Instant::now();
-        let mut stream = client
-            .get(format!("{url}/sse"))
-            .send()
+        // The upstream holds the rest of the response until the test confirms
+        // the first event, so the first event (and the headers before it) can
+        // only arrive if the proxy streams. Every step is bounded so a
+        // buffering proxy fails instead of hanging; a passing run never waits
+        // out a bound.
+        let bound = Duration::from_secs(30);
+        let mut stream = tokio::time::timeout(bound, client.get(format!("{url}/sse")).send())
             .await
+            .expect("response headers must stream before the body completes")
             .unwrap()
             .bytes_stream();
-        let first = tokio::time::timeout(Duration::from_millis(500), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&first).contains("first"));
-        assert!(start.elapsed() < Duration::from_millis(600));
-        let second = stream.next().await.unwrap().unwrap();
-        assert!(String::from_utf8_lossy(&second).contains("second"));
-        assert!(start.elapsed() >= Duration::from_millis(700));
+        // Chunks are not events: read up to each complete SSE frame.
+        let mut buffer = String::new();
+        let mut next_event = async |buffer: &mut String| -> String {
+            loop {
+                if let Some(end) = buffer.find("\n\n") {
+                    let event = buffer[..end].to_owned();
+                    buffer.drain(..end + 2);
+                    return event;
+                }
+                let chunk = tokio::time::timeout(bound, stream.next())
+                    .await
+                    .expect("an event must stream before the response completes")
+                    .expect("stream ended before the event")
+                    .unwrap();
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        };
+        assert_eq!(next_event(&mut buffer).await, "data: first");
+        first_seen.notify_one();
+        assert_eq!(next_event(&mut buffer).await, "data: second");
         if !tls {
             let actual_loop = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -482,8 +497,25 @@ with context.wrap_socket(socket.create_connection(('127.0.0.1',int(sys.argv[2]))
     proxy.abort();
     let _ = proxy.await;
     // Numeric loopback aliases still reach IPv6-only application listeners.
-    let v6 = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
-    let v6port = v6.local_addr().unwrap().port();
+    // The IPv4 side of the port stays bound but never listens, so the proxy's
+    // 127.0.0.1 attempt is refused rather than reaching another process that
+    // happens to listen on the same port number over IPv4.
+    let (v6, v6port, _v4_refused) = loop {
+        let v6 = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let port = v6.local_addr().unwrap().port();
+        let v4 = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        if v4
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
+            .is_ok()
+        {
+            break (v6, port, v4);
+        }
+    };
     let v6server = tokio::spawn(async move {
         axum::serve(
             v6,

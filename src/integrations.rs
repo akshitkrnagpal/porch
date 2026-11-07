@@ -94,11 +94,13 @@ fn command(program: &str, args: &[String]) -> Result<String> {
     let err = stderr
         .join()
         .map_err(|_| anyhow::anyhow!("command stderr reader failed"))??;
-    require_status(status)
-        .with_context(|| format!("{program} failed: {}", String::from_utf8_lossy(&err)))?;
+    // Before the exit status: a helper writing past the limit may be killed by
+    // SIGPIPE once the reader stops, and must still be reported as oversized.
     if out.len() as u64 > COMMAND_OUTPUT_LIMIT {
         bail!("{program} produced more than {COMMAND_OUTPUT_LIMIT} bytes of output");
     }
+    require_status(status)
+        .with_context(|| format!("{program} failed: {}", String::from_utf8_lossy(&err)))?;
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 pub(crate) fn exec(program: &str, args: &[&str]) -> Result<String> {
@@ -2530,6 +2532,14 @@ mod tests {
     fn oversized_command_output_is_an_error() {
         let n = (COMMAND_OUTPUT_LIMIT + 1).to_string();
         let err = exec("head", &["-c", &n, "/dev/zero"]).unwrap_err();
+        assert!(err.to_string().contains("more than"), "{err:#}");
+        // Far past the limit the writer is cut off by SIGPIPE, which must not
+        // turn the oversize report into an exit-status failure.
+        let err = exec(
+            "head",
+            &["-c", &(4 * COMMAND_OUTPUT_LIMIT).to_string(), "/dev/zero"],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("more than"), "{err:#}");
         assert_eq!(exec("head", &["-c", "3", "/dev/zero"]).unwrap().len(), 3);
     }

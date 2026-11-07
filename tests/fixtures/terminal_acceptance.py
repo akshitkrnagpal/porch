@@ -19,10 +19,35 @@ import time
 BINARY = str(pathlib.Path(sys.argv[1]).resolve())
 
 
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1', 0))
-        return sock.getsockname()[1]
+# Private port slots claimed by tests/pty.rs (see tests/common/mod.rs), one per
+# Fixture. Ephemeral ports would be released before Porch binds them, and a
+# concurrent test could take them in between.
+SLOTS = [int(port) for port in os.environ.get('PORCH_TEST_SLOTS', '').split(',') if port]
+SLOT_SIZE, APP_OFFSET = 256, 224
+
+
+def claim_slot():
+    assert SLOTS, 'more fixtures than PORCH_TEST_SLOTS; raise FIXTURES in tests/pty.rs'
+    return SLOTS.pop(0)
+
+
+def stopped_in_tree(root):
+    """Processes under `root` stopped by job control (state T): the hazard
+    these tests exist to catch, which would otherwise look like a hang."""
+    table = subprocess.run(['ps', '-axo', 'pid=,ppid=,stat='],
+                           capture_output=True, text=True).stdout
+    children, states = {}, {}
+    for line in table.splitlines():
+        pid, ppid, stat = line.split(None, 2)
+        children.setdefault(int(ppid), []).append(int(pid))
+        states[int(pid)] = stat
+    found, todo = [], [root]
+    while todo:
+        pid = todo.pop()
+        if states.get(pid, '').startswith('T'):
+            found.append(pid)
+        todo.extend(children.get(pid, []))
+    return found
 
 
 def alive(pid):
@@ -39,8 +64,10 @@ class Fixture:
         for name in list(self.env):
             if name.startswith(('PORCH_', 'PORTLESS_')) or name in ('PORCH', 'PORTLESS'):
                 self.env.pop(name)
+        slot = claim_slot()
         self.env.update(PORCH_STATE_DIR=str(self.root / 'state'),
-                        PORCH_PORT=str(free_port()), PORCH_HTTPS='0',
+                        PORCH_PORT=str(slot), PORCH_HTTPS='0',
+                        PORCH_APP_PORTS=f'{slot + APP_OFFSET}-{slot + SLOT_SIZE - 1}',
                         PORCH_SYNC_HOSTS='0', PORCH_SKIP_TRUST='1',
                         PORCH_PREFIX='', TERM='xterm-256color')
         self.pid = None
@@ -68,40 +95,42 @@ class Fixture:
             if waited:
                 self.status = os.waitstatus_to_exitcode(status)
 
-    def wait_for(self, marker, timeout=10):
+    # Waits end on what they wait for, or on a stopped or exited process; the
+    # timeouts are watchdogs for a broken run that a passing run never reaches.
+    def wait_for(self, marker, timeout=60):
         deadline = time.monotonic() + timeout
         while marker.encode() not in self.output and time.monotonic() < deadline:
             self.read()
             if self.status is not None:
                 break
+            stopped = stopped_in_tree(self.pid)
+            assert not stopped, f'stopped by the terminal: {stopped}; output={self.output!r}'
         assert marker.encode() in self.output, (f'missing {marker}; exit={self.status}; '
                                                 f'output={self.output.decode(errors="replace")}')
 
     def wait(self, expected=0):
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 60
         while self.status is None and time.monotonic() < deadline:
             self.read()
+            if self.status is None:
+                stopped = stopped_in_tree(self.pid)
+                assert not stopped, f'stopped by the terminal: {stopped}; output={self.output!r}'
         assert self.status == expected, f'exit={self.status}; output={self.output!r}'
 
     def close(self):
-        # Failure cleanup is restricted to process identities in our temp state.
-        state = self.root / 'state' / 'state.json'
-        if state.exists():
-            for owner in json.loads(state.read_text()).get('owners', {}).values():
-                child = owner.get('child')
-                if child:
-                    try:
-                        os.killpg(child, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
         if self.pid and self.status is None:
             try:
                 os.kill(self.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             os.waitpid(self.pid, 0)
+        # Failure cleanup of the dead launcher's apps goes through Porch, which
+        # signals a recorded process group only if its identity still matches:
+        # a raw killpg of a recorded id could reach a process that reused it.
+        subprocess.run([BINARY, 'prune', '--force'], env=self.env, cwd=self.root,
+                       capture_output=True, timeout=60)
         subprocess.run([BINARY, 'proxy', 'stop'], env=self.env, cwd=self.root,
-                       capture_output=True, timeout=10)
+                       capture_output=True, timeout=60)
         if self.fd is not None:
             os.close(self.fd)
         self.temp.cleanup()
@@ -154,7 +183,8 @@ while True: time.sleep(.1)
             os.kill(fixture.pid, sig)
         fixture.wait(128 + sig)
         assert (fixture.root / 'signal.txt').read_text() == str(sig), 'signal not forwarded'
-        deadline = time.monotonic() + 5
+        # Porch killed the group before exiting; this only waits for the kernel.
+        deadline = time.monotonic() + 60
         while alive(descendant) and time.monotonic() < deadline:
             time.sleep(.02)
         assert not alive(descendant), f'descendant {descendant} survived {sig}'
@@ -195,13 +225,17 @@ else:
         (fixture.root / 'package-lock.json').write_text(json.dumps({
             'name': 'pty-workspace', 'lockfileVersion': 3, 'packages': packages}))
         fixture.start([])
-        # A finite deadline catches terminal stops in Turbo, npm, or its git probe.
-        deadline = time.monotonic() + 20
+        # Fail on what this guards against, a terminal stop in Turbo, npm or its
+        # git probe, as soon as it shows; a slow start is not a failure. The
+        # deadline is a watchdog for a broken run.
+        deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             fixture.read()
             if all((fixture.root / 'apps' / app / 'ready').exists() for app in ['web', 'api']):
                 break
             assert fixture.status is None, f'Turbo exited: {fixture.output!r}'
+            stopped = stopped_in_tree(fixture.pid)
+            assert not stopped, f'stopped by the terminal: {stopped}; {fixture.output!r}'
         for app in ['web', 'api']:
             ready = fixture.root / 'apps' / app / 'ready'
             assert ready.exists(), f'Turbo {app} stopped before ready: {fixture.output!r}'

@@ -210,7 +210,7 @@ pub fn parse_ss(output: &str) -> Vec<Listener> {
 
 /// Whether a proxy could bind `port` right now on every interface.
 pub fn available(port: u16) -> bool {
-    crate::sockets::reserve(port).is_ok()
+    crate::sockets::probe(port).is_ok()
 }
 
 /// Is a live listener (not merely lingering TIME_WAIT connections) holding `port`?
@@ -297,20 +297,70 @@ mod tests {
     }
     #[test]
     fn live_listener_is_distinguished_from_a_free_port() {
-        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = held.local_addr().unwrap().port();
+        // A private slot port: an ephemeral one, once released, can be taken by
+        // a parallel test before the free-port assertions run.
+        let port = crate::test_support::free_port();
+        // Held by a child process: a listener in this process could outlive
+        // its drop inside a child that another test forks at that moment.
+        #[cfg(unix)]
+        let (held, _) = crate::test_support::ChildListener::bind("127.0.0.1", port, false).unwrap();
+        #[cfg(not(unix))]
+        let held = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
         assert!(has_listener(port));
         assert!(!wait_released(port, Duration::from_millis(100)));
         drop(held);
         assert!(!has_listener(port));
         assert!(wait_released(port, Duration::from_secs(1)));
+        // Bound without listening, like a port held by closing connections.
+        // (Windows lets an exclusive wildcard bind share a port with a socket
+        // bound to one address, so the port would count as available there.)
+        #[cfg(unix)]
+        {
+            let (_bound, refused) = crate::test_support::refused_port();
+            assert!(!available(refused));
+            assert!(!has_listener(refused));
+            assert!(!wait_released(refused, Duration::from_millis(100)));
+        }
     }
     #[test]
     fn next_free_skips_discovery_and_busy_ports() {
-        let held = crate::sockets::reserve(0).unwrap();
-        let busy = held.port().unwrap();
+        // The probes stay inside this test's private slot.
+        let busy = crate::test_support::free_port();
+        let _held = crate::sockets::reserve(busy).unwrap();
         let next = next_free(busy - 1);
-        assert_ne!(next, Some(busy));
+        assert!(next.is_some_and(|p| p > busy && p < busy + 200), "{next:?}");
         assert_ne!(next_free(DEFAULT_PROXY_PORT), Some(DISCOVERY_PORT));
+    }
+    #[test]
+    fn test_port_slots_are_unique_across_concurrent_tests_and_capped_per_test() {
+        // Threads stand in for concurrently running tests: each claims its
+        // whole batch at once and hands out its slots one by one. All hold
+        // their claims together (a finished test releases its slots).
+        let together = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let claims: Vec<Vec<u16>> = (0..4)
+            .map(|_| {
+                let together = together.clone();
+                std::thread::spawn(move || {
+                    let ports: Vec<u16> =
+                        (0..8).map(|_| crate::test_support::free_port()).collect();
+                    together.wait();
+                    ports
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        let mut all: Vec<u16> = claims.concat();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 32, "{claims:?}");
+        // A test asking for more than its batch fails instead of waiting.
+        let over = std::thread::spawn(|| {
+            for _ in 0..9 {
+                crate::test_support::free_port();
+            }
+        });
+        assert!(over.join().is_err());
     }
 }

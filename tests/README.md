@@ -23,9 +23,15 @@ Start at boot, real system and browser trust, live Docker, provider sign-up, LAN
 
 ## Writing tests
 
-Get any port you hand to Porch (proxy, discovery agent or `--app-port`) from `common::free_port()`. Don't bind `127.0.0.1:0` and drop the listener: the OS can give that port to another test or an outgoing connection before Porch binds it. Each `free_port()` result is the start of a private 256-port range below the OS's ephemeral range, so Porch's search for the next free port never reaches another test's ports.
+Tests run in parallel threads, and several test processes may run at once. Every rule here removes a way one test can change another's outcome. The helpers are in `tests/common/mod.rs`, which the unit tests in `src/` share.
 
-Wait for something you can observe (a route, a log line, a ready file) with a deadline, rather than relying on a fixture running for a fixed time, and clean up even when the test fails.
+- **Ports.** Get any port you hand to Porch (proxy, discovery agent or `--app-port`) from `common::free_port()`. Don't bind `127.0.0.1:0` and drop the listener: the OS can give that port to another test, which your probe then reaches. Each `free_port()` result is the start of a private 256-port slot below the OS's ephemeral range, so Porch's search for the next free port never reaches another test's ports. A test's first call claims all its slots at once (eight at most) with lock files shared by every test process, after checking that the ports tests bind or hand to Porch are free; the claim ends when the test's thread does. A test waiting for slots holds none, so concurrent tests cannot deadlock.
+- **App ports.** Set `PORCH_APP_PORTS` to `common::app_ports(proxy_port)` in every sandbox that launches apps. Otherwise Porch picks app ports from the machine-wide 4000–4999 pool, and a parallel test's Porch can take a port your app was given but has not bound yet, or ignores.
+- **Ports nothing listens on.** Use `common::refused_port()`, a socket bound but not listening, rather than a port you freed.
+- **Listener ownership and release.** A socket this multi-threaded process opens is copied into any child another test forks at that moment and stays open there until the child execs. If a test asserts that a port is free after closing a listener, or which process owns one, hold the listener in a child process with `common::ChildListener`. Check availability with `common::bindable`, which binds from a child process.
+- **Own your accept loops.** A fixture that counts or asserts on every connection it accepts must only be reachable by its own client. Prefer in-memory streams (`tokio::io::duplex`) where no real socket is needed.
+- **Names.** Name temporary directories with the process id and a per-process counter, never the clock: macOS clocks have microsecond resolution, so parallel tests would share a directory.
+- **Waiting.** Wait for something you can observe (a route, a log line, a file written by rename) with a deadline that only bounds a broken run. Don't rely on a fixture running for a fixed time or on how fast something happens, and don't retry an operation whose result you assert. Publish files that a test parses atomically (write a temporary file, then rename). Clean up even when the test fails.
 
 ## Turbo and sudo
 

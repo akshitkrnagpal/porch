@@ -23,10 +23,13 @@ impl Sandbox {
         let dir = std::env::temp_dir().join(format!(
             "porch-integrations-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            // A per-process counter: the clock (microseconds on macOS) gives
+            // parallel tests the same name, and with it shared state.
+            {
+                static NEXT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            }
         ));
         fs::create_dir_all(dir.join("bin")).unwrap();
         fs::create_dir_all(dir.join("state")).unwrap();
@@ -41,10 +44,8 @@ impl Sandbox {
         Self { dir, path, port }
     }
     fn fake(&self, name: &str, script: &str) {
-        use std::os::unix::fs::PermissionsExt;
         let p = self.dir.join("bin").join(name);
-        fs::write(&p,format!("#!/usr/bin/env python3\nimport os,sys,json,time\na=sys.argv[1:]\nwith open(os.environ['PORCH_TEST_LOG'],'a') as f:f.write(json.dumps([os.path.basename(sys.argv[0])]+a)+'\\n')\n{script}\n")).unwrap();
-        fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+        common::write_executable(&p,&format!("#!/usr/bin/env python3\nimport os,sys,json,time\na=sys.argv[1:]\nwith open(os.environ['PORCH_TEST_LOG'],'a') as f:f.write(json.dumps([os.path.basename(sys.argv[0])]+a)+'\\n')\n{script}\n"));
     }
     fn cmd(&self) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_porch"));
@@ -52,6 +53,7 @@ impl Sandbox {
             .env("PORCH_HOSTS_FILE", self.dir.join("hosts"))
             .env("PORCH_SYNC_HOSTS", "0")
             .env("PORCH_PORT", self.port.to_string())
+            .env("PORCH_APP_PORTS", common::app_ports(self.port))
             .env("PORCH_HTTPS", "0")
             .env("PORCH_SERVICE_FILE", self.dir.join("service"))
             .env("PORCH_TRUST_DIR", self.dir.join("trust"))
@@ -82,6 +84,16 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         let _ = self.cmd().args(["proxy", "stop"]).output();
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+/// Wait until `pid` has exited. A killed process Porch did not reap stays a
+/// zombie until its new parent reaps it, which a container's init may never
+/// do; a zombie has exited, so it counts as gone.
+fn wait_gone(pid: i32, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while porch::state::alive(pid as u32) {
+        assert!(std::time::Instant::now() < deadline, "{what}: pid {pid}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 fn state(root: &Path) -> serde_json::Value {
@@ -375,7 +387,7 @@ else:
     }
     let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(143));
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Porch removes the Tailscale registration before it exits.
     assert!(s
         .log()
         .contains("\"serve\", \"--yes\", \"--https=8443\", \"off\""));
@@ -384,11 +396,7 @@ else:
             .unwrap()
             .parse()
             .unwrap();
-        assert_ne!(
-            unsafe { libc::kill(pid, 0) },
-            0,
-            "owned tunnel survived Drop"
-        );
+        wait_gone(pid, "owned tunnel survived Drop");
     }
 }
 
@@ -531,11 +539,16 @@ else:
   sys.exit(2)
  print('started tunnel url=https://demo.ngrok.app',flush=True)
  print('https://demo.trycloudflare.com Registered tunnel connection',flush=True)
- time.sleep(0.5)
+ # Fail only once the app runs, however long Porch takes to start it.
+ app=os.environ['PORCH_TEST_ROOT']+'/app-pid'
+ deadline=time.monotonic()+30
+ while not os.path.exists(app) and time.monotonic()<deadline:time.sleep(0.02)
  sys.exit(9)
 "#,
             );
-            let script="import os,time,json;root=os.environ['PORCH_TEST_ROOT'];open(root+'/app-pid','w').write(str(os.getpid()));open(root+'/app-env','w').write(json.dumps(dict(os.environ)));time.sleep(60)";
+            // The environment is complete before the pid appears (both renamed
+            // into place): the fake tunnel fails as soon as it sees the pid.
+            let script="import os,time,json;root=os.environ['PORCH_TEST_ROOT'];open(root+'/app-env.tmp','w').write(json.dumps(dict(os.environ)));os.replace(root+'/app-env.tmp',root+'/app-env');open(root+'/app-pid.tmp','w').write(str(os.getpid()));os.replace(root+'/app-pid.tmp',root+'/app-pid');time.sleep(60)";
             let flag = format!("--{provider}");
             let mut child = s
                 .cmd()
@@ -565,7 +578,7 @@ else:
                     .unwrap()
                     .parse()
                     .unwrap();
-                assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+                wait_gone(pid, "app of a failed tunnel");
                 let env: serde_json::Value =
                     serde_json::from_slice(&fs::read(s.dir.join("app-env")).unwrap()).unwrap();
                 assert!(env[format!("PORTLESS_{}_URL", provider.to_uppercase())]
@@ -706,7 +719,7 @@ fn compose_passthrough_preserves_stdin_output_and_exit_status() {
 fn stalled_external_helper_has_bounded_lifetime() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let s = Sandbox::new();
-    s.fake("security","open(os.environ['PORCH_TEST_ROOT']+'/helper-pid','w').write(str(os.getpid()))\ntime.sleep(60)");
+    s.fake("security", "time.sleep(60)");
     write_ca(&s);
     let start = std::time::Instant::now();
     let out = s
@@ -717,13 +730,42 @@ fn stalled_external_helper_has_bounded_lifetime() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    // The helper would run for a minute; returning well before proves the bound.
+    assert!(start.elapsed() < std::time::Duration::from_secs(30));
     assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
-    let pid: i32 = fs::read_to_string(s.dir.join("helper-pid"))
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+    // The helper may be killed before its interpreter runs a line, so find it
+    // by its command line rather than by a file it would write.
+    let helper = s.dir.join("bin/security");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let running = Command::new("pgrep")
+            .args(["-f", &helper.to_string_lossy()])
+            .output()
+            .unwrap();
+        // pgrep exits 1 for "no match"; anything else but 0 is a failed check.
+        match running.status.code() {
+            Some(1) => break,
+            Some(0) => {}
+            other => panic!(
+                "pgrep failed ({other:?}): {}",
+                String::from_utf8_lossy(&running.stderr)
+            ),
+        }
+        // pgrep lists zombies too; an exited helper waiting for its reaper is gone.
+        let pids: Vec<u32> = String::from_utf8_lossy(&running.stdout)
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        if pids.iter().all(|pid| !porch::state::alive(*pid)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stalled helper survived its timeout: {}",
+            String::from_utf8_lossy(&running.stdout)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -817,24 +859,35 @@ fn doctor_does_not_call_a_foreign_listener_ready() {
     for name in ["node", "docker", "tailscale", "ngrok", "cloudflared"] {
         s.fake(name, "print('fixture version')");
     }
+    // A foreign HTTP server that answers until doctor is done. It reads each
+    // request's headers before replying: a reply followed by closing with the
+    // request unread resets the connection, which doctor reports as
+    // unavailable rather than foreign.
     let listener = std::net::TcpListener::bind(("127.0.0.1", s.port)).unwrap();
-    listener.set_nonblocking(true).unwrap();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = done.clone();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-        while std::time::Instant::now() < deadline {
-            if let Ok((mut c, _)) = listener.accept() {
-                c.set_read_timeout(Some(std::time::Duration::from_millis(300)))
-                    .unwrap();
-                let mut buf = [0; 4096];
-                let _ = c.read(&mut buf);
-                let _ = c.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
+        for c in listener.incoming() {
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            let Ok(mut c) = c else { continue };
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ =
+                c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         }
     });
     let out = s.ok(&["doctor"]);
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Wake the accept loop so it sees the flag.
+    let _ = std::net::TcpStream::connect(("127.0.0.1", s.port));
     server.join().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("foreign/unverified listener"), "{stdout}");

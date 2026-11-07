@@ -35,6 +35,7 @@ impl Sandbox {
             .current_dir(&self.root)
             .env("PORCH_STATE_DIR", self.root.join("state"))
             .env("PORCH_PORT", self.port.to_string())
+            .env("PORCH_APP_PORTS", common::app_ports(self.port))
             .env("PORCH_HTTPS", "0")
             .env("PORCH_SYNC_HOSTS", "0")
             .env("PORCH_SKIP_TRUST", "1")
@@ -289,7 +290,40 @@ fn daemon_remembers_settings_and_rejects_bind_failure() {
     assert_eq!(v["tlds"], serde_json::json!(["localhost", "test"]));
     assert_eq!(v["wildcard"], true);
     s.ok(&["proxy", "stop"]);
-    let listener = std::net::TcpListener::bind(("127.0.0.1", s.port)).unwrap();
+    // Occupy the port with a live listener. The stopped proxy's connections can
+    // leave the port in TIME_WAIT, which blocks a plain bind but is not what
+    // this test is about.
+    let listener = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .unwrap();
+    let address: socket2::SockAddr = std::net::SocketAddr::from(([127, 0, 0, 1], s.port)).into();
+    // Unix: SO_REUSEADDR binds over TIME_WAIT, never over a live listener.
+    #[cfg(unix)]
+    {
+        listener.set_reuse_address(true).unwrap();
+        listener.bind(&address).unwrap();
+    }
+    // Windows: SO_REUSEADDR would also bind over a live listener, so wait for
+    // the port to be free instead. The bound is a watchdog (Windows keeps
+    // TIME_WAIT for at most 240s); a passing run binds at once or soon after.
+    #[cfg(windows)]
+    {
+        let deadline = Instant::now() + Duration::from_secs(240);
+        while let Err(e) = listener.bind(&address) {
+            // Only "in use" is worth waiting out.
+            assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e}");
+            assert!(
+                Instant::now() < deadline,
+                "port {} never freed: {e}",
+                s.port
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    listener.listen(16).unwrap();
     assert!(!s.run(&["proxy", "start"]).status.success());
     assert!(!s.root.join("state/proxy.ready").exists());
     drop(listener);
@@ -333,13 +367,21 @@ fn orphan_prune_kills_child_group_and_preserves_static_alias() {
 #[test]
 fn https_opt_in_ca_environment_allows_node_to_call_another_app() {
     let s = Sandbox::new();
-    let mut server=s.command(&["secure","node","-e","require('http').createServer((q,r)=>r.end('from-secure')).listen(process.env.PORT,'127.0.0.1')"])
+    let mut server=s.command(&["secure","node","-e","const fs=require('fs');require('http').createServer((q,r)=>r.end('from-secure')).listen(process.env.PORT,'127.0.0.1',()=>{fs.writeFileSync('secure.tmp','');fs.renameSync('secure.tmp','secure.ready')})"])
       .env("PORCH_HTTPS", "1").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     s.wait_route("secure");
+    // A registered route only means the app was started; the client must not
+    // reach it (and get a 502) before it listens.
+    let d = Instant::now() + Duration::from_secs(30);
+    while !s.root.join("secure.ready").exists() {
+        assert!(Instant::now() < d, "secure app never listened");
+        std::thread::sleep(Duration::from_millis(30));
+    }
     let settings: serde_json::Value =
         serde_json::from_slice(&std::fs::read(s.root.join("state/proxy.json")).unwrap()).unwrap();
     assert_eq!(settings["tls"], true);
-    let script=format!("const https=require('https');let n=0;function fetch(){{https.get({{hostname:'127.0.0.1',port:{},servername:'secure.localhost',headers:{{host:'secure.localhost'}}}},r=>{{let b='';r.on('data',c=>b+=c);r.on('end',()=>{{console.log(b);process.exit(b==='from-secure'?0:1)}})}}).on('error',e=>{{if(++n<50)setTimeout(fetch,30);else{{console.error(e);process.exit(1)}}}})}}fetch()",s.port);
+    // One request: the proxy and the app are both ready, so any failure is real.
+    let script=format!("const https=require('https');https.get({{hostname:'127.0.0.1',port:{},servername:'secure.localhost',headers:{{host:'secure.localhost'}}}},r=>{{let b='';r.on('data',c=>b+=c);r.on('end',()=>{{console.log(b);if(b!=='from-secure')console.error('status '+r.statusCode+': '+b);process.exit(b==='from-secure'?0:1)}})}}).on('error',e=>{{console.error(e);process.exit(1)}})",s.port);
     let output = s
         .command(&["client", "node", "-e", &script])
         .env("PORCH_HTTPS", "1")
@@ -544,8 +586,7 @@ fn proxy_recovers_after_accept_fd_exhaustion() {
     let script = r#"
 import os,resource,socket,subprocess,sys,tempfile,time
 with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
- with socket.socket() as s:
-  s.bind(('127.0.0.1',0));port=s.getsockname()[1]
+ port=int(sys.argv[2])
  env=os.environ.copy();env.update(PORCH_STATE_DIR=root,PORCH_SYNC_HOSTS='0',PORCH_SKIP_TRUST='1')
  def limit():resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
  with open(root+'/log','w+') as log:
@@ -560,7 +601,14 @@ with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
    for i in range(110):
     c=socket.create_connection(('127.0.0.1',port),timeout=2)
     c.sendall(b'GET / HTTP/1.1\r\n');sockets.append(c)
-   time.sleep(.3)
+   # Hold every connection until the daemon has run out of descriptors.
+   deadline=time.monotonic()+10
+   while True:
+    # A separate handle: seeking `log` would move the daemon's write offset.
+    if 'accept failed' in open(root+'/log').read():break
+    assert child.poll() is None,'accept error terminated daemon'
+    assert time.monotonic()<deadline,'fixture failed to exhaust accept descriptors'
+    time.sleep(.02)
    for c in sockets:c.close()
    sockets=[]
    assert child.poll() is None,'accept error terminated daemon'
@@ -573,7 +621,6 @@ with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
       if b'404' in reply:break
     except (OSError,TimeoutError):pass
     assert time.monotonic()<deadline,'listener did not recover after freeing descriptors'
-   log.flush();log.seek(0);assert 'accept failed' in log.read(),'fixture failed to exhaust accept descriptors'
   finally:
    for c in sockets:c.close()
    if child.poll() is None:child.terminate()
@@ -581,7 +628,14 @@ with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
    except subprocess.TimeoutExpired:child.kill();child.wait()
 "#;
     let out = Command::new("python3")
-        .args(["-c", script, env!("CARGO_BIN_EXE_porch")])
+        .args([
+            "-c",
+            script,
+            env!("CARGO_BIN_EXE_porch"),
+            // A private port: one freed by Python could be reassigned before
+            // the daemon binds it.
+            &common::free_port().to_string(),
+        ])
         .output()
         .unwrap();
     assert!(

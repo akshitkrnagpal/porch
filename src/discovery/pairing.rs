@@ -632,10 +632,19 @@ async fn refused(response: reqwest::Response) -> anyhow::Error {
 async fn step<T: serde::de::DeserializeOwned>(
     request: reqwest::RequestBuilder,
 ) -> std::result::Result<T, anyhow::Error> {
-    let response = request
-        .send()
-        .await
-        .map_err(|e| fail("unreachable", format!("pairing connection failed: {e}")))?;
+    let response = request.send().await.map_err(|e| {
+        // reqwest's own message omits the cause (timeout, refused, reset).
+        let mut detail = e.to_string();
+        let mut source = std::error::Error::source(&e);
+        while let Some(cause) = source {
+            detail.push_str(&format!(": {cause}"));
+            source = cause.source();
+        }
+        fail(
+            "unreachable",
+            format!("pairing connection failed: {detail}"),
+        )
+    })?;
     if !response.status().is_success() {
         return Err(refused(response).await);
     }
@@ -772,8 +781,8 @@ async fn join_one(
 }
 
 /// Forget a machine: revoke its access here first, then tell it (best effort,
-/// five seconds). Returns whether the other machine was reached.
-pub async fn unpair(reference: &str) -> Result<(Peer, bool)> {
+/// five seconds). Returns why the other machine was not reached, if it wasn't.
+pub async fn unpair(reference: &str) -> Result<(Peer, Option<String>)> {
     let peer = client::find_peer(reference)?;
     server::revoke_machine(&peer.machine.id)?;
     super::disconnect_peer(&peer.machine.id).await?;
@@ -787,11 +796,14 @@ pub async fn unpair(reference: &str) -> Result<(Peer, bool)> {
             .error_for_status()?;
         anyhow::Ok(())
     };
-    let reached = matches!(
-        tokio::time::timeout(Duration::from_secs(5), remote).await,
-        Ok(Ok(()))
-    );
-    Ok((peer, reached))
+    let unreached = match tokio::time::timeout(Duration::from_secs(5), remote).await {
+        Ok(Ok(())) => None,
+        // The alternate form includes the cause (timeout, refused, reset),
+        // which reqwest's own message omits.
+        Ok(Err(e)) => Some(format!("{e:#}")),
+        Err(_) => Some("no answer within 5 seconds".into()),
+    };
+    Ok((peer, unreached))
 }
 
 /// The browser URL template for a paired machine's apps.
