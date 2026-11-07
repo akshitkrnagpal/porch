@@ -170,7 +170,7 @@ cargo test --all-targets
 
 The tests start real processes, so they need Node.js with npm, Python 3 and Git. They use temporary state and never touch your hosts file, trust store or startup services. The menu bar app builds with `cargo build --release --features tray --bins`.
 
-To cut a release, bump `version` in `Cargo.toml`, merge, then push a matching tag such as `v0.3.2`. The [release workflow](.github/workflows/release.yml) builds the archives and publishes the GitHub Release.
+To cut a release, bump `version` in `Cargo.toml`, merge, then push a matching tag such as `v0.4.0`. The [release workflow](.github/workflows/release.yml) builds the archives and publishes the GitHub Release.
 
 ## License
 
