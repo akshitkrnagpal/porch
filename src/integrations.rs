@@ -804,49 +804,46 @@ fn find_program(name: &str) -> bool {
 fn trust_platform() -> String {
     std::env::var("PORCH_TRUST_PLATFORM").unwrap_or_else(|_| std::env::consts::OS.into())
 }
+/// DER of the first certificate in a PEM file, the same one `openssl x509 -in` reads.
+fn ca_der(ca: &Path) -> Result<Vec<u8>> {
+    let pem = fs::read(ca).with_context(|| format!("could not read {}", ca.display()))?;
+    let der = rustls_pemfile::certs(&mut std::io::BufReader::new(pem.as_slice()))
+        .next()
+        .with_context(|| format!("no PEM certificate in {}", ca.display()))?
+        .with_context(|| format!("invalid PEM certificate in {}", ca.display()))?;
+    Ok(der.to_vec())
+}
+/// Uppercase hex SHA-1 of the certificate DER, without separators. This is the
+/// format `openssl x509 -fingerprint -sha1` produced (minus colons) in Porch 0.3.x,
+/// so existing trust records keep matching.
 fn ca_fingerprint(ca: &Path) -> Result<String> {
-    let out = exec(
-        "openssl",
-        &[
-            "x509",
-            "-in",
-            &ca.to_string_lossy(),
-            "-noout",
-            "-fingerprint",
-            "-sha1",
-        ],
-    )?;
-    let fingerprint = out
-        .trim()
-        .split('=')
-        .next_back()
-        .unwrap_or("")
-        .replace(':', "");
-    if fingerprint.len() != 40 || !fingerprint.bytes().all(|c| c.is_ascii_hexdigit()) {
-        bail!("could not determine CA fingerprint");
-    }
-    Ok(fingerprint)
+    use sha1::Sha1;
+    let der = ca_der(ca)?;
+    Ok(Sha1::digest(&der)
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect())
 }
 fn verify_porch_ca(path: &Path) -> Result<()> {
-    let subject = exec(
-        "openssl",
-        &[
-            "x509",
-            "-in",
-            &path.to_string_lossy(),
-            "-noout",
-            "-subject",
-            "-nameopt",
-            "RFC2253",
-        ],
-    )?;
-    if !subject
-        .split(',')
-        .any(|part| part.trim().trim_start_matches("subject=").trim() == "CN=Porch Local CA")
+    let der = ca_der(path)?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&der)
+        .map_err(|e| anyhow::anyhow!("invalid CA certificate {}: {e}", path.display()))?;
+    if !cert
+        .subject()
+        .iter_common_name()
+        .any(|cn| cn.as_str() == Ok("Porch Local CA"))
     {
         bail!("refusing to alter trust for a certificate not issued as Porch Local CA");
     }
     Ok(())
+}
+/// True only when certutil ran and reported that the nickname is not in the database.
+/// Spawn failures, timeouts and database errors are not "absent".
+fn nss_cert_absent(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_lowercase();
+    message.contains("certutil failed:")
+        && message.contains("could not find cert")
+        && !message.contains("sec_error_bad_database")
 }
 fn linux_ca_layout(os_release: &str) -> (&'static str, &'static str) {
     let os = os_release.to_lowercase();
@@ -1106,8 +1103,20 @@ fn untrust() -> Result<()> {
                 }
                 let sql = format!("sql:{}", db.display());
                 // Only delete the nickname this fingerprint installed, and only where present.
-                if exec("certutil", &["-L", "-d", &sql, "-n", &name]).is_ok() {
-                    exec("certutil", &["-D", "-d", &sql, "-n", &name])?;
+                // Anything other than an explicit "not found" keeps the trust record for retry.
+                match exec("certutil", &["-L", "-d", &sql, "-n", &name]) {
+                    Ok(_) => {
+                        exec("certutil", &["-D", "-d", &sql, "-n", &name]).with_context(|| {
+                            format!("could not remove Porch CA from {}", db.display())
+                        })?;
+                    }
+                    Err(e) if nss_cert_absent(&e) => {}
+                    Err(e) => {
+                        return Err(e.context(format!(
+                            "could not check {} for the Porch CA; trust record kept for retry",
+                            db.display()
+                        )))
+                    }
                 }
             }
         }
@@ -2486,7 +2495,6 @@ async fn doctor() -> Result<()> {
     );
     for (tool, flag) in [
         ("node", "--version"),
-        ("openssl", "version"),
         ("docker", "--version"),
         ("tailscale", "version"),
         ("ngrok", "version"),
@@ -2503,6 +2511,52 @@ async fn doctor() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ca_fingerprint_matches_openssl_format() {
+        // Pinned against `openssl x509 -noout -fingerprint -sha1` (colons stripped), the
+        // format trust.json records used through 0.3.x.
+        let ca = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/porch-ca.pem"
+        ));
+        assert_eq!(
+            ca_fingerprint(ca).unwrap(),
+            "8B7699335C1F0EDA581E025A5F45400A8BEF9354"
+        );
+        verify_porch_ca(ca).unwrap();
+        let other = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/other-ca.pem"
+        ));
+        assert!(verify_porch_ca(other).is_err());
+        let dir = std::env::temp_dir().join(format!("porch-ca-garbage-{}", std::process::id()));
+        fs::write(&dir, "not a certificate").unwrap();
+        assert!(ca_fingerprint(&dir).is_err());
+        assert!(verify_porch_ca(&dir).is_err());
+        let _ = fs::remove_file(&dir);
+    }
+    #[test]
+    fn nss_absent_only_on_explicit_not_found() {
+        let failed = |stderr: &str| {
+            anyhow::anyhow!("exit status: 255").context(format!("certutil failed: {stderr}"))
+        };
+        assert!(nss_cert_absent(&failed(
+            "certutil: Could not find cert: Porch Local CA ABCDEF012345\n: PR_FILE_NOT_FOUND_ERROR: File not found"
+        )));
+        assert!(nss_cert_absent(&failed(
+            "certutil: could not find certificate named \"Porch Local CA ABCDEF012345\""
+        )));
+        assert!(!nss_cert_absent(&failed(
+            "certutil: function failed: SEC_ERROR_BAD_DATABASE: security library: bad database."
+        )));
+        assert!(!nss_cert_absent(
+            &anyhow::anyhow!("No such file or directory")
+                .context("could not start certutil; install it and ensure it is on PATH")
+        ));
+        assert!(!nss_cert_absent(&anyhow::anyhow!(
+            "certutil timed out after 30000ms"
+        )));
+    }
     #[test]
     fn hosts_preserve_unmanaged() {
         assert_eq!(

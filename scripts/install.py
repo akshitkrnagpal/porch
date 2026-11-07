@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install Porch in user directories with atomic executable replacement.
+r"""Install Porch in user directories with atomic executable replacement.
 
 Run it from an extracted release directory, or point it at a release tarball:
 

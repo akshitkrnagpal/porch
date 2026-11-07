@@ -2193,6 +2193,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha1",
  "sha2",
  "socket2",
  "spake2",
@@ -2203,6 +2204,7 @@ dependencies = [
  "tray-icon",
  "url",
  "windows-sys 0.61.2",
+ "x509-parser",
 ]
 
 [[package]]

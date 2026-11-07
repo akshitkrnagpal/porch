@@ -6,6 +6,12 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
 };
+/// A real "Porch Local CA" certificate; its SHA-1 was computed with `openssl x509 -fingerprint -sha1`.
+const PORCH_CA: &str = include_str!("fixtures/porch-ca.pem");
+const PORCH_CA_SHA1: &str = "8B7699335C1F0EDA581E025A5F45400A8BEF9354";
+fn write_ca(s: &Sandbox) {
+    fs::write(s.dir.join("state/ca.pem"), PORCH_CA).unwrap();
+}
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct Sandbox {
     dir: PathBuf,
@@ -397,10 +403,6 @@ fn trust_install_and_cleanup_use_only_recorded_certificate() {
         ("linux", false),
     ] {
         let s = Sandbox::new();
-        s.fake(
-            "openssl",
-            "print('subject=CN=Porch Local CA' if '-subject' in a else 'sha1 Fingerprint=' + ':'.join(['AB']*20))",
-        );
         for tool in ["security", "update-ca-certificates", "certutil"] {
             s.fake(tool, "");
         }
@@ -408,7 +410,7 @@ fn trust_install_and_cleanup_use_only_recorded_certificate() {
         let profile = s.dir.join("home/.mozilla/firefox/abc.default");
         fs::create_dir_all(&profile).unwrap();
         fs::write(profile.join("cert9.db"), "").unwrap();
-        fs::write(s.dir.join("state/ca.pem"), "fixture certificate").unwrap();
+        write_ca(&s);
         fs::write(s.dir.join("state/ca-key.pem"), "fixture key").unwrap();
         let mut args = vec!["trust"];
         if system {
@@ -436,7 +438,7 @@ fn trust_install_and_cleanup_use_only_recorded_certificate() {
         );
         let log = s.log();
         match (platform, system) {
-            ("linux", true) => assert!(s.dir.join("trust/porch-ABABABABABAB.crt").exists()),
+            ("linux", true) => assert!(s.dir.join("trust/porch-8B7699335C1F.crt").exists()),
             ("macos", true) => assert!(log.contains("/Library/Keychains/System.keychain")),
             ("macos", false) => {
                 let keychain = s.dir.join("home/Library/Keychains/login.keychain-db");
@@ -482,10 +484,9 @@ fn trust_install_and_cleanup_use_only_recorded_certificate() {
 fn user_trust_never_requests_sudo() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let s = Sandbox::new();
-    s.fake("openssl","print('subject=CN=Porch Local CA' if '-subject' in a else 'sha1 Fingerprint=' + ':'.join(['AB']*20))");
     s.fake("security", "");
     s.fake("sudo", "sys.exit(97)");
-    fs::write(s.dir.join("state/ca.pem"), "fixture certificate").unwrap();
+    write_ca(&s);
     // Without PORCH_TRUST_DIR the system scope would elevate; per-user trust must not.
     let out = s
         .cmd()
@@ -571,9 +572,8 @@ else:
 fn failed_trust_removal_retains_ca_for_retry() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let s = Sandbox::new();
-    s.fake("openssl","print('subject=CN=Porch Local CA' if '-subject' in a else 'sha1 Fingerprint=' + ':'.join(['AB']*20))");
     s.fake("security", "\nif 'delete-certificate' in a:sys.exit(2)");
-    fs::write(s.dir.join("state/ca.pem"), "fixture certificate").unwrap();
+    write_ca(&s);
     fs::write(s.dir.join("state/ca-key.pem"), "fixture key").unwrap();
     let out = s
         .cmd()
@@ -698,9 +698,8 @@ fn compose_passthrough_preserves_stdin_output_and_exit_status() {
 fn stalled_external_helper_has_bounded_lifetime() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let s = Sandbox::new();
-    s.fake("openssl","print('subject=CN=Porch Local CA' if '-subject' in a else 'sha1 Fingerprint=' + ':'.join(['AB']*20))");
     s.fake("security","open(os.environ['PORCH_TEST_ROOT']+'/helper-pid','w').write(str(os.getpid()))\ntime.sleep(60)");
-    fs::write(s.dir.join("state/ca.pem"), "fixture").unwrap();
+    write_ca(&s);
     let start = std::time::Instant::now();
     let out = s
         .cmd()
@@ -807,14 +806,7 @@ fn doctor_does_not_call_a_foreign_listener_ready() {
         .unwrap(),
     )
     .unwrap();
-    for name in [
-        "node",
-        "openssl",
-        "docker",
-        "tailscale",
-        "ngrok",
-        "cloudflared",
-    ] {
+    for name in ["node", "docker", "tailscale", "ngrok", "cloudflared"] {
         s.fake(name, "print('fixture version')");
     }
     let listener = std::net::TcpListener::bind(("127.0.0.1", s.port)).unwrap();
@@ -845,20 +837,19 @@ fn doctor_does_not_call_a_foreign_listener_ready() {
 fn trust_records_from_before_scopes_stay_system_wide() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let s = Sandbox::new();
-    s.fake("openssl","print('subject=CN=Porch Local CA' if '-subject' in a else 'sha1 Fingerprint=' + ':'.join(['AB']*20))");
     for tool in ["update-ca-certificates", "certutil"] {
         s.fake(tool, "");
     }
-    fs::write(s.dir.join("state/ca.pem"), "fixture certificate").unwrap();
+    write_ca(&s);
     fs::create_dir_all(s.dir.join("trust")).unwrap();
-    let installed = s.dir.join("trust/porch-ABABABABABAB.crt");
-    fs::write(&installed, "fixture certificate").unwrap();
+    let installed = s.dir.join("trust/porch-8B7699335C1F.crt");
+    fs::write(&installed, PORCH_CA).unwrap();
     // A record written by Porch 0.3.x: no scope, keychain or NSS fields.
     fs::write(
         s.dir.join("state/trust.json"),
         serde_json::to_vec(&serde_json::json!({
             "platform": "linux",
-            "fingerprint": "AB".repeat(20),
+            "fingerprint": PORCH_CA_SHA1,
             "installed": installed,
             "update": "update-ca-certificates",
             "windows": false,
@@ -890,4 +881,133 @@ fn trust_records_from_before_scopes_stay_system_wide() {
     assert!(!installed.exists());
     assert!(s.log().contains("update-ca-certificates"));
     assert!(!s.dir.join("state/trust.json").exists());
+}
+
+/// Seed a per-user Linux trust record covering the shared NSS database.
+fn linux_user_trust(s: &Sandbox) -> PathBuf {
+    write_ca(s);
+    let db = s.dir.join("home/.pki/nssdb");
+    fs::create_dir_all(&db).unwrap();
+    fs::write(
+        s.dir.join("state/trust.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "platform": "linux",
+            "fingerprint": PORCH_CA_SHA1,
+            "installed": null,
+            "update": null,
+            "windows": false,
+            "scope": "user",
+            "nss_dbs": [db],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn linux_user_trust_cleanup_removes_only_when_certutil_is_certain() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let nickname = format!("Porch Local CA {}", &PORCH_CA_SHA1[..12]);
+    // (certutil script, clean succeeds, deletion attempted, stderr fragment)
+    let cases = [
+        ("", true, true, ""),
+        (
+            "\nif '-L' in a:\n print('certutil: Could not find cert: '+a[-1]+'\\n: PR_FILE_NOT_FOUND_ERROR: File not found',file=sys.stderr);sys.exit(255)",
+            true,
+            false,
+            "",
+        ),
+        (
+            "\nprint('certutil: function failed: SEC_ERROR_BAD_DATABASE: security library: bad database.',file=sys.stderr);sys.exit(255)",
+            false,
+            false,
+            "bad database",
+        ),
+        (
+            "\nif '-D' in a:\n print('certutil: could not delete',file=sys.stderr);sys.exit(255)",
+            false,
+            true,
+            "could not remove Porch CA",
+        ),
+    ];
+    for (script, ok, deleted, stderr) in cases {
+        let s = Sandbox::new();
+        s.fake("certutil", script);
+        linux_user_trust(&s);
+        let out = s
+            .cmd()
+            .env("PORCH_TRUST_PLATFORM", "linux")
+            .args(["clean"])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        let log = s.log();
+        assert_eq!(out.status.success(), ok, "{script}: {err}");
+        assert!(log.contains(&nickname), "{log}");
+        assert_eq!(log.contains("\"-D\""), deleted, "{script}: {log}");
+        assert!(err.contains(stderr), "{err}");
+        // The trust record survives every failure so cleanup can be retried.
+        assert_eq!(!s.dir.join("state/trust.json").exists(), ok, "{script}");
+        assert_eq!(!s.dir.join("state/ca.pem").exists(), ok, "{script}");
+    }
+}
+
+#[test]
+fn linux_user_trust_cleanup_without_certutil_keeps_record() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = Sandbox::new();
+    linux_user_trust(&s);
+    // Only the sandbox's empty bin directory: certutil cannot be found.
+    let out = s
+        .cmd()
+        .env("PATH", s.dir.join("bin"))
+        .env("PORCH_TRUST_PLATFORM", "linux")
+        .args(["clean"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("could not start certutil"), "{err}");
+    assert!(s.dir.join("state/trust.json").exists());
+    assert!(s.dir.join("state/ca.pem").exists());
+}
+
+#[test]
+fn trust_needs_no_openssl() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = Sandbox::new();
+    s.fake("openssl", "sys.exit(99)");
+    s.fake("certutil", "");
+    write_ca(&s);
+    let out = s
+        .cmd()
+        .env("PORCH_TRUST_PLATFORM", "windows")
+        .args(["trust"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(s.dir.join("state/trust.json")).unwrap()).unwrap();
+    assert_eq!(record["fingerprint"], PORCH_CA_SHA1);
+    assert!(!s.log().contains("openssl"), "{}", s.log());
+    // A certificate that is not the Porch CA is refused before any trust store change.
+    fs::write(
+        s.dir.join("state/ca.pem"),
+        include_str!("fixtures/other-ca.pem"),
+    )
+    .unwrap();
+    fs::remove_file(s.dir.join("state/trust.json")).unwrap();
+    let out = s
+        .cmd()
+        .env("PORCH_TRUST_PLATFORM", "windows")
+        .args(["trust"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not issued as Porch Local CA"));
 }
