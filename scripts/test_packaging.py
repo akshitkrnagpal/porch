@@ -285,6 +285,37 @@ class PackageTests(unittest.TestCase):
         self.assertIn(f"'{bin_dir};'", hint)
 
 
+class NpmTests(unittest.TestCase):
+    def test_npm_packages_hold_one_platform_binary_each(self):
+        import json
+        npm = load('porch_npm', ROOT / 'scripts/build_npm.py')
+        with tempfile.TemporaryDirectory(prefix='porch-npm-test-') as temporary:
+            root = Path(temporary)
+            dist = root / 'dist'
+            dist.mkdir()
+            for suffix, (target, _, _, exe) in npm.PLATFORMS.items():
+                stage = root / 'stage' / f'porch-1.2.3-{target}'
+                stage.mkdir(parents=True)
+                (stage / exe).write_bytes(f'binary for {suffix}'.encode())
+                (stage / 'README.md').write_text('readme')
+                with tarfile.open(dist / f'porch-1.2.3-{target}.tar.gz', 'w:gz') as tar:
+                    tar.add(stage, arcname=stage.name)
+            out = root / 'out'
+            subprocess.run([sys.executable, str(ROOT / 'scripts/build_npm.py'), '--version', '1.2.3',
+                            '--dist', str(dist), '--output', str(out)], check=True, capture_output=True)
+            launcher = json.loads((out / 'porch-cli/package.json').read_text())
+            self.assertEqual(launcher['version'], '1.2.3')
+            self.assertEqual(launcher['bin'], {'porch': 'bin/porch.js'})
+            self.assertNotIn('scripts', launcher)
+            for suffix, (_, os_name, cpu, exe) in npm.PLATFORMS.items():
+                package = out / f'porch-cli-{suffix}'
+                meta = json.loads((package / 'package.json').read_text())
+                self.assertEqual((meta['os'], meta['cpu']), ([os_name], [cpu]))
+                self.assertEqual(launcher['optionalDependencies'][meta['name']], '1.2.3')
+                self.assertEqual((package / exe).read_text(), f'binary for {suffix}')
+                self.assertNotIn('scripts', meta)
+
+
 class FormulaTests(unittest.TestCase):
     DIGESTS = {target: f'{index:x}' * 64 for index, target in enumerate(formula.TARGETS, 1)}
 

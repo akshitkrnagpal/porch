@@ -389,6 +389,15 @@ impl GitHub {
 // ---------------------------------------------------------------------------
 // Install locations
 
+/// True when `exe` comes from the porch-cli npm packages, which the project's
+/// package manager owns and pins.
+pub fn is_npm_path(exe: &Path) -> bool {
+    exe.components().any(|c| c.as_os_str() == "node_modules")
+        && exe
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with("porch-cli-"))
+}
+
 /// True when `exe` (already canonicalized) lives in a Homebrew Cellar.
 pub fn is_homebrew_path(exe: &Path, prefixes: &[PathBuf]) -> bool {
     if prefixes
@@ -800,6 +809,10 @@ pub async fn run(args: SelfUpdateArgs) -> Result<i32> {
         });
     }
     let exe = current_exe()?;
+    if is_npm_path(&exe) {
+        println!("porch was installed from npm (porch-cli); update it with your package manager, for example:\n  npm install --save-dev porch-cli@latest   (or pnpm up porch-cli, yarn up porch-cli, npm i -g porch-cli@latest)");
+        return Ok(0);
+    }
     if is_homebrew_path(&exe, &homebrew_prefixes()) {
         println!("porch is managed by Homebrew; running: brew upgrade {BREW_FORMULA}");
         if args.dry_run {
@@ -938,6 +951,10 @@ fn truthy(key: &str) -> bool {
 /// Whether this invocation may show a passive notice at all.
 pub fn notice_allowed(args: &[String], stderr_tty: bool) -> bool {
     if !stderr_tty || truthy("PORCH_NO_UPDATE_CHECK") || truthy("CI") {
+        return false;
+    }
+    // A project pins its porch-cli version; the package manager updates it.
+    if std::env::current_exe().is_ok_and(|e| is_npm_path(&e)) {
         return false;
     }
     // `--json` after `--` belongs to a child command, not to porch.
@@ -1160,6 +1177,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn npm_installs_are_detected() {
+        assert!(is_npm_path(Path::new(
+            "/w/app/node_modules/porch-cli-darwin-arm64/porch"
+        )));
+        assert!(is_npm_path(Path::new(
+            "/w/app/node_modules/.pnpm/porch-cli-linux-x64@0.5.0/node_modules/porch-cli-linux-x64/porch"
+        )));
+        assert!(!is_npm_path(Path::new("/home/me/.local/bin/porch")));
+        assert!(!is_npm_path(Path::new("/w/node_modules/other/porch")));
+    }
     #[test]
     fn homebrew_and_source_paths_are_detected() {
         let prefixes = vec![PathBuf::from("/opt/homebrew"), PathBuf::from("/usr/local")];

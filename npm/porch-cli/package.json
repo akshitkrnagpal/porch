@@ -1,0 +1,19 @@
+{
+  "name": "porch-cli",
+  "version": "0.0.0",
+  "description": "Stable named URLs for local dev servers (http://web.localhost), across your machines. Prebuilt Porch binary.",
+  "license": "MIT",
+  "homepage": "https://github.com/akshitkrnagpal/porch",
+  "repository": { "type": "git", "url": "git+https://github.com/akshitkrnagpal/porch.git", "directory": "npm/porch-cli" },
+  "keywords": ["localhost", "dev-server", "proxy", "monorepo", "portless", "https", "turborepo"],
+  "bin": { "porch": "bin/porch.js" },
+  "files": ["bin/porch.js", "README.md"],
+  "engines": { "node": ">=18" },
+  "optionalDependencies": {
+    "porch-cli-darwin-arm64": "0.0.0",
+    "porch-cli-darwin-x64": "0.0.0",
+    "porch-cli-linux-x64": "0.0.0",
+    "porch-cli-linux-arm64": "0.0.0",
+    "porch-cli-win32-x64": "0.0.0"
+  }
+}

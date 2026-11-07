@@ -205,3 +205,43 @@ jobs:
           fi
           git commit -m "porch ${VERSION}"
           git push origin HEAD
+
+  npm:
+    # Publishes porch-cli and its per-platform binary packages with npm
+    # provenance. Skipped until the NPM_TOKEN secret is set.
+    if: github.ref_type == 'tag'
+    needs: [version, release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - if: env.NPM_TOKEN == ''
+        run: echo "::notice::NPM_TOKEN is not set; skipping npm publishing. Build the packages locally with scripts/build_npm.py."
+      - if: env.NPM_TOKEN != ''
+        uses: actions/checkout@v7
+      - if: env.NPM_TOKEN != ''
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - if: env.NPM_TOKEN != ''
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: porch-*
+          merge-multiple: true
+      - if: env.NPM_TOKEN != ''
+        name: Build and publish the npm packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          python3 scripts/build_npm.py --version "$VERSION" --dist dist --output npm-dist
+          # Platform packages first, so the launcher never points at a missing one.
+          for package in npm-dist/porch-cli-*; do
+            npm publish "$package" --provenance --access public
+          done
+          npm publish npm-dist/porch-cli --provenance --access public
