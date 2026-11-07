@@ -399,29 +399,31 @@ mod tests {
             .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
-            // Positive control proves this is policy rejection rather than a broken
-            // listener, root, or leaf profile.
-            for expected in [true, false, true, false] {
-                let (stream, _) = listener.accept().await.unwrap();
-                assert_eq!(acceptor.accept(stream).await.is_ok(), expected);
-            }
-        });
+        // Each handshake runs over its own in-memory pipe. A loopback listener
+        // would accept any connection on its port, and a parallel test probing a
+        // port it freed (and the OS reassigned here) once took the place of the
+        // positive control below.
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
-        let local = tokio::net::TcpStream::connect(address).await.unwrap();
-        let accepted = connector
-            .connect("app.localhost".try_into().unwrap(), local)
-            .await;
-        assert!(accepted.is_ok(), "configured local name must complete TLS");
-        drop(accepted);
-        let foreign = tokio::net::TcpStream::connect(address).await.unwrap();
-        assert!(connector
-            .connect("www.google.com".try_into().unwrap(), foreign)
-            .await
-            .is_err());
+        let handshake = |name: &'static str| {
+            let (acceptor, connector) = (acceptor.clone(), connector.clone());
+            async move {
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (accepted, connected) = tokio::join!(
+                    acceptor.accept(server),
+                    connector.connect(name.try_into().unwrap(), client)
+                );
+                (accepted.is_ok(), connected.is_ok())
+            }
+        };
+        // Positive control proves this is policy rejection rather than a broken
+        // root or leaf profile.
+        assert_eq!(
+            handshake("app.localhost").await,
+            (true, true),
+            "configured local name must complete TLS"
+        );
+        assert_eq!(handshake("www.google.com").await, (false, false));
         fs::write(
             &path,
             serde_json::to_vec(&crate::state::State {
@@ -435,21 +437,13 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let registered = tokio::net::TcpStream::connect(address).await.unwrap();
-        assert!(connector
-            .connect("registered.example.com".try_into().unwrap(), registered)
-            .await
-            .is_ok());
+        assert_eq!(handshake("registered.example.com").await, (true, true));
         fs::remove_file(path).unwrap();
-        let revoked = tokio::net::TcpStream::connect(address).await.unwrap();
-        assert!(
-            connector
-                .connect("registered.example.com".try_into().unwrap(), revoked)
-                .await
-                .is_err(),
+        assert_eq!(
+            handshake("registered.example.com").await,
+            (false, false),
             "cached certificate must not survive route removal"
         );
-        task.await.unwrap();
     }
     #[test]
     fn rejects_invalid_pem() {

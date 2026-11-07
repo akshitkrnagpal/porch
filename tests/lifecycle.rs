@@ -10,13 +10,9 @@ use std::{
     net::{TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::Mutex,
     time::{Duration, Instant},
 };
 
-// The blocked-port fixture occupies the complete allocation pool. Keep this
-// file's other allocation tests out of that fixture's lifetime.
-static SERIAL: Mutex<()> = Mutex::new(());
 struct Sandbox {
     root: PathBuf,
     port: u16,
@@ -49,6 +45,7 @@ impl Sandbox {
             .current_dir(&self.root)
             .env("PORCH_STATE_DIR", self.root.join("state"))
             .env("PORCH_PORT", self.port.to_string())
+            .env("PORCH_APP_PORTS", common::app_ports(self.port))
             .env("PORCH_HTTPS", "0")
             .env("PORCH_PREFIX", "")
             .env("PORCH_SYNC_HOSTS", "0")
@@ -228,7 +225,6 @@ fn wait_dead(pid: u32) {
 
 #[test]
 fn force_reuses_fixed_port_after_delayed_and_ignored_termination() {
-    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     for mode in ["delayed", "ignore"] {
         let sandbox = Sandbox::new();
         sandbox.write_takeover_fixture();
@@ -278,7 +274,6 @@ fn force_reuses_fixed_port_after_delayed_and_ignored_termination() {
 
 #[test]
 fn prune_kills_surviving_grandchild_after_launcher_and_group_leader_exit() {
-    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let sandbox = Sandbox::new();
     fs::write(
         sandbox.root.join("tree.py"),
@@ -297,8 +292,24 @@ else:
     let leader = sandbox.pid_file("leader.pid");
     sandbox.track_group(leader);
     let worker = sandbox.pid_file("worker.pid");
-    // Permit normal background ownership tracking before simulating abrupt loss.
-    std::thread::sleep(Duration::from_millis(500));
+    // Simulate abrupt loss only after the launcher recorded the child it owns;
+    // prune finds the surviving tree through that record.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let state: serde_json::Value = fs::read(sandbox.root.join("state/state.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or_default();
+        let owner = &state["owners"]["tree"];
+        if owner["child"] == leader && owner["child_started"].is_string() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "launcher never recorded its child: {state}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     unsafe {
         libc::kill(sandbox.launcher_pid(launcher) as i32, libc::SIGKILL);
     }
@@ -315,74 +326,51 @@ else:
     assert!(routes["routes"].as_array().unwrap().is_empty());
 }
 
-struct DescriptorLimit(libc::rlimit);
-impl DescriptorLimit {
-    fn raise() -> Self {
-        let mut old = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut old) }, 0);
-        if old.rlim_cur < 1500 {
-            let new = libc::rlimit {
-                rlim_cur: old.rlim_max.min(4096),
-                rlim_max: old.rlim_max,
-            };
-            assert!(
-                new.rlim_cur >= 1500,
-                "blocked-port fixture needs1500 descriptors"
-            );
-            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &new) }, 0);
-        }
-        Self(old)
-    }
-}
-impl Drop for DescriptorLimit {
-    fn drop(&mut self) {
-        unsafe {
-            libc::setrlimit(libc::RLIMIT_NOFILE, &self.0);
-        }
-    }
-}
 #[test]
 fn automatic_allocator_refuses_blocked_ports_when_the_safe_pool_is_full() {
-    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-    let _limit = DescriptorLimit::raise();
     let sandbox = Sandbox::new();
-    let mut held = vec![];
-    for port in 4000..5000 {
-        if [4045, 4190].contains(&port) {
-            continue;
-        }
-        match TcpListener::bind(("127.0.0.1", port)) {
-            Ok(listener) => held.push(listener),
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
-            Err(error) => panic!("cannot occupy fixture port {port}: {error}"),
-        }
-    }
-    let output = sandbox.run(&[
-        "blocked",
-        "python3",
-        "-c",
-        "open('spawned','w').write('unexpected')",
-    ]);
-    assert!(
-        !output.status.success(),
-        "allocated a framework-blocked port: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    assert!(
-        !sandbox.root.join("spawned").exists(),
-        "child started on a blocked app port"
-    );
+    let refused = |range: &str, why: &str| {
+        let output = sandbox
+            .command(&[
+                "blocked",
+                "python3",
+                "-c",
+                "open('spawned','w').write('unexpected')",
+            ])
+            .env("PORCH_APP_PORTS", range)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{why}: {stderr}");
+        assert!(
+            stderr.contains(&format!("all app ports {range} are occupied")),
+            "{why}: {stderr}"
+        );
+        assert!(
+            !sandbox.root.join("spawned").exists(),
+            "{why}: child started"
+        );
+    };
+    // Pools whose only ports are framework-blocked are full, not usable.
+    refused("4045-4045", "allocated framework-blocked port 4045");
+    refused("4190-4190", "allocated framework-blocked port 4190");
+    // Every port of the sandbox's private pool is occupied.
+    let pool = common::app_ports(sandbox.port);
+    let (first, last) = pool.split_once('-').unwrap();
+    let held: Vec<_> = (first.parse::<u16>().unwrap()..=last.parse().unwrap())
+        .map(|port| TcpListener::bind(("127.0.0.1", port)).unwrap())
+        .collect();
+    refused(&pool, "allocated an occupied port");
     drop(held);
 }
 
 #[test]
 fn dead_routes_do_not_consume_free_app_port_reservations() {
-    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let sandbox = Sandbox::new();
-    let dead:Vec<_>=(4000..5000).map(|port|serde_json::json!({"name":format!("dead-{port}"),"target":format!("http://127.0.0.1:{port}"),"pid":2_000_000_000u32})).collect();
+    let pool = common::app_ports(sandbox.port);
+    let (first, last) = pool.split_once('-').unwrap();
+    let pool = first.parse::<u16>().unwrap()..=last.parse::<u16>().unwrap();
+    let dead:Vec<_>=pool.clone().map(|port|serde_json::json!({"name":format!("dead-{port}"),"target":format!("http://127.0.0.1:{port}"),"pid":2_000_000_000u32})).collect();
     fs::write(
         sandbox.root.join("state/state.json"),
         serde_json::to_vec(&serde_json::json!({"routes":dead})).unwrap(),
@@ -399,13 +387,11 @@ fn dead_routes_do_not_consume_free_app_port_reservations() {
         .trim()
         .parse()
         .unwrap();
-    assert!((4000..5000).contains(&port));
-    assert!(![4045, 4190].contains(&port));
+    assert!(pool.contains(&port), "{port} outside {pool:?}");
 }
 
 #[test]
 fn removing_one_tld_from_an_unscoped_alias_preserves_the_other_domain() {
-    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let sandbox = Sandbox::new();
     sandbox.ok(&["proxy", "start", "--no-tls", "--tld", "localhost,test"]);
     // Unreachable upstream makes502 prove a route still exists without a separate fixture server.

@@ -482,8 +482,25 @@ with context.wrap_socket(socket.create_connection(('127.0.0.1',int(sys.argv[2]))
     proxy.abort();
     let _ = proxy.await;
     // Numeric loopback aliases still reach IPv6-only application listeners.
-    let v6 = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
-    let v6port = v6.local_addr().unwrap().port();
+    // The IPv4 side of the port stays bound but never listens, so the proxy's
+    // 127.0.0.1 attempt is refused rather than reaching another process that
+    // happens to listen on the same port number over IPv4.
+    let (v6, v6port, _v4_refused) = loop {
+        let v6 = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let port = v6.local_addr().unwrap().port();
+        let v4 = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        if v4
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
+            .is_ok()
+        {
+            break (v6, port, v4);
+        }
+    };
     let v6server = tokio::spawn(async move {
         axum::serve(
             v6,

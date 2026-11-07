@@ -19,3 +19,11 @@ pub mod win_net;
 pub mod discovery;
 #[cfg(feature = "tray")]
 pub mod tray;
+
+// Unit tests share the integration tests' port helpers, which name this crate
+// `porch`.
+#[cfg(test)]
+extern crate self as porch;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_ports;

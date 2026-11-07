@@ -35,6 +35,7 @@ impl Sandbox {
             .current_dir(&self.root)
             .env("PORCH_STATE_DIR", self.root.join("state"))
             .env("PORCH_PORT", self.port.to_string())
+            .env("PORCH_APP_PORTS", common::app_ports(self.port))
             .env("PORCH_HTTPS", "0")
             .env("PORCH_SYNC_HOSTS", "0")
             .env("PORCH_SKIP_TRUST", "1")
@@ -544,8 +545,7 @@ fn proxy_recovers_after_accept_fd_exhaustion() {
     let script = r#"
 import os,resource,socket,subprocess,sys,tempfile,time
 with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
- with socket.socket() as s:
-  s.bind(('127.0.0.1',0));port=s.getsockname()[1]
+ port=int(sys.argv[2])
  env=os.environ.copy();env.update(PORCH_STATE_DIR=root,PORCH_SYNC_HOSTS='0',PORCH_SKIP_TRUST='1')
  def limit():resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
  with open(root+'/log','w+') as log:
@@ -560,7 +560,14 @@ with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
    for i in range(110):
     c=socket.create_connection(('127.0.0.1',port),timeout=2)
     c.sendall(b'GET / HTTP/1.1\r\n');sockets.append(c)
-   time.sleep(.3)
+   # Hold every connection until the daemon has run out of descriptors.
+   deadline=time.monotonic()+10
+   while True:
+    # A separate handle: seeking `log` would move the daemon's write offset.
+    if 'accept failed' in open(root+'/log').read():break
+    assert child.poll() is None,'accept error terminated daemon'
+    assert time.monotonic()<deadline,'fixture failed to exhaust accept descriptors'
+    time.sleep(.02)
    for c in sockets:c.close()
    sockets=[]
    assert child.poll() is None,'accept error terminated daemon'
@@ -573,7 +580,6 @@ with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
       if b'404' in reply:break
     except (OSError,TimeoutError):pass
     assert time.monotonic()<deadline,'listener did not recover after freeing descriptors'
-   log.flush();log.seek(0);assert 'accept failed' in log.read(),'fixture failed to exhaust accept descriptors'
   finally:
    for c in sockets:c.close()
    if child.poll() is None:child.terminate()
@@ -581,7 +587,14 @@ with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
    except subprocess.TimeoutExpired:child.kill();child.wait()
 "#;
     let out = Command::new("python3")
-        .args(["-c", script, env!("CARGO_BIN_EXE_porch")])
+        .args([
+            "-c",
+            script,
+            env!("CARGO_BIN_EXE_porch"),
+            // A private port: one freed by Python could be reassigned before
+            // the daemon binds it.
+            &common::free_port().to_string(),
+        ])
         .output()
         .unwrap();
     assert!(

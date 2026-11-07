@@ -52,6 +52,7 @@ impl Sandbox {
             .env("PORCH_HOSTS_FILE", self.dir.join("hosts"))
             .env("PORCH_SYNC_HOSTS", "0")
             .env("PORCH_PORT", self.port.to_string())
+            .env("PORCH_APP_PORTS", common::app_ports(self.port))
             .env("PORCH_HTTPS", "0")
             .env("PORCH_SERVICE_FILE", self.dir.join("service"))
             .env("PORCH_TRUST_DIR", self.dir.join("trust"))
@@ -82,6 +83,16 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         let _ = self.cmd().args(["proxy", "stop"]).output();
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+/// Wait until `pid` no longer exists. A killed process that Porch did not reap
+/// stays a zombie, which still answers `kill(pid, 0)`, until its new parent
+/// (init) reaps it after Porch exits.
+fn wait_gone(pid: i32, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(std::time::Instant::now() < deadline, "{what}: pid {pid}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 fn state(root: &Path) -> serde_json::Value {
@@ -375,7 +386,7 @@ else:
     }
     let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(143));
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Porch removes the Tailscale registration before it exits.
     assert!(s
         .log()
         .contains("\"serve\", \"--yes\", \"--https=8443\", \"off\""));
@@ -384,11 +395,7 @@ else:
             .unwrap()
             .parse()
             .unwrap();
-        assert_ne!(
-            unsafe { libc::kill(pid, 0) },
-            0,
-            "owned tunnel survived Drop"
-        );
+        wait_gone(pid, "owned tunnel survived Drop");
     }
 }
 
@@ -531,7 +538,10 @@ else:
   sys.exit(2)
  print('started tunnel url=https://demo.ngrok.app',flush=True)
  print('https://demo.trycloudflare.com Registered tunnel connection',flush=True)
- time.sleep(0.5)
+ # Fail only once the app runs, however long Porch takes to start it.
+ app=os.environ['PORCH_TEST_ROOT']+'/app-pid'
+ deadline=time.monotonic()+30
+ while not os.path.exists(app) and time.monotonic()<deadline:time.sleep(0.02)
  sys.exit(9)
 "#,
             );
@@ -565,7 +575,7 @@ else:
                     .unwrap()
                     .parse()
                     .unwrap();
-                assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+                wait_gone(pid, "app of a failed tunnel");
                 let env: serde_json::Value =
                     serde_json::from_slice(&fs::read(s.dir.join("app-env")).unwrap()).unwrap();
                 assert!(env[format!("PORTLESS_{}_URL", provider.to_uppercase())]

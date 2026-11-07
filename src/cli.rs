@@ -1487,6 +1487,38 @@ impl Drop for Lease {
         });
     }
 }
+/// Default range for automatically assigned app ports.
+const APP_PORTS: (u16, u16) = (4000, 4999);
+/// Ports browsers refuse to fetch (lockd, sieve); never assigned automatically.
+const BROWSER_BLOCKED_PORTS: [u16; 2] = [4045, 4190];
+/// The inclusive range automatic app ports come from: `PORCH_APP_PORTS=START-END`,
+/// or 4000-4999.
+fn app_port_range() -> Result<(u16, u16)> {
+    parse_app_ports(state::env("APP_PORTS").as_deref())
+}
+fn parse_app_ports(value: Option<&str>) -> Result<(u16, u16)> {
+    let Some(value) = value else {
+        return Ok(APP_PORTS);
+    };
+    let parsed = value.trim().split_once('-').and_then(|(a, b)| {
+        let (a, b) = (a.trim().parse::<u16>().ok()?, b.trim().parse::<u16>().ok()?);
+        (crate::ports::FIRST_UNPRIVILEGED_PORT <= a && a <= b).then_some((a, b))
+    });
+    parsed.with_context(|| {
+        format!(
+            "PORCH_APP_PORTS must be START-END with 1024 <= START <= END <= 65535, not {value:?}"
+        )
+    })
+}
+/// Every assignable port in `range`, starting at a random one so concurrent
+/// launches from different state directories rarely probe the same port first.
+fn app_port_candidates((first, last): (u16, u16)) -> Result<impl Iterator<Item = u16>> {
+    let len = u32::from(last - first) + 1;
+    let start = getrandom::u32().map_err(|e| anyhow::anyhow!("secure random: {e}"))? % len;
+    Ok((0..len)
+        .map(move |i| first + ((start + i) % len) as u16)
+        .filter(|p| !BROWSER_BLOCKED_PORTS.contains(p) && *p != crate::ports::DISCOVERY_PORT))
+}
 fn reserve(
     plan: &crate::config::LaunchPlan,
     requested: Option<u16>,
@@ -1518,26 +1550,25 @@ fn reserve(
             }
             crate::sockets::reserve(port).with_context(|| format!("app port {port} unavailable"))?
         } else {
-            let start = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .subsec_nanos() as u16
-                % 1000;
+            let range = app_port_range()?;
             let mut last_error = None;
-            (0..1000)
-                .map(|i| 4000 + (start + i) % 1000)
-                .filter(|p| !used.contains(p) && ![4045, 4190].contains(p))
+            app_port_candidates(range)?
+                .filter(|p| !used.contains(p))
                 .find_map(|p| {
                     crate::sockets::reserve(p)
                         .map_err(|e| last_error = Some(e))
                         .ok()
                 })
-                .with_context(|| match last_error {
-                    // Name the cause when binding failed for another reason
-                    // (for example, out of file descriptors).
-                    Some(e) if e.kind() != std::io::ErrorKind::AddrInUse => {
-                        format!("no app port in 4000-4999 could be reserved: {e}")
+                .with_context(|| {
+                    let (first, last) = range;
+                    match last_error {
+                        // Name the cause when binding failed for another reason
+                        // (for example, out of file descriptors).
+                        Some(e) if e.kind() != std::io::ErrorKind::AddrInUse => {
+                            format!("no app port in {first}-{last} could be reserved: {e}")
+                        }
+                        _ => format!("all app ports {first}-{last} are occupied"),
                     }
-                    _ => "all app ports 4000-4999 are occupied".to_owned(),
                 })?
         };
         let port = listener.port()?;
@@ -2277,6 +2308,49 @@ with tempfile.TemporaryDirectory(prefix='porch-sudo-') as root:
             out.status.success(),
             "{}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[cfg(test)]
+mod app_port_tests {
+    use super::*;
+    #[test]
+    fn app_port_range_defaults_and_validates() {
+        assert_eq!(parse_app_ports(None).unwrap(), (4000, 4999));
+        assert_eq!(
+            parse_app_ports(Some(" 20000 - 20031 ")).unwrap(),
+            (20000, 20031)
+        );
+        assert_eq!(parse_app_ports(Some("5000-5000")).unwrap(), (5000, 5000));
+        for bad in [
+            "",
+            "5000",
+            "5000-4999",
+            "80-90",
+            "5000-70000",
+            "a-b",
+            "-5000",
+        ] {
+            assert!(parse_app_ports(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
+    #[test]
+    fn app_port_candidates_cover_the_range_once_without_blocked_ports() {
+        let mut ports: Vec<u16> = app_port_candidates((4000, 4999)).unwrap().collect();
+        assert_eq!(ports.len(), 998);
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), 998);
+        assert!(!ports.contains(&4045) && !ports.contains(&4190));
+        let narrow: Vec<u16> = app_port_candidates((7460, 7464)).unwrap().collect();
+        assert_eq!(narrow.len(), 4);
+        assert!(!narrow.contains(&crate::ports::DISCOVERY_PORT));
+        assert_eq!(
+            app_port_candidates((65535, 65535))
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![65535]
         );
     }
 }

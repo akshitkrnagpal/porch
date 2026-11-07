@@ -19,10 +19,16 @@ import time
 BINARY = str(pathlib.Path(sys.argv[1]).resolve())
 
 
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1', 0))
-        return sock.getsockname()[1]
+# Private port slots claimed by tests/pty.rs (see tests/common/mod.rs), one per
+# Fixture. Ephemeral ports would be released before Porch binds them, and a
+# concurrent test could take them in between.
+SLOTS = [int(port) for port in os.environ.get('PORCH_TEST_SLOTS', '').split(',') if port]
+SLOT_SIZE, APP_OFFSET = 256, 224
+
+
+def claim_slot():
+    assert SLOTS, 'more fixtures than PORCH_TEST_SLOTS; raise FIXTURES in tests/pty.rs'
+    return SLOTS.pop(0)
 
 
 def alive(pid):
@@ -39,8 +45,10 @@ class Fixture:
         for name in list(self.env):
             if name.startswith(('PORCH_', 'PORTLESS_')) or name in ('PORCH', 'PORTLESS'):
                 self.env.pop(name)
+        slot = claim_slot()
         self.env.update(PORCH_STATE_DIR=str(self.root / 'state'),
-                        PORCH_PORT=str(free_port()), PORCH_HTTPS='0',
+                        PORCH_PORT=str(slot), PORCH_HTTPS='0',
+                        PORCH_APP_PORTS=f'{slot + APP_OFFSET}-{slot + SLOT_SIZE - 1}',
                         PORCH_SYNC_HOSTS='0', PORCH_SKIP_TRUST='1',
                         PORCH_PREFIX='', TERM='xterm-256color')
         self.pid = None

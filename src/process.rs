@@ -551,45 +551,37 @@ mod tests {
 
     #[tokio::test]
     async fn discovers_python_tcp_listener_for_state_user() {
-        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = reserve.local_addr().unwrap().port();
-        drop(reserve);
+        // Python picks its own port and reports it only once it is listening.
+        // Reserving a port, freeing it and probing it with connect() was racy:
+        // under parallel tests the OS reassigned the freed port, so the probe
+        // reached (and disturbed) another test's listener while Python's bind
+        // failed or came later, and the lookup saw no Python listener.
         let mut command = Command::new("python3");
         command
             .args([
                 "-c",
-                "import socket,sys,time; s=socket.socket(); s.bind(('127.0.0.1',int(sys.argv[1]))); s.listen(); time.sleep(60)",
-                &port.to_string(),
+                "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); print(s.getsockname()[1],flush=True); time.sleep(60)",
             ])
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         configure(&mut command);
         let mut child = command.spawn().unwrap();
         let pid = child.id().unwrap();
         let guard = TreeGuard::new(&child).unwrap();
-        let ready = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    return Err(format!("Python exited: {status}"));
-                }
-                if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                    .await
-                    .is_ok()
-                {
-                    return Ok(());
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            Duration::from_secs(30),
+            BufReader::new(child.stdout.take().unwrap()).read_line(&mut line),
+        )
         .await;
-        if !matches!(ready, Ok(Ok(()))) {
+        let Ok(port) = line.trim().parse::<u16>() else {
             drop(guard);
             let output = child.wait_with_output().await.unwrap();
             panic!(
-                "Python TCP listener failed to bind: {ready:?}; stderr: {}",
+                "Python TCP listener did not report its port: {read:?} {line:?}; stderr: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-        }
+        };
         assert_eq!(listening_process(port), Some(pid));
         drop(guard);
         child.wait().await.unwrap();

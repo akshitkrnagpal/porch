@@ -11,6 +11,8 @@ use std::{
 
 struct Sandbox {
     root: PathBuf,
+    /// Slot whose top Porch assigns app ports from (see `common::app_ports`).
+    apps: u16,
 }
 impl Sandbox {
     fn new() -> Self {
@@ -22,7 +24,10 @@ impl Sandbox {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("state")).unwrap();
-        Self { root }
+        Self {
+            root,
+            apps: common::free_port(),
+        }
     }
     /// A command without PORCH_PORT, so saved settings decide the port.
     fn command(&self, args: &[&str]) -> Command {
@@ -33,6 +38,7 @@ impl Sandbox {
             .env_remove("PORTLESS_PORT")
             .env_remove("PORCH_HTTPS")
             .env("PORCH_STATE_DIR", self.root.join("state"))
+            .env("PORCH_APP_PORTS", common::app_ports(self.apps))
             .env("PORCH_SYNC_HOSTS", "0")
             .env("PORCH_SKIP_TRUST", "1")
             .env("CI", "1")
@@ -100,46 +106,22 @@ fn quiet_port() -> u16 {
     // Tests here occupy a few ports above it, so those must be free too.
     loop {
         let p = common::free_port();
-        if (p..p + 6).all(|q| q != 7462 && q != 7463 && porch::ports::available(q)) {
+        if common::bindable(&(p..p + 6).collect::<Vec<_>>()) {
             return p;
         }
     }
 }
-fn try_hold(port: u16) -> std::io::Result<socket2::Socket> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-    socket.set_reuse_address(true)?;
-    let addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
-    socket.bind(&addr.into())?;
-    socket.listen(16)?;
-    Ok(socket)
+/// Occupy a specific port on every interface like a real server does
+/// (`SO_REUSEADDR`), from a child process that owns the listener.
+fn hold(port: u16) -> common::ChildListener {
+    common::ChildListener::bind("0.0.0.0", port, true)
+        .unwrap_or_else(|e| panic!("cannot hold port {port}: {e}"))
+        .0
 }
-/// Occupy a specific port like a real server does, retrying briefly while
-/// parallel tests probe nearby ports.
-fn hold(port: u16) -> socket2::Socket {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match try_hold(port) {
-            Ok(s) => return s,
-            Err(e) if Instant::now() < deadline => {
-                let _ = e;
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => panic!("cannot hold port {port}: {e}"),
-        }
-    }
-}
-/// A quiet port, already occupied by this test process.
-fn held_port() -> (u16, socket2::Socket) {
-    loop {
-        let port = quiet_port();
-        if let Ok(s) = try_hold(port) {
-            return (port, s);
-        }
-    }
+/// A quiet port, already occupied by a process this test owns.
+fn held_port() -> (u16, common::ChildListener) {
+    let port = quiet_port();
+    (port, hold(port))
 }
 
 #[test]
@@ -168,13 +150,12 @@ fn high_port_implies_no_hosts_sync_even_for_legacy_settings() {
 #[test]
 fn busy_saved_port_moves_to_next_free_port_and_names_owner() {
     let s = Sandbox::new();
-    let (port, _held) = held_port();
+    let (port, held) = held_port();
     s.save_port(port, serde_json::json!({}));
     let (_, err) = s.ok(&["proxy", "start"]);
     assert!(err.contains(&format!("Port {port} is used by")), "{err}");
-    // The owner is this test process.
-    let me = std::process::id().to_string();
-    assert!(err.contains(&format!("pid {me}")), "{err}");
+    // The owner is the process holding the port.
+    assert!(err.contains(&format!("pid {}", held.pid())), "{err}");
     let moved = s.settings()["port"].as_u64().unwrap() as u16;
     assert_ne!(moved, port);
     assert_ne!(moved, 7463);
@@ -184,39 +165,46 @@ fn busy_saved_port_moves_to_next_free_port_and_names_owner() {
 #[test]
 fn explicit_busy_port_fails_with_owner_and_command() {
     let s = Sandbox::new();
-    let (port, _held) = held_port();
+    let (port, held) = held_port();
     let o = s.run(&["proxy", "start", "--port", &port.to_string()]);
     assert!(!o.status.success());
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("unavailable"), "{err}");
-    assert!(
-        err.contains(&format!("pid {}", std::process::id())),
-        "{err}"
-    );
+    assert!(err.contains(&format!("pid {}", held.pid())), "{err}");
     assert!(err.contains("`porch proxy start --port "), "{err}");
     assert!(!s.root.join("state/proxy.ready").exists());
 }
 
 #[test]
 fn app_that_ignores_port_produces_listen_warning() {
-    use std::io::BufRead;
+    use std::{io::BufRead, os::fd::AsRawFd, os::unix::process::CommandExt};
     let s = Sandbox::new();
     s.save_port(quiet_port(), serde_json::json!({}));
+    // A separately started proxy does not inherit the app's listener below.
+    s.ok(&["proxy", "start"]);
+    // The app's wrong-port listener exists before Porch's listen timer starts:
+    // it is created here and inherited by Porch and then the app, so the
+    // diagnosis never races the app's startup. The app stays up until the
+    // warning is observed. Only this test's Porch child may inherit it.
     let other = quiet_port();
-    // The app stays up until the warning is observed; its lifetime must not
-    // race the diagnosis, which inspects the app's listeners after the timeout.
-    std::fs::write(
-        s.root.join("wrong.py"),
-        format!("import socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',{other}))\ns.listen()\ntime.sleep(60)\n"),
-    )
-    .unwrap();
-    let mut porch = s
-        .command(&["wrong", "python3", "wrong.py"])
+    let listener = std::net::TcpListener::bind(("127.0.0.1", other)).unwrap();
+    let fd = listener.as_raw_fd();
+    let mut command = s.command(&["wrong", "python3", "-c", "import time;time.sleep(60)"]);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut porch = command
         .env("PORCH_LISTEN_TIMEOUT", "1.5")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    drop(listener);
     let (lines, received) = std::sync::mpsc::channel();
     let stderr = porch.stderr.take().unwrap();
     std::thread::spawn(move || {
@@ -257,16 +245,20 @@ fn app_that_ignores_port_produces_listen_warning() {
 fn listen_check_is_silent_for_correct_apps_and_can_be_disabled() {
     let s = Sandbox::new();
     s.save_port(quiet_port(), serde_json::json!({}));
+    // The app exits once Porch's listen check has connected, so the check's
+    // outcome never depends on how long the app or the check takes to start.
+    // The deadline only bounds a broken check; a passing run never waits it out.
     std::fs::write(
         s.root.join("good.py"),
-        "import os,socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',int(os.environ['PORT'])))\ns.listen()\ntime.sleep(2.5)\n",
+        "import os,socket\ns=socket.socket()\ns.bind(('127.0.0.1',int(os.environ['PORT'])))\ns.listen()\ns.accept()\n",
     )
     .unwrap();
     let o = s
         .command(&["good", "python3", "good.py"])
-        .env("PORCH_LISTEN_TIMEOUT", "2")
+        .env("PORCH_LISTEN_TIMEOUT", "60")
         .output()
         .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(!String::from_utf8_lossy(&o.stderr).contains("nothing is listening"));
     let o = s
         .command(&["off", "python3", "-c", "import time;time.sleep(1.5)"])
