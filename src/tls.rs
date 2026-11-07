@@ -32,9 +32,9 @@ fn write_private(path: &Path, value: &str) -> Result<()> {
     Ok(())
 }
 fn certified(cert: &str, key: &str) -> Result<Arc<CertifiedKey>> {
-    let chain = rustls_pemfile::certs(&mut BufReader::new(cert.as_bytes()))
+    let chain = crate::pem::certs(&mut BufReader::new(cert.as_bytes()))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key.as_bytes()))?
+    let key = crate::pem::private_key(&mut BufReader::new(key.as_bytes()))?
         .context("No private key in PEM")?;
     let provider = rustls::crypto::ring::default_provider();
     Ok(Arc::new(CertifiedKey::from_der(chain, key, &provider)?))
@@ -507,7 +507,7 @@ mod tests {
         ));
         resolver.route_state = path.clone();
         let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut BufReader::new(resolver.ca_pem.as_bytes())) {
+        for cert in crate::pem::certs(&mut BufReader::new(resolver.ca_pem.as_bytes())) {
             roots.add(cert.unwrap()).unwrap();
         }
         let provider = Arc::new(rustls::crypto::ring::default_provider());

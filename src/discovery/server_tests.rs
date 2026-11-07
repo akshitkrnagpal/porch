@@ -260,7 +260,7 @@ async fn fixture(label: &'static str) -> Fixture {
     ensure_certificate(&dir, "127.0.0.1").unwrap();
     let cert = cert_der(&dir).unwrap().remove(0);
     let bytes = fs::read(dir.join("discovery-key.pem")).unwrap();
-    let key = rustls_pemfile::private_key(&mut bytes.as_slice())
+    let key = crate::pem::private_key(&mut bytes.as_slice())
         .unwrap()
         .unwrap();
     let tls = rustls::ServerConfig::builder_with_provider(Arc::new(

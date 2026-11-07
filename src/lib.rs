@@ -4,6 +4,7 @@ pub mod doctor;
 pub mod health;
 pub mod integrations;
 pub mod mcp;
+pub mod pem;
 pub mod ports;
 pub mod process;
 pub mod proxy;

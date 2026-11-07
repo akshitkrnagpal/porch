@@ -394,7 +394,7 @@ fn ensure_certificate(dir: &Path, bind: &str) -> Result<()> {
 }
 fn cert_der(dir: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let bytes = fs::read(dir.join("discovery-cert.pem"))?;
-    Ok(rustls_pemfile::certs(&mut bytes.as_slice()).collect::<std::io::Result<_>>()?)
+    Ok(crate::pem::certs(&mut bytes.as_slice()).collect::<std::io::Result<_>>()?)
 }
 pub fn fingerprint() -> Result<String> {
     let bind = config()?
@@ -1466,7 +1466,7 @@ fn upstream(dir: &Path) -> Result<Upstream> {
         let _ = roots.add(cert);
     }
     if let Ok(bytes) = fs::read(dir.join("ca.pem")) {
-        for cert in rustls_pemfile::certs(&mut bytes.as_slice()).flatten() {
+        for cert in crate::pem::certs(&mut bytes.as_slice()).flatten() {
             let _ = roots.add(cert);
         }
     }
@@ -1522,8 +1522,7 @@ pub async fn serve() -> Result<()> {
     ensure_certificate(&dir, &config.bind)?;
     let certificates = cert_der(&dir)?;
     let bytes = fs::read(dir.join("discovery-key.pem"))?;
-    let key =
-        rustls_pemfile::private_key(&mut bytes.as_slice())?.context("missing discovery key")?;
+    let key = crate::pem::private_key(&mut bytes.as_slice())?.context("missing discovery key")?;
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))

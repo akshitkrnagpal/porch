@@ -894,7 +894,7 @@ fn trust_platform() -> String {
 /// DER of the first certificate in a PEM file, the same one `openssl x509 -in` reads.
 fn ca_der(ca: &Path) -> Result<Vec<u8>> {
     let pem = fs::read(ca).with_context(|| format!("could not read {}", ca.display()))?;
-    let der = rustls_pemfile::certs(&mut std::io::BufReader::new(pem.as_slice()))
+    let der = crate::pem::certs(&mut std::io::BufReader::new(pem.as_slice()))
         .next()
         .with_context(|| format!("no PEM certificate in {}", ca.display()))?
         .with_context(|| format!("invalid PEM certificate in {}", ca.display()))?;

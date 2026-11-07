@@ -332,7 +332,7 @@ pub fn find_workspace_root(cwd: &Path) -> Option<PathBuf> {
 }
 fn workspace_patterns(dir: &Path) -> Option<Vec<String>> {
     if let Ok(raw) = fs::read_to_string(dir.join("pnpm-workspace.yaml")) {
-        let v: serde_yaml::Value = serde_yaml::from_str(&raw).ok()?;
+        let v: serde_norway::Value = serde_norway::from_str(&raw).ok()?;
         return Some(
             v.get("packages")?
                 .as_sequence()?

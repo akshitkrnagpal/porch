@@ -24,7 +24,7 @@ async fn ready(port: u16) {
 fn tls_client(dir: &std::path::Path, h2: bool) -> Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     let raw = std::fs::read(dir.join("ca.pem")).unwrap();
-    for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(raw.as_slice())) {
+    for cert in porch::pem::certs(&mut std::io::BufReader::new(raw.as_slice())) {
         roots.add(cert.unwrap()).unwrap();
     }
     let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(

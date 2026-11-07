@@ -1115,7 +1115,7 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
         let _ = roots.add(cert);
     }
     if let Ok(ca) = std::fs::read(crate::state::dir().join("ca.pem")) {
-        for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(ca.as_slice())).flatten() {
+        for cert in crate::pem::certs(&mut std::io::BufReader::new(ca.as_slice())).flatten() {
             let _ = roots.add(cert);
         }
     }
