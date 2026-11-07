@@ -561,6 +561,18 @@ enum Update {
         flips: usize,
         error: Option<String>,
     },
+    /// The browser launcher failed for the direct open started by menu click
+    /// number `click`. Shown only if nothing was clicked since.
+    OpenFailed {
+        click: u64,
+        error: String,
+    },
+}
+/// Whether a direct open's late failure is still news: only if no click came
+/// after the one that started it. A launcher that fails slowly must not
+/// replace the answer to a newer click, such as a pairing code.
+fn still_latest(open_click: u64, latest_click: u64) -> bool {
+    open_click == latest_click
 }
 /// Opens a URL in the browser; `crate::discovery::open_url` outside tests.
 type Opener = fn(&str) -> Result<()>;
@@ -569,16 +581,22 @@ type Opener = fn(&str) -> Result<()>;
 /// neither the menu nor queued CLI work. Everything else, including relay apps
 /// that have no URL until `porch open` starts the relay, queues for the CLI
 /// worker.
-fn dispatch(action: Action, commands: &Sender<Action>, notices: &Sender<Update>, opener: Opener) {
+/// `click` numbers this click, so a late failure can be told from newer news.
+fn dispatch(
+    action: Action,
+    click: u64,
+    commands: &Sender<Action>,
+    notices: &Sender<Update>,
+    opener: Opener,
+) {
     if let Action::Open { url: Some(url), .. } = &action {
         if let Some(url) = direct_url(url) {
             let notices = notices.clone();
-            // Success needs no message: the browser is the message. Staying
-            // quiet also keeps a late launcher from replacing a newer notice,
-            // such as a pairing code.
+            // Success needs no message: the browser is the message.
             std::thread::spawn(move || {
                 if let Err(error) = opener(&url) {
-                    let _ = notices.send(Update::Notice(format!("{error:#}")));
+                    let error = format!("{error:#}");
+                    let _ = notices.send(Update::OpenFailed { click, error });
                 }
             });
             return;
@@ -818,6 +836,8 @@ mod native {
         /// that state instead of whatever an older catalog says.
         pending: usize,
         wanted: bool,
+        /// Menu clicks so far, numbering each for `still_latest`.
+        clicks: u64,
         /// Rows below the header changed while the menu was open; redraw them
         /// once it closes.
         stale: bool,
@@ -1184,6 +1204,7 @@ mod native {
                 notice: None,
                 pending: 0,
                 wanted: false,
+                clicks: 0,
                 stale: false,
             })
         }
@@ -1205,6 +1226,11 @@ mod native {
                     }
                     Update::Snapshot(Err(error)) => self.error = Some(error),
                     Update::Notice(notice) => self.notice = Some(notice),
+                    Update::OpenFailed { click, error } => {
+                        if still_latest(click, self.clicks) {
+                            self.notice = Some(error);
+                        }
+                    }
                     Update::ProxyDone { flips, error } => {
                         self.pending = self.pending.saturating_sub(flips);
                         // Success needs no message: the switch is the message.
@@ -1282,6 +1308,7 @@ mod native {
                 }
             }
             while let Ok(event) = MenuEvent::receiver().try_recv() {
+                self.clicks += 1;
                 if let Some(toggle) = self.toggles.get(&event.id.0) {
                     // The control has already flipped itself. Ask for the state it
                     // now shows, not the action captured when the menu was drawn,
@@ -1301,6 +1328,7 @@ mod native {
                     }
                     dispatch(
                         action.clone(),
+                        self.clicks,
                         commands,
                         notices,
                         crate::discovery::open_url,
@@ -1931,6 +1959,7 @@ mod tests {
                 let (notices, notice_rx) = mpsc::channel();
                 dispatch(
                     row.action.clone().unwrap(),
+                    1,
                     &commands,
                     &notices,
                     record_open,
@@ -1959,7 +1988,7 @@ mod tests {
         let (commands, command_rx) = mpsc::channel();
         let (notices, notice_rx) = mpsc::channel();
         let open = relay.action.clone().unwrap();
-        dispatch(open.clone(), &commands, &notices, record_open);
+        dispatch(open.clone(), 1, &commands, &notices, record_open);
         assert_eq!(command_rx.try_recv().unwrap(), open);
         assert_eq!(
             open.cli_args().unwrap(),
@@ -1976,12 +2005,19 @@ mod tests {
             peer: None,
             url: Some("http://web.localhost:7462".into()),
         };
-        dispatch(open, &commands, &notices, failing_open);
-        let Update::Notice(notice) = notice_rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
-            panic!("expected a notice")
+        dispatch(open, 7, &commands, &notices, failing_open);
+        let Update::OpenFailed { click, error } =
+            notice_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        else {
+            panic!("expected a failed open")
         };
-        assert!(notice.contains("browser could not open"), "{notice}");
+        assert!(error.contains("browser could not open"), "{error}");
         assert!(command_rx.try_recv().is_err());
+        // Shown when it is the latest click; dropped once the user clicked on,
+        // say to "Pair a device…", so it cannot hide the pairing code.
+        assert_eq!(click, 7);
+        assert!(still_latest(click, 7));
+        assert!(!still_latest(click, 8));
     }
     #[test]
     fn only_canonical_credential_free_http_urls_open_directly() {
