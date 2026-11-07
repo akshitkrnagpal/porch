@@ -468,41 +468,11 @@ pub async fn join(code: &str, host: Option<&str>, bind: Option<&str>, port: u16)
             .map(|c| async move { probe(&c.endpoint).await.map_err(|e| format!("{e:#}")) }),
     )
     .await;
-    let mut salts = std::collections::HashMap::new();
-    let mut outdated = Vec::new();
-    let mut open = false;
-    let probes: Vec<_> = probes
-        .into_iter()
-        .zip(&candidates)
-        .map(|(probe, candidate)| match probe {
-            Ok(Probe::Open { pin, salt }) => {
-                open = true;
-                salts.insert(pin.clone(), salt);
-                Ok(Some(pin))
-            }
-            Ok(Probe::Outdated) => {
-                outdated.push(candidate.endpoint.trim_end_matches('/').to_owned());
-                Ok(None)
-            }
-            Ok(Probe::Closed) => Ok(None),
-            Err(e) => Err(e),
-        })
-        .collect();
-    if !open && !outdated.is_empty() {
-        return Err(fail(
-            "protocol",
-            format!(
-                "{} runs an older Porch with an insecure pairing protocol; update Porch on it and show a new code",
-                outdated.join(", ")
-            ),
-        ));
-    }
-    let (target, pin) = select_target(
+    let (target, pin, salt) = choose(
         candidates.into_iter().zip(probes).collect(),
         own.as_deref(),
         host,
     )?;
-    let salt = salts.remove(&pin).unwrap_or_default();
     let before = Sharing::capture();
     match join_one(
         &code,
@@ -524,6 +494,51 @@ pub async fn join(code: &str, host: Option<&str>, bind: Option<&str>, port: u16)
             Err(e)
         }
     }
+}
+
+/// Turn probe results into the one machine to run the key exchange with, its
+/// pin and window salt. Agents that only speak the insecure version 1
+/// exchange are never chosen; if they are the only ones showing a code, that
+/// is a `protocol` failure asking to update them.
+fn choose(
+    probed: Vec<(JoinCandidate, std::result::Result<Probe, String>)>,
+    own: Option<&str>,
+    host: Option<&str>,
+) -> Result<(JoinCandidate, String, String)> {
+    let mut salts = std::collections::HashMap::new();
+    let mut outdated = Vec::new();
+    let mut open = false;
+    let probed: Vec<_> = probed
+        .into_iter()
+        .map(|(candidate, probe)| {
+            let result = match probe {
+                Ok(Probe::Open { pin, salt }) => {
+                    open = true;
+                    salts.insert(pin.clone(), salt);
+                    Ok(Some(pin))
+                }
+                Ok(Probe::Outdated) => {
+                    outdated.push(candidate.endpoint.trim_end_matches('/').to_owned());
+                    Ok(None)
+                }
+                Ok(Probe::Closed) => Ok(None),
+                Err(e) => Err(e),
+            };
+            (candidate, result)
+        })
+        .collect();
+    if !open && !outdated.is_empty() {
+        return Err(fail(
+            "protocol",
+            format!(
+                "{} runs an older Porch with an insecure pairing protocol; update Porch on it and show a new code",
+                outdated.join(", ")
+            ),
+        ));
+    }
+    let (target, pin) = select_target(probed, own, host)?;
+    let salt = salts.remove(&pin).unwrap_or_default();
+    Ok((target, pin, salt))
 }
 
 /// Choose the one machine to send the code to from probe results (its
@@ -797,6 +812,65 @@ mod tests {
     }
     fn code_of(e: anyhow::Error) -> JoinFailure {
         e.downcast::<JoinFailure>().expect("structured failure")
+    }
+    fn open(pin: char) -> std::result::Result<Probe, String> {
+        Ok(Probe::Open {
+            pin: pin.to_string().repeat(64),
+            salt: format!("salt{pin}"),
+        })
+    }
+    #[test]
+    fn outdated_agents_are_never_chosen_and_alone_are_a_protocol_failure() {
+        let e = choose(
+            vec![
+                (at("old", "10.0.0.2"), Ok(Probe::Outdated)),
+                (at("idle", "10.0.0.3"), Ok(Probe::Closed)),
+            ],
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
+        let e = code_of(e);
+        assert_eq!(e.code, "protocol");
+        assert!(e.detail.unwrap().contains("https://10.0.0.2:7463"));
+        // Mixed versions: the current agent is chosen with its own salt.
+        let (target, pin, salt) = choose(
+            vec![
+                (at("old", "10.0.0.2"), Ok(Probe::Outdated)),
+                (at("new", "10.0.0.4"), open('b')),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(target.name, "new");
+        assert_eq!(pin, "b".repeat(64));
+        assert_eq!(salt, "saltb");
+        // Two current agents stay ambiguous, outdated ones aside.
+        let e = choose(
+            vec![
+                (at("old", "10.0.0.2"), Ok(Probe::Outdated)),
+                (at("one", "10.0.0.4"), open('b')),
+                (at("two", "10.0.0.5"), open('c')),
+            ],
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
+        let e = code_of(e);
+        assert_eq!(e.code, "multiple_hosts");
+        assert_eq!(e.candidates.len(), 2);
+        // This machine's own agent is never a target.
+        let e = choose(
+            vec![(at("me", "10.0.0.4"), open('b'))],
+            Some(&"b".repeat(64)),
+            Some("10.0.0.4"),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(code_of(e).code, "not_waiting");
     }
     #[test]
     fn the_code_goes_to_exactly_one_waiting_machine() {
