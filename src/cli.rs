@@ -914,6 +914,16 @@ pub(crate) async fn start_proxy(
         use std::os::unix::process::CommandExt;
         c.process_group(0);
     }
+    // Off the launching console: Ctrl+C in that terminal, or closing it, must
+    // not reach the shared proxy. It is stopped by request instead.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(
+            windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
+                | windows_sys::Win32::System::Threading::DETACHED_PROCESS,
+        );
+    }
     let mut child = c.spawn().context("starting proxy daemon")?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
