@@ -752,3 +752,92 @@ fn rewrite_location_with_https_relay_only_rewrites_explicit_app_authority() {
         assert!(rewrite(location).is_err(), "{location} should be rejected");
     }
 }
+fn temp_state() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "porch-discovery-client-{}",
+        super::super::server::random().unwrap()
+    ));
+    fs::create_dir_all(&path).unwrap();
+    path
+}
+/// A paired machine that accepts TCP but never completes TLS: if anything tried
+/// it, the caller would wait out the request timeout. Counts every connection.
+async fn silent_peer() -> (Peer, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = fixture_peer(
+        format!("https://{}/", listener.local_addr().unwrap()),
+        "0".repeat(64),
+    );
+    peer.machine = Machine {
+        id: "machine-offline".into(),
+        name: "Offline Box".into(),
+    };
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            seen.fetch_add(1, Ordering::Relaxed);
+            held.push(stream);
+        }
+    });
+    (peer, hits, task)
+}
+#[tokio::test]
+async fn opening_one_peer_never_contacts_an_unreachable_other_peer() {
+    let dir = temp_state();
+    let (reachable, reachable_hits, good_task) = tls_fixture(
+        serde_json::to_vec(&fixture_catalog()).unwrap(),
+        StatusCode::OK,
+    )
+    .await;
+    let (offline, offline_hits, offline_task) = silent_peer().await;
+    // The offline peer is enrolled first, so a query over every peer meets it first.
+    upsert_peer_in(&dir, offline.clone()).unwrap();
+    upsert_peer_in(&dir, reachable.clone()).unwrap();
+
+    let result = refresh_peer_in(&dir, "machine-local", "machine-b")
+        .await
+        .unwrap();
+    assert_eq!(result.machine.id, "machine-b");
+    assert_eq!(result.catalog.unwrap().apps[0].name, "web");
+    assert_eq!(reachable_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        offline_hits.load(Ordering::Relaxed),
+        0,
+        "opening machine-b must not wait on another paired peer"
+    );
+    // Like a snapshot, the authenticated refresh is persisted for the selected
+    // peer only; the untouched peer keeps its stored record.
+    let stored = peers_in(&dir).unwrap();
+    let b = stored.iter().find(|p| p.machine.id == "machine-b").unwrap();
+    assert!(b.last_seen > 0);
+    assert_eq!(b.endpoint, reachable.endpoint);
+    let off = stored
+        .iter()
+        .find(|p| p.machine.id == "machine-offline")
+        .unwrap();
+    assert_eq!(off.last_seen, 0);
+    assert_eq!(off.endpoint, offline.endpoint);
+
+    good_task.abort();
+    offline_task.abort();
+    let _ = fs::remove_dir_all(&dir);
+}
+#[tokio::test]
+async fn refreshing_a_peer_refuses_unknown_and_local_machine_ids() {
+    let dir = temp_state();
+    let (offline, hits, task) = silent_peer().await;
+    upsert_peer_in(&dir, offline).unwrap();
+    for (local, wanted) in [
+        ("machine-local", "machine-missing"),
+        ("machine-offline", "machine-offline"),
+    ] {
+        let error = refresh_peer_in(&dir, local, wanted).await.unwrap_err();
+        assert!(error.to_string().contains("paired peer unavailable"));
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+    task.abort();
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -822,14 +822,7 @@ pub async fn snapshot(refresh: bool) -> Result<Snapshot> {
     let successful: Vec<_> = results.iter().filter(|p| p.catalog.is_some()).collect();
     if !successful.is_empty() {
         update_peers(|all| {
-            for p in all {
-                if let Some(good) = successful.iter().find(|g| g.machine.id == p.machine.id) {
-                    p.endpoint = good.endpoint.clone();
-                    p.sources = good.sources.clone();
-                    p.machine = good.machine.clone();
-                    p.last_seen = good.last_seen;
-                }
-            }
+            record_refreshed(all, &successful);
             Ok(())
         })?;
     }
@@ -841,6 +834,47 @@ pub async fn snapshot(refresh: bool) -> Result<Snapshot> {
         candidates,
         warnings,
     })
+}
+/// Persist the address, sources and identity a successful refresh authenticated.
+fn record_refreshed(all: &mut [Peer], successful: &[&PeerCatalog]) {
+    for p in all {
+        if let Some(good) = successful.iter().find(|g| g.machine.id == p.machine.id) {
+            p.endpoint = good.endpoint.clone();
+            p.sources = good.sources.clone();
+            p.machine = good.machine.clone();
+            p.last_seen = good.last_seen;
+        }
+    }
+}
+/// Refresh one enrolled peer, as `snapshot` would, without querying any other.
+/// Opening an app on a reachable machine must not wait out the connect timeout
+/// of an unrelated peer that is offline.
+pub async fn refresh_peer(local_id: &str, peer_id: &str) -> Result<PeerCatalog> {
+    crate::state::load()?;
+    refresh_peer_in(&crate::state::dir(), local_id, peer_id).await
+}
+pub(super) async fn refresh_peer_in(
+    dir: &std::path::Path,
+    local_id: &str,
+    peer_id: &str,
+) -> Result<PeerCatalog> {
+    let peer = peers_in(dir)?
+        .into_iter()
+        .find(|p| p.machine.id == peer_id && p.machine.id != local_id)
+        .context("paired peer unavailable")?;
+    // The cached hints `snapshot(false)` uses; never browse the network here.
+    let mut cache: CandidateCache = read_json_in(dir, CACHE_FILE)?;
+    cache.expire(now());
+    let mut candidates = cache.all();
+    candidates.retain(|c| c.machine_id.as_deref() != Some(local_id));
+    let result = query_peer(peer, &candidates).await;
+    if result.catalog.is_some() {
+        update_peers_in(dir, |all| {
+            record_refreshed(all, &[&result]);
+            Ok(())
+        })?;
+    }
+    Ok(result)
 }
 fn endpoint_ip(endpoint: &str) -> Option<IpAddr> {
     match Url::parse(endpoint).ok()?.host()? {
