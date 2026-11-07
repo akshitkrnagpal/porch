@@ -37,7 +37,8 @@ fn write_state(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
     crate::state::inherit_owner(path)?;
     Ok(())
 }
-/// Helper output beyond this is an error, never silently truncated: callers such as NSS
+/// Helper stdout beyond this is an error, never silently truncated (stderr is diagnostic
+/// only and may be capped): callers such as NSS
 /// cleanup infer absence from a complete listing.
 const COMMAND_OUTPUT_LIMIT: u64 = 32 * 1024 * 1024;
 fn command(program: &str, args: &[String]) -> Result<String> {
