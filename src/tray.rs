@@ -1,7 +1,8 @@
 //! Porch's optional native menu. All network/lifecycle work goes through the CLI
-//! on a Tokio worker; native UI objects never leave the OS main thread.
+//! on a Tokio worker; native UI objects never leave the OS main thread. Opening
+//! an app row's URL needs neither, so the tray hands it to the browser itself.
 use crate::discovery::{
-    gateway,
+    hostname_url,
     types::{App, Health, PeerCatalog, Snapshot},
 };
 use crate::state::ProxySettings;
@@ -20,6 +21,10 @@ pub enum Action {
     Open {
         app: String,
         peer: Option<String>,
+        /// The URL this app's row shows. When present the tray opens it
+        /// directly, without the CLI or any peer. `None` means `porch open`
+        /// must work it out, as for a relay app whose port is not known yet.
+        url: Option<String>,
     },
     Copy {
         app: String,
@@ -37,7 +42,7 @@ impl Action {
     /// Pass argument vectors to the existing CLI, never to a shell.
     pub fn cli_args(&self) -> Option<Vec<String>> {
         let args = match self {
-            Self::Open { app, peer } | Self::Copy { app, peer } => {
+            Self::Open { app, peer, .. } | Self::Copy { app, peer } => {
                 let mut args = vec![
                     if matches!(self, Self::Open { .. }) {
                         "open"
@@ -162,8 +167,29 @@ fn display_url(url: &str) -> &str {
         .map_or(url, |(_, rest)| rest)
         .trim_end_matches('/')
 }
+/// A URL the tray may hand to the browser itself. Every one is built on this
+/// machine from its own proxy settings (any TLD, or `.local` in LAN mode); a
+/// peer's own `local_url` never gets here. Still require HTTP(S) with a host
+/// and no credentials, in canonical form so the opener gets exactly the string
+/// that was checked and it can never read as a command-line option. Anything
+/// else goes through the CLI.
+fn direct_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let ok = matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some_and(|host| !host.is_empty())
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.as_str().trim_end_matches('/') == url.trim_end_matches('/');
+    ok.then(|| url.to_owned())
+}
 /// One app as a single row: its URL, which opens it. The alternate copies it.
 /// `peer` is the paired machine the app lives on, `None` for this machine.
+///
+/// `target` is the app's full URL on this machine's proxy: a local app's
+/// `local_url`, or the APP.MACHINE name from `hostname_url`, the helper
+/// `porch open --peer` uses. The row shows it and a click opens that same
+/// string, so they cannot drift. Path-routed peer apps have no target until
+/// `porch open` starts their relay.
 fn app_entry(
     app: &App,
     peer: Option<&PeerCatalog>,
@@ -171,8 +197,9 @@ fn app_entry(
     proxy_running: bool,
 ) -> Entry {
     let usable = !matches!(app.health, Health::Stopped | Health::Unreachable);
-    let (url, enabled, note) = match peer {
+    let (target, url, enabled, note) = match peer {
         None => (
+            Some(app.local_url.clone()),
             display_url(&app.local_url).to_owned(),
             proxy_running && usable,
             if !usable {
@@ -184,13 +211,14 @@ fn app_entry(
         Some(peer) => {
             // The same APP.MACHINE name `porch open --peer` serves through the
             // local proxy. Path-routed apps get a relay instead, so name them.
-            let named = gateway::hostname_app(&app.name)
-                .filter(|_| !peer.slug.is_empty())
-                .map(|name| {
-                    display_url(&settings.url(&format!("{name}.{}", peer.slug))).to_owned()
-                });
-            let needs_proxy = named.is_some();
-            let url = named.unwrap_or_else(|| format!("{} on {}", app.name, peer.machine.name));
+            let target = Some(&peer.slug)
+                .filter(|slug| !slug.is_empty())
+                .and_then(|slug| hostname_url(settings, slug, &app.name));
+            let needs_proxy = target.is_some();
+            let url = target.as_deref().map_or_else(
+                || format!("{} on {}", app.name, peer.machine.name),
+                |target| display_url(target).to_owned(),
+            );
             let note = if !app.remote_access {
                 Some("sharing off")
             } else if !usable {
@@ -199,6 +227,7 @@ fn app_entry(
                 None
             };
             (
+                target,
                 url,
                 app.remote_access && usable && (proxy_running || !needs_proxy),
                 note,
@@ -216,6 +245,7 @@ fn app_entry(
         action: Some(Action::Open {
             app: app.id.clone(),
             peer: peer_id.clone(),
+            url: target.as_deref().and_then(direct_url),
         }),
         children: vec![],
         separator: false,
@@ -532,16 +562,43 @@ enum Update {
         error: Option<String>,
     },
 }
-fn worker(cli: PathBuf) -> (Sender<Action>, Receiver<Update>) {
+/// Opens a URL in the browser; `crate::discovery::open_url` outside tests.
+type Opener = fn(&str) -> Result<()>;
+/// Route a clicked menu action. An app row with a URL opens it straight away:
+/// no CLI, no peer query, on its own thread so a slow `open`/`xdg-open` blocks
+/// neither the menu nor queued CLI work. Everything else, including relay apps
+/// that have no URL until `porch open` starts the relay, queues for the CLI
+/// worker.
+fn dispatch(action: Action, commands: &Sender<Action>, notices: &Sender<Update>, opener: Opener) {
+    if let Action::Open { url: Some(url), .. } = &action {
+        if let Some(url) = direct_url(url) {
+            let notices = notices.clone();
+            // Success needs no message: the browser is the message. Staying
+            // quiet also keeps a late launcher from replacing a newer notice,
+            // such as a pairing code.
+            std::thread::spawn(move || {
+                if let Err(error) = opener(&url) {
+                    let _ = notices.send(Update::Notice(format!("{error:#}")));
+                }
+            });
+            return;
+        }
+    }
+    let _ = commands.send(action);
+}
+fn worker(cli: PathBuf) -> (Sender<Action>, Sender<Update>, Receiver<Update>) {
     worker_with_intervals(cli, Duration::from_secs(15), Duration::from_secs(60))
 }
+/// The command queue, a sender for notices from outside the worker (direct
+/// opens), and the updates the menu draws from.
 fn worker_with_intervals(
     cli: PathBuf,
     poll: Duration,
     discovery: Duration,
-) -> (Sender<Action>, Receiver<Update>) {
+) -> (Sender<Action>, Sender<Update>, Receiver<Update>) {
     let (commands, command_rx) = mpsc::channel();
     let (updates, update_rx) = mpsc::channel();
+    let notices = updates.clone();
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -669,7 +726,7 @@ fn worker_with_intervals(
             }
         }
     });
-    (commands, update_rx)
+    (commands, notices, update_rx)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -1130,7 +1187,12 @@ mod native {
                 stale: false,
             })
         }
-        pub fn tick(&mut self, updates: &Receiver<Update>, commands: &Sender<Action>) -> bool {
+        pub fn tick(
+            &mut self,
+            updates: &Receiver<Update>,
+            commands: &Sender<Action>,
+            notices: &Sender<Update>,
+        ) -> bool {
             let mut changed = false;
             for update in updates.try_iter() {
                 match update {
@@ -1237,7 +1299,12 @@ mod native {
                         let _ = commands.send(Action::Quit);
                         return false;
                     }
-                    let _ = commands.send(action.clone());
+                    dispatch(
+                        action.clone(),
+                        commands,
+                        notices,
+                        crate::discovery::open_url,
+                    );
                 }
             }
             for toggle in self.toggles.values() {
@@ -1259,7 +1326,7 @@ mod native {
             use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
             event_loop.set_activation_policy(ActivationPolicy::Accessory);
         }
-        let (commands, updates) = worker(cli);
+        let (commands, notices, updates) = worker(cli);
         let mut ui: Option<Ui> = None;
         event_loop.run(move |event, _, control_flow| {
             *control_flow =
@@ -1274,7 +1341,7 @@ mod native {
                 }
             }
             if let Some(ui) = &mut ui {
-                if !ui.tick(&updates, &commands) {
+                if !ui.tick(&updates, &commands, &notices) {
                     *control_flow = ControlFlow::Exit;
                 }
             }
@@ -1337,10 +1404,10 @@ mod native {
         if !indicator_library {
             bail!("AppIndicator is unavailable. Install libayatana-appindicator3-1, or use `porch list --all`");
         }
-        let (commands, updates) = worker(cli);
+        let (commands, notices, updates) = worker(cli);
         let mut ui = Ui::new()?;
         glib::timeout_add_local(Duration::from_millis(150), move || {
-            if ui.tick(&updates, &commands) {
+            if ui.tick(&updates, &commands, &notices) {
                 glib::ControlFlow::Continue
             } else {
                 gtk::main_quit();
@@ -1570,7 +1637,7 @@ mod tests {
         crate::test_support::write_executable(&cli, &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"));
         // Discovery is due far less often than the catalog poll, so catalog
         // refreshes happen in between even when each CLI call is slow.
-        let (commands, updates) =
+        let (commands, _, updates) =
             worker_with_intervals(cli, Duration::from_millis(30), Duration::from_millis(400));
         assert!(matches!(
             updates.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -1580,6 +1647,7 @@ mod tests {
             .send(Action::Open {
                 app: "app-stable-id".into(),
                 peer: Some("peer-stable-id".into()),
+                url: None,
             })
             .unwrap();
         // Wait for the observable outcome, not a number of updates: a catalog
@@ -1690,7 +1758,7 @@ mod tests {
             &cli,
             &format!("#!/bin/sh\ncase \"$1\" in proxy) exit 0;; esac\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"),
         );
-        let (commands, updates) =
+        let (commands, _, updates) =
             worker_with_intervals(cli, Duration::from_secs(60), Duration::from_secs(60));
         assert!(matches!(
             updates.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -1733,7 +1801,7 @@ mod tests {
             &cli,
             &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncase \"$1\" in peers) while [ ! -e {quoted_release} ]; do sleep 0.01; done;; proxy) exit 0;; esac\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"),
         );
-        let (commands, updates) =
+        let (commands, _, updates) =
             worker_with_intervals(cli, Duration::from_secs(60), Duration::from_secs(60));
         // Queue the flips only once the worker is inside that discovery.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -1793,5 +1861,153 @@ mod tests {
     fn labels_do_not_inject_shortcuts_or_control_characters() {
         assert_eq!(clean_label("A&B\nC\t"), "A&&BC");
         assert!(clean_label(&"x".repeat(500)).len() <= 140);
+    }
+
+    type Opened = Vec<(String, std::thread::ThreadId)>;
+    static OPENED: std::sync::Mutex<Opened> = std::sync::Mutex::new(Vec::new());
+    fn record_open(url: &str) -> Result<()> {
+        OPENED
+            .lock()
+            .unwrap()
+            .push((url.to_owned(), std::thread::current().id()));
+        Ok(())
+    }
+    fn failing_open(url: &str) -> Result<()> {
+        bail!("browser could not open {url}")
+    }
+    /// Wait for the opener thread, without sleeping a fixed time.
+    fn opened(url: &str) -> std::thread::ThreadId {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((_, thread)) = OPENED.lock().unwrap().iter().find(|(u, _)| u == url) {
+                return *thread;
+            }
+            assert!(std::time::Instant::now() < deadline, "{url} never opened");
+            std::thread::yield_now();
+        }
+    }
+    fn open_url_of(entry: &Entry) -> Option<String> {
+        match entry.action.as_ref().unwrap() {
+            Action::Open { url, .. } => url.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+    #[test]
+    fn clicking_an_app_row_opens_the_url_it_shows_without_the_cli() {
+        // A custom-TLD proxy serves its own suffix, for local and peer apps.
+        let test_tld = ProxySettings {
+            tlds: vec!["test".into()],
+            ..ProxySettings::default()
+        };
+        let mut on_test = snapshot();
+        on_test.local.apps[0].local_url = "http://web.test:7462".into();
+        for (state, settings, local, remote) in [
+            (
+                snapshot(),
+                ProxySettings::default(),
+                "http://web.localhost:7462",
+                "http://web.workbench.localhost:7462",
+            ),
+            (
+                on_test,
+                test_tld,
+                "http://web.test:7462",
+                "http://web.workbench.test:7462",
+            ),
+        ] {
+            let entries = menu_model(Some(&state), &settings, None, None);
+            for expected in [local, remote] {
+                let shown = display_url(expected);
+                let row = entries
+                    .iter()
+                    .find(|entry| entry.label == shown)
+                    .unwrap_or_else(|| panic!("no row {shown:?} in {entries:#?}"));
+                assert_eq!(
+                    open_url_of(row).as_deref(),
+                    Some(expected),
+                    "the row opens the URL it shows"
+                );
+                let (commands, command_rx) = mpsc::channel();
+                let (notices, notice_rx) = mpsc::channel();
+                dispatch(
+                    row.action.clone().unwrap(),
+                    &commands,
+                    &notices,
+                    record_open,
+                );
+                assert_ne!(
+                    opened(expected),
+                    std::thread::current().id(),
+                    "the browser launcher runs off the clicking thread"
+                );
+                assert!(
+                    command_rx.try_recv().is_err(),
+                    "a direct open must not run the CLI"
+                );
+                assert!(notice_rx.try_recv().is_err(), "success needs no notice");
+            }
+        }
+    }
+    #[test]
+    fn relay_apps_still_open_through_the_cli() {
+        // A path-routed app has no URL until `porch open` starts its relay.
+        let mut state = snapshot();
+        state.peers[0].catalog.as_mut().unwrap().apps[0].name = "web/admin".into();
+        let entries = model(Some(&state), None, None);
+        let relay = row(&entries, "web/admin on Workbench");
+        assert_eq!(open_url_of(relay), None);
+        let (commands, command_rx) = mpsc::channel();
+        let (notices, notice_rx) = mpsc::channel();
+        let open = relay.action.clone().unwrap();
+        dispatch(open.clone(), &commands, &notices, record_open);
+        assert_eq!(command_rx.try_recv().unwrap(), open);
+        assert_eq!(
+            open.cli_args().unwrap(),
+            vec!["open", "app-stable-id", "--peer", "peer-stable-id"]
+        );
+        assert!(notice_rx.try_recv().is_err());
+    }
+    #[test]
+    fn a_failed_direct_open_reports_why() {
+        let (commands, command_rx) = mpsc::channel();
+        let (notices, notice_rx) = mpsc::channel();
+        let open = Action::Open {
+            app: "app-stable-id".into(),
+            peer: None,
+            url: Some("http://web.localhost:7462".into()),
+        };
+        dispatch(open, &commands, &notices, failing_open);
+        let Update::Notice(notice) = notice_rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
+            panic!("expected a notice")
+        };
+        assert!(notice.contains("browser could not open"), "{notice}");
+        assert!(command_rx.try_recv().is_err());
+    }
+    #[test]
+    fn only_canonical_credential_free_http_urls_open_directly() {
+        for good in [
+            "http://web.localhost:7462",
+            "https://web.workbench.localhost",
+            "http://localhost:3000/app",
+            "http://web.test:7462",
+            "https://web.workbench.local",
+        ] {
+            assert_eq!(direct_url(good).as_deref(), Some(good));
+        }
+        for bad in [
+            "http://user:pw@web.localhost",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "-a Calculator",
+            "http://WEB.localhost",
+            "http://web.localhost\\@evil.com",
+        ] {
+            assert_eq!(direct_url(bad), None, "{bad}");
+        }
+        // An unsafe URL is never opened directly; the CLI handles that click.
+        let mut state = snapshot();
+        state.local.apps[0].local_url = "http://user:pw@web.localhost".into();
+        let entries = model(Some(&state), None, None);
+        assert_eq!(open_url_of(row(&entries, "user:pw@web.localhost")), None);
     }
 }
