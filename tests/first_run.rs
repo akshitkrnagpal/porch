@@ -377,7 +377,9 @@ fn a_running_launch_restarts_a_crashed_proxy_but_not_a_stopped_one() {
     let crashed: i32 = s.file("proxy.pid").parse().unwrap();
     unsafe { libc::kill(crashed, libc::SIGKILL) };
     s.wait_for("proxy restart", || {
-        s.file("proxy.pid").parse::<i32>().is_ok_and(|p| p != crashed)
+        s.file("proxy.pid")
+            .parse::<i32>()
+            .is_ok_and(|p| p != crashed)
             && s.ok(&["proxy", "status"]).0.trim() == "running"
     });
     // A deliberate stop stays stopped.

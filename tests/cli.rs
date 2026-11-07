@@ -701,3 +701,53 @@ fn saved_proxy_ports_survive_the_https_default_change() {
         "https://web.localhost:8080"
     );
 }
+
+#[test]
+fn bare_domain_serves_a_dashboard_and_app_list() {
+    let s = Sandbox::new();
+    let up = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let up_port = up.local_addr().unwrap().port();
+    s.ok(&["alias", "web", &up_port.to_string()]);
+    s.ok(&["alias", "--private", "secret", "1"]);
+    s.ok(&["proxy", "start"]);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let get = |path: &str, accept: &str| {
+            client
+                .get(format!("http://127.0.0.1:{}{path}", s.port))
+                .header("host", "localhost")
+                .header("accept", accept.to_owned())
+                .send()
+        };
+        let page = get("/", "text/html").await.unwrap();
+        assert_eq!(page.status(), 200);
+        let html = page.text().await.unwrap();
+        assert!(
+            html.contains("Your apps") && html.contains("web.localhost"),
+            "{html}"
+        );
+        let json: serde_json::Value = get("/_porch/apps.json", "*/*")
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let apps = json["apps"].as_array().unwrap();
+        let web = apps.iter().find(|a| a["name"] == "web").unwrap();
+        assert_eq!(web["health"], "ok");
+        let secret = apps.iter().find(|a| a["name"] == "secret").unwrap();
+        assert_eq!(secret["private"], true);
+        assert_eq!(secret["health"], "not listening");
+        // An unknown name is still a 404, not the dashboard.
+        let missing = client
+            .get(format!("http://127.0.0.1:{}/", s.port))
+            .header("host", "nope.localhost")
+            .header("accept", "text/html")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
+    });
+    drop(up);
+}

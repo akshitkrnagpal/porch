@@ -31,7 +31,88 @@ fn escape(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
-const PAGE_CSS: &str = ":root{color-scheme:light dark;--bg:#faf8f2;--fg:#242421;--muted:#6b675e;--card:#fff;--line:#e6e1d6;--accent:#b4532a;--code:#efeadf}@media (prefers-color-scheme:dark){:root{--bg:#161513;--fg:#ece9e1;--muted:#a19c90;--card:#1f1e1b;--line:#33312c;--accent:#f08a5d;--code:#2a2925}}*{box-sizing:border-box}body{margin:0;font:16px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg)}main{max-width:46rem;margin:0 auto;padding:12vh 1rem 4rem}.status{font:600 .8rem ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}h1{font-size:1.75rem;line-height:1.2;margin:.4rem 0 1rem}p{margin:.6rem 0}code{font:.9em ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--code);padding:.1rem .35rem;border-radius:4px}.muted{color:var(--muted)}h2{font-size:.95rem;margin:2.5rem 0 .75rem;color:var(--muted);font-weight:600}ul.apps{list-style:none;padding:0;margin:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}ul.apps li{border-top:1px solid var(--line)}ul.apps li:first-child{border-top:0}ul.apps a{display:flex;justify-content:space-between;gap:1rem;padding:.75rem 1rem;color:inherit;text-decoration:none}ul.apps a:hover,ul.apps a:focus-visible{background:var(--code);outline:none}.name{font-weight:600}.target{color:var(--muted);font:.85em ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}input[type=search]{width:100%;font:inherit;padding:.55rem .75rem;margin:0 0 .75rem;border:1px solid var(--line);border-radius:8px;background:var(--card);color:inherit}.spinner{display:inline-block;width:.8em;height:.8em;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;vertical-align:-.05em;margin-right:.4rem}@keyframes spin{to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.spinner{animation:none}}footer{margin-top:3rem;font-size:.85rem;color:var(--muted)}";
+const PAGE_CSS: &str = ":root{color-scheme:light dark;--bg:#faf8f2;--fg:#242421;--muted:#6b675e;--card:#fff;--line:#e6e1d6;--accent:#b4532a;--code:#efeadf}@media (prefers-color-scheme:dark){:root{--bg:#161513;--fg:#ece9e1;--muted:#a19c90;--card:#1f1e1b;--line:#33312c;--accent:#f08a5d;--code:#2a2925}}*{box-sizing:border-box}body{margin:0;font:16px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg)}main{max-width:46rem;margin:0 auto;padding:12vh 1rem 4rem}.status{font:600 .8rem ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}h1{font-size:1.75rem;line-height:1.2;margin:.4rem 0 1rem}p{margin:.6rem 0}code{font:.9em ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--code);padding:.1rem .35rem;border-radius:4px}.muted{color:var(--muted)}h2{font-size:.95rem;margin:2.5rem 0 .75rem;color:var(--muted);font-weight:600}ul.apps{list-style:none;padding:0;margin:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}ul.apps li{border-top:1px solid var(--line)}ul.apps li:first-child{border-top:0}ul.apps a{display:flex;justify-content:space-between;gap:1rem;padding:.75rem 1rem;color:inherit;text-decoration:none}ul.apps a:hover,ul.apps a:focus-visible{background:var(--code);outline:none}.name{font-weight:600}.target{color:var(--muted);font:.85em ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}input[type=search]{width:100%;font:inherit;padding:.55rem .75rem;margin:0 0 .75rem;border:1px solid var(--line);border-radius:8px;background:var(--card);color:inherit}.spinner{display:inline-block;width:.8em;height:.8em;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;vertical-align:-.05em;margin-right:.4rem}@keyframes spin{to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.spinner{animation:none}}footer{margin-top:3rem;font-size:.85rem;color:var(--muted)}.dot{display:inline-block;width:.55rem;height:.55rem;border-radius:50%;margin-right:.55rem;vertical-align:.08em}.dot.up{background:#2f9e44}.dot.down{background:#e0a100}";
+/// Live data for the dashboard at the bare domain: this machine's apps with
+/// health and, with `peers`, every paired machine's apps (loopback only).
+async fn dashboard_json(settings: &ProxySettings, peers: bool) -> serde_json::Value {
+    let state = crate::state::live_routes().unwrap_or_default();
+    let routes = state.routes.clone();
+    let health = tokio::task::spawn_blocking(move || {
+        routes
+            .iter()
+            .map(|r| crate::health::target_listening(&r.target))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let apps: Vec<_> = state
+        .routes
+        .iter()
+        .zip(health)
+        .map(|(r, up)| {
+            serde_json::json!({
+                "name": r.name,
+                "host": settings.hostname(&r.name),
+                "url": settings.url(&r.name),
+                "target": r.target,
+                "health": if up { "ok" } else { "not listening" },
+                "private": state.private.contains(&r.name),
+            })
+        })
+        .collect();
+    let mut out = serde_json::json!({ "apps": apps });
+    if peers {
+        let snapshot = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::discovery::client::snapshot(false),
+        )
+        .await;
+        let machines: Vec<_> = match snapshot {
+            Ok(Ok(snap)) => snap
+                .peers
+                .iter()
+                .map(|p| {
+                    let apps: Vec<_> = p
+                        .catalog
+                        .iter()
+                        .flat_map(|c| c.apps.iter())
+                        .map(|a| {
+                            let url = (a.remote_access && !p.slug.is_empty())
+                                .then(|| crate::discovery::gateway::hostname_app(&a.name))
+                                .flatten()
+                                .map(|n| settings.url(&format!("{n}.{}", p.slug)));
+                            serde_json::json!({
+                                "name": a.name,
+                                "url": url,
+                                "health": a.health,
+                                "note": a.unavailable_reason,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "machine": p.machine.name,
+                        "error": p.error,
+                        "apps": apps,
+                    })
+                })
+                .collect(),
+            _ => vec![],
+        };
+        out["machines"] = serde_json::json!(machines);
+    }
+    out
+}
+const DASHBOARD_SCRIPT: &str = r#"<script>
+(()=>{const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+const row=(url,label,up,detail)=>`<li><a href="${esc(url)}"><span class="name"><span class="dot ${up?'up':'down'}"></span>${esc(label)}</span><span class="target">${esc(detail)}</span></a></li>`;
+async function local(){try{const r=await fetch('/_porch/apps.json',{cache:'no-store'});const d=await r.json();const q=document.querySelector('input[type=search]');const f=q?q.value.toLowerCase():'';
+const el=document.getElementById('local');if(!d.apps.length){el.innerHTML='<p class="muted">No apps are running. Start one with <code>porch run pnpm dev</code>.</p>';return}
+const ul=el.querySelector('ul.apps');const html=d.apps.map(a=>row(a.url,a.host,a.health==='ok',a.health==='ok'?a.target:a.target+' · not listening')).join('');
+if(ul){ul.innerHTML=html;if(f)for(const li of ul.children)li.hidden=!li.textContent.toLowerCase().includes(f)}else el.innerHTML='<ul class="apps">'+html+'</ul>'}catch(e){}}
+async function peers(){try{const r=await fetch('/_porch/apps.json?peers=1',{cache:'no-store'});const d=await r.json();const el=document.getElementById('peers');
+el.innerHTML=(d.machines||[]).map(m=>`<h2>${esc(m.machine)}${m.error?' · unreachable':''}</h2>`+(m.apps.length?'<ul class="apps">'+m.apps.map(a=>a.url?row(a.url,a.name,a.health==='healthy',''):`<li><a><span class="name"><span class="dot down"></span>${esc(a.name)}</span><span class="target">${esc(a.note||'not shared')}</span></a></li>`).join('')+'</ul>':'<p class="muted">No apps.</p>')).join('')}catch(e){}}
+setInterval(local,3000);peers();setInterval(peers,30000);})();
+</script>"#;
 fn page(code: StatusCode, title: &str, body: &str, head: &str) -> String {
     let status = if code.is_success() {
         "<div class=\"status\">Porch</div>".to_owned()
@@ -362,6 +443,38 @@ async fn forward(
             html,
         ));
     }
+    let dashboard_host = settings.tlds.contains(&hostname) || hostname == "porch.localhost";
+    if dashboard_host && req.uri().path() == "/_porch/apps.json" {
+        if !peer.ip().is_loopback() {
+            return Ok(error(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "The app list is only available on this computer",
+                &host,
+                false,
+            ));
+        }
+        let peers = req
+            .uri()
+            .query()
+            .is_some_and(|q| q.split('&').any(|p| p == "peers=1"));
+        let body = dashboard_json(&settings, peers).await.to_string();
+        let mut r = Response::new(
+            Full::new(Bytes::from(body))
+                .map_err(|e: Infallible| match e {})
+                .boxed_unsync(),
+        );
+        r.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        r.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+        marker(&mut r);
+        return Ok(r);
+    }
     let extended = req.method() == Method::CONNECT
         && req.version() == Version::HTTP_2
         && req
@@ -475,6 +588,22 @@ async fn forward(
                 html,
             ));
         }
+        if dashboard_host && !html && peer.ip().is_loopback() {
+            let body = dashboard_json(&settings, false).await.to_string();
+            let mut r = Response::new(
+                Full::new(Bytes::from(body))
+                    .map_err(|e: Infallible| match e {})
+                    .boxed_unsync(),
+            );
+            r.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
+            );
+            r.headers_mut()
+                .insert(header::VARY, header::HeaderValue::from_static("Accept"));
+            marker(&mut r);
+            return Ok(r);
+        }
         let mut response = error(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -485,13 +614,26 @@ async fn forward(
         if html {
             // Other devices (LAN mode) see names only; upstream targets stay private.
             let show_targets = peer.ip().is_loopback();
+            let targets: Vec<String> = state.routes.iter().map(|r| r.target.clone()).collect();
+            let health = tokio::task::spawn_blocking(move || {
+                targets
+                    .iter()
+                    .map(|t| crate::health::target_listening(t))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
             let links = state
                 .routes
                 .iter()
-                .map(|r| {
+                .enumerate()
+                .map(|(i, r)| {
+                    let up = health.get(i).copied().unwrap_or(true);
                     format!(
-                        "<li><a href=\"{}\"><span class=\"name\">{}</span>{}</a></li>",
+                        "<li><a href=\"{}\"><span class=\"name\"><span class=\"dot {}\" title=\"{}\"></span>{}</span>{}</a></li>",
                         escape(&settings.url(&r.name)),
+                        if up { "up" } else { "down" },
+                        if up { "answering" } else { "not listening" },
                         escape(&settings.hostname(&r.name)),
                         if show_targets {
                             format!("<span class=\"target\">{}</span>", escape(&r.target))
@@ -513,14 +655,18 @@ async fn forward(
             };
             // The bare domain (http://localhost) is Porch's dashboard: a 200
             // page listing every app, rather than an error.
-            let dashboard = settings.tlds.contains(&hostname) || hostname == "porch.localhost";
-            let page = if dashboard {
+            let page = if dashboard_host {
                 *response.status_mut() = StatusCode::OK;
+                let live = if peer.ip().is_loopback() {
+                    DASHBOARD_SCRIPT
+                } else {
+                    ""
+                };
                 page(
                     StatusCode::OK,
                     "Your apps",
                     &format!(
-                        "<p class=\"muted\">Every app Porch is serving on this computer.</p>{list}"
+                        "<p class=\"muted\">Every app Porch is serving on this computer. This page updates by itself.</p><div id=\"local\">{list}</div><div id=\"peers\"></div>{live}"
                     ),
                     "",
                 )
