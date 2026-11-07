@@ -37,6 +37,9 @@ fn write_state(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
     crate::state::inherit_owner(path)?;
     Ok(())
 }
+/// Helper output beyond this is an error, never silently truncated: callers such as NSS
+/// cleanup infer absence from a complete listing.
+const COMMAND_OUTPUT_LIMIT: u64 = 32 * 1024 * 1024;
 fn command(program: &str, args: &[String]) -> Result<String> {
     let mut command = Command::new(program);
     command
@@ -58,7 +61,7 @@ fn command(program: &str, args: &[String]) -> Result<String> {
         std::thread::spawn(move || {
             let mut data = Vec::new();
             reader
-                .take(32 * 1024 * 1024)
+                .take(COMMAND_OUTPUT_LIMIT + 1)
                 .read_to_end(&mut data)
                 .map(|_| data)
         })
@@ -92,6 +95,9 @@ fn command(program: &str, args: &[String]) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("command stderr reader failed"))??;
     require_status(status)
         .with_context(|| format!("{program} failed: {}", String::from_utf8_lossy(&err)))?;
+    if out.len() as u64 > COMMAND_OUTPUT_LIMIT {
+        bail!("{program} produced more than {COMMAND_OUTPUT_LIMIT} bytes of output");
+    }
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 pub(crate) fn exec(program: &str, args: &[&str]) -> Result<String> {
@@ -2516,6 +2522,14 @@ async fn doctor() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn oversized_command_output_is_an_error() {
+        let n = (COMMAND_OUTPUT_LIMIT + 1).to_string();
+        let err = exec("head", &["-c", &n, "/dev/zero"]).unwrap_err();
+        assert!(err.to_string().contains("more than"), "{err:#}");
+        assert_eq!(exec("head", &["-c", "3", "/dev/zero"]).unwrap().len(), 3);
+    }
     #[test]
     fn ca_fingerprint_matches_openssl_format() {
         // Pinned against `openssl x509 -noout -fingerprint -sha1` (colons stripped), the
