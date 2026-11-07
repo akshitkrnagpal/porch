@@ -78,6 +78,13 @@ jobs:
     # The CLI and tray must build and lint clean, the CLI must smoke-start
     # without state, packaging must work, and unit and integration tests must
     # pass. Some integration suites are still Unix-only and run nothing here.
+    #
+    # Everything here uses debug builds: `cargo test` already builds the CLI
+    # for the integration tests, so the smoke start and packaging reuse it
+    # instead of paying for two optimized compiles. Nothing in the source
+    # depends on the build profile; release.yml still builds and smoke-tests
+    # the optimized Windows binaries for every tag, and a manual run of it
+    # checks them before tagging.
     runs-on: windows-2025
     timeout-minutes: 45
     steps:
@@ -91,20 +98,21 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - run: cargo clippy --all-targets -- -D warnings
+      # The tray feature only adds code (src/tray.rs and porch-tray), so this
+      # lints every Windows path the featureless build has and more. The
+      # featureless lint runs in `test` on Linux and macOS.
       - run: cargo clippy --features tray --all-targets -- -D warnings
-      - run: cargo build --release --bin porch
-      - run: cargo build --release --features tray --bin porch-tray
-      - name: CLI starts without existing state
-        shell: pwsh
-        run: target/release/porch.exe --state-dir "$env:RUNNER_TEMP/porch-smoke" list --json
-      - run: python scripts/test_packaging.py
-      - run: python scripts/package.py --target x86_64-pc-windows-msvc --binaries target/release
-      - run: cargo test --no-fail-fast --lib
-      - name: Integration tests
-        # A hung test must not hold the job until GitHub's 6-hour limit.
+      - name: Unit and integration tests
+        # `--tests` includes the library's unit tests. A hung test must not
+        # hold the job until GitHub's 6-hour limit.
         timeout-minutes: 15
         run: cargo test --no-fail-fast --tests
+      - name: CLI starts without existing state
+        shell: pwsh
+        run: target/debug/porch.exe --state-dir "$env:RUNNER_TEMP/porch-smoke" list --json
+      - run: cargo build --features tray --bin porch-tray
+      - run: python scripts/test_packaging.py
+      - run: python scripts/package.py --target x86_64-pc-windows-msvc --binaries target/debug
   tray:
     strategy:
       fail-fast: false
@@ -124,7 +132,9 @@ jobs:
       - run: cargo clippy --features tray --all-targets -- -D warnings
       - run: cargo test --features tray --lib tray::tests
       - run: python3 scripts/test_packaging.py
-      - run: cargo build --release --features tray --bin porch-tray
+      # A debug build shares dependencies with the test above; release.yml
+      # builds the optimized tray for every tag.
+      - run: cargo build --features tray --bin porch-tray
       - if: runner.os == 'Linux'
         name: Tray fails clearly without a desktop
         run: |
@@ -138,7 +148,7 @@ jobs:
           env.pop('DISPLAY', None)
           env.pop('WAYLAND_DISPLAY', None)
           env['PORCH_BIN'] = os.path.join(os.environ['RUNNER_TEMP'], 'porch')
-          result = subprocess.run(['target/release/porch-tray'], env=env, capture_output=True, text=True, timeout=10)
+          result = subprocess.run(['target/debug/porch-tray'], env=env, capture_output=True, text=True, timeout=10)
           assert result.returncode != 0, result
           assert 'porch list --all' in result.stderr, result.stderr
           PY
