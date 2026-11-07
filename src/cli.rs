@@ -1389,18 +1389,24 @@ async fn evict_conflicts(names: &[String], settings: &ProxySettings, force: bool
             if state::matches(owner) && state::process_owned(owner.pid) {
                 signal_pid(owner.pid, 9);
             }
-            // Kernel release of a forced child's listening sockets can follow its signal briefly.
-            // SIGKILL cannot be ignored, so wait for the group to be gone: on a
-            // loaded machine its exit can take well over a second, and reusing
-            // its fixed port before then fails. The bound only covers a process
-            // stuck in the kernel.
-            if let Some(pid) = owner.child {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-                while state::group_matches(pid, owner.child_started.as_deref())
-                    && tokio::time::Instant::now() < deadline
-                {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+            // The route, and a fixed port its app held, are only free once
+            // the old launcher and its app group are gone. A killed process
+            // exits once the kernel finishes with it, which on a loaded
+            // machine can take well over a second; the bound only catches a
+            // process stuck in the kernel, and then the takeover fails rather
+            // than racing the old app for its port.
+            let gone = || {
+                !state::matches(owner)
+                    && owner.child.is_none_or(|pid| {
+                        !state::group_matches(pid, owner.child_started.as_deref())
+                    })
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !gone() {
+                if tokio::time::Instant::now() >= deadline {
+                    bail!("route {n}: its launcher or app did not exit after SIGKILL; retry once it has")
                 }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
     }
@@ -1706,7 +1712,10 @@ async fn spawn_prepared(
             p.plan.command.join(" "),
         ))
     });
-    let code = tokio::select! {status=child.wait()=>child_status(status?),failure=share_failure(&mut p.shares)=>{signal_group(id,15);let _=tokio::time::timeout(Duration::from_secs(3),child.wait()).await;failure?;bail!("sharing tunnel stopped")},changed=shutdown.changed()=>{changed?;let sig=(*shutdown.borrow()).unwrap_or(15);signal_group(id,sig);match tokio::time::timeout(Duration::from_secs(3),child.wait()).await{Ok(r)=>{r?;},Err(_)=>{signal_group(id,9);let _=child.wait().await;}}128+sig}};
+    // The child is reaped only at the end (see `process::wait_exit`): until
+    // then its pid still names its process group, which the cleanup below
+    // signals.
+    let code = tokio::select! {status=crate::process::wait_exit(&mut child)=>child_status(status?),failure=share_failure(&mut p.shares)=>{signal_group(id,15);let _=tokio::time::timeout(Duration::from_secs(3),crate::process::wait_exit(&mut child)).await;failure?;bail!("sharing tunnel stopped")},changed=shutdown.changed()=>{changed?;let sig=(*shutdown.borrow()).unwrap_or(15);signal_group(id,sig);match tokio::time::timeout(Duration::from_secs(3),crate::process::wait_exit(&mut child)).await{Ok(r)=>{r?;},Err(_)=>{signal_group(id,9);crate::process::wait_exit(&mut child).await?;}}128+sig}};
     if let Some(task) = listen_check {
         task.abort();
     }
@@ -1774,6 +1783,8 @@ async fn spawn_prepared(
         signal_group(id, 15);
     } // Dispose descendants unless ownership moved to a daemon.
     drop(tree.take());
+    // Reap last: the group is disposed of (or handed to the daemon) above.
+    let _ = child.wait().await;
     drop(p.shares.take());
     drop(p.lease.take());
     sync_hosts().await;
@@ -1966,7 +1977,15 @@ async fn launch_extra(
         })?;
         let mut r = rx.clone();
         let tree = crate::process::TreeGuard::new(&child)?;
-        tasks.spawn(async move{let _group=tree;let mut resources=prepared;let result=tokio::select!{s=child.wait()=>child_status(s?),failure=workspace_share_failure(&mut resources)=>{signal_group(pid,15);let _=tokio::time::timeout(Duration::from_secs(3),child.wait()).await;failure?;bail!("workspace sharing tunnel stopped")},_=r.changed()=>{let signal=(*r.borrow()).unwrap_or(15);signal_group(pid,signal);let _=tokio::time::timeout(Duration::from_secs(3),child.wait()).await;128+signal}};Ok::<_,anyhow::Error>(result)});
+        tasks.spawn(async move{
+            // Reap last (see `process::wait_exit`): the guard disposes of the
+            // group while the child's pid still names it.
+            let group=tree;let mut resources=prepared;
+            let result=tokio::select!{s=crate::process::wait_exit(&mut child)=>s.map(child_status).map_err(anyhow::Error::from),failure=workspace_share_failure(&mut resources)=>{signal_group(pid,15);let _=tokio::time::timeout(Duration::from_secs(3),crate::process::wait_exit(&mut child)).await;failure.and_then(|_|Err(anyhow::anyhow!("workspace sharing tunnel stopped")))},_=r.changed()=>{let signal=(*r.borrow()).unwrap_or(15);signal_group(pid,signal);let _=tokio::time::timeout(Duration::from_secs(3),crate::process::wait_exit(&mut child)).await;Ok(128+signal)}};
+            drop(group);
+            let _ = child.wait().await;
+            result
+        });
         turbo_manifest = Some(manifest);
     } else {
         for p in prepared {

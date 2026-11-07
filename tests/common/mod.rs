@@ -17,6 +17,17 @@ fn slots() -> impl Iterator<Item = u16> {
         .filter(move |base| !(*base..base + SLOT).any(|p| defaults.contains(&p)))
 }
 
+/// Slots one test may use (the network test needs eight). A test's first
+/// `free_port` claims this many at once (see below); asking for more is a
+/// test bug.
+const SLOTS_PER_TEST: usize = 8;
+
+/// Ports at the start of a slot that tests bind directly (the proxy port and
+/// the few above it that `first_run.rs` occupies). They must be free when the
+/// slot is claimed; the rest of the slot is only probed or assigned by Porch,
+/// which skips busy ports.
+const CHECKED_PER_SLOT: u16 = 8;
+
 /// A TCP port that is free right now, for a proxy or app the test starts.
 ///
 /// Binding `127.0.0.1:0` and dropping the listener yields an *ephemeral* port.
@@ -28,54 +39,184 @@ fn slots() -> impl Iterator<Item = u16> {
 /// Ports here are never assigned implicitly. Each one is the base of its own
 /// 256-port slot, because Porch probes up to 200 ports above a busy proxy port
 /// to suggest a free one; adjacent test ports would see those probes as
-/// transient conflicts. A slot is claimed with an exclusive lock file held
-/// until this process exits, which keeps slots unique among this process's
-/// parallel tests and across concurrent test processes (cargo-nextest,
-/// several `cargo test` runs).
+/// transient conflicts. A slot is claimed with an exclusive lock file, which
+/// keeps slots unique among this process's parallel tests and across
+/// concurrent test processes (cargo-nextest, several `cargo test` runs), and
+/// the ports tests bind directly must be free when it is claimed.
+///
+/// Claims belong to the calling test's thread and end when it exits. The
+/// first call in a thread claims all `SLOTS_PER_TEST` slots at once, under a
+/// lock shared by every test process, and later calls hand them out. A test
+/// waiting for slots therefore holds none, and a test holding slots never
+/// waits for more, so concurrent tests cannot deadlock on the 117 slots.
 pub fn free_port() -> u16 {
-    use fs2::FileExt;
-    // Ports returned by this process, with the lock files that claim them for
-    // other processes. Tracked by number too: whether two open files of one
-    // process conflict under flock is not something to rely on everywhere.
-    static CLAIMS: Mutex<Vec<(u16, std::fs::File)>> = Mutex::new(Vec::new());
-    let claims = std::env::temp_dir().join("porch-test-port-slots");
-    std::fs::create_dir_all(&claims).unwrap();
-    let all: Vec<u16> = slots().collect();
-    // Start each process at a different slot so concurrent processes rarely
-    // contend for the same lock files.
-    let start = std::process::id() as usize % all.len();
-    // Concurrent test processes can claim every slot. Their claims end when
-    // they exit, and TIME_WAIT on a slot's port expires within minutes, so
-    // wait for a slot rather than fail.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
-    loop {
-        let mut claimed = CLAIMS.lock().unwrap_or_else(|e| e.into_inner());
-        for port in all[start..].iter().chain(&all[..start]).copied() {
-            if claimed.iter().any(|(p, _)| *p == port) {
-                continue;
-            }
-            let Ok(claim) = std::fs::OpenOptions::new()
+    thread_local! {
+        static BATCH: std::cell::RefCell<Option<Batch>> = const { std::cell::RefCell::new(None) };
+    }
+    BATCH.with(|batch| {
+        let mut batch = batch.borrow_mut();
+        let batch = batch.get_or_insert_with(Batch::claim);
+        assert!(
+            batch.next < batch.slots.len(),
+            "a test may use at most {SLOTS_PER_TEST} ports from free_port()"
+        );
+        batch.next += 1;
+        batch.slots[batch.next - 1].0
+    })
+}
+
+/// Slot bases this process has claimed, with the lock files that claim them
+/// for other processes. Tracked by number too: whether two open files of one
+/// process conflict under flock is not something to rely on everywhere.
+static CLAIMED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+struct Batch {
+    slots: Vec<(u16, std::fs::File)>,
+    next: usize,
+}
+impl Batch {
+    fn claim() -> Self {
+        use fs2::FileExt;
+        let dir = std::env::temp_dir().join("porch-test-port-slots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let all: Vec<u16> = slots().collect();
+        // Start each process at a different slot so concurrent processes
+        // rarely contend for the same lock files.
+        let start = std::process::id() as usize % all.len();
+        // Other tests release slots when they finish; TIME_WAIT on a slot's
+        // ports expires within minutes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        loop {
+            let admission = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .write(true)
-                .open(claims.join(port.to_string()))
-            else {
-                continue;
-            };
-            if claim.try_lock_exclusive().is_err() {
-                continue;
+                .open(dir.join("admission"))
+                .unwrap();
+            admission.lock_exclusive().unwrap();
+            let mut claimed = CLAIMED.lock().unwrap_or_else(|e| e.into_inner());
+            let mut locked: Vec<(u16, std::fs::File)> = Vec::new();
+            let candidates: Vec<u16> = all[start..]
+                .iter()
+                .chain(&all[..start])
+                .copied()
+                .filter(|base| !claimed.contains(base))
+                .collect();
+            let mut candidates = candidates.into_iter();
+            // Lock candidates in rounds, keeping only clean ones (a slot's
+            // previous test may have left a directly bound port in TIME_WAIT),
+            // until enough are held or every slot has been tried.
+            loop {
+                let want = SLOTS_PER_TEST - locked.len();
+                let mut round = Vec::new();
+                for base in candidates.by_ref() {
+                    let Ok(claim) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .write(true)
+                        .open(dir.join(base.to_string()))
+                    else {
+                        continue;
+                    };
+                    if claim.try_lock_exclusive().is_ok() {
+                        round.push((base, claim));
+                        if round.len() == want {
+                            break;
+                        }
+                    }
+                }
+                if round.is_empty() {
+                    break;
+                }
+                let bases: Vec<u16> = round.iter().map(|(base, _)| *base).collect();
+                let clean = clean_slots(&bases);
+                locked.extend(round.into_iter().filter(|(base, _)| clean.contains(base)));
+                if locked.len() == SLOTS_PER_TEST {
+                    claimed.extend(locked.iter().map(|(base, _)| *base));
+                    return Self {
+                        slots: locked,
+                        next: 0,
+                    };
+                }
             }
-            if bindable(&[port]) {
-                claimed.push((port, claim));
-                return port;
-            }
+            // All or nothing: release everything and wait holding no slot.
+            drop(locked);
+            drop(claimed);
+            drop(admission);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "not enough free test port slots for ten minutes"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        drop(claimed);
-        assert!(
-            std::time::Instant::now() < deadline,
-            "every test port slot stayed claimed by a test or busy (TIME_WAIT)"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+impl Drop for Batch {
+    fn drop(&mut self) {
+        let mut claimed = CLAIMED.lock().unwrap_or_else(|e| e.into_inner());
+        claimed.retain(|base| !self.slots.iter().any(|(b, _)| b == base));
+        // Dropping the files releases the locks for other processes.
+    }
+}
+
+/// The slots among `bases` whose first `CHECKED_PER_SLOT` ports are bindable
+/// (see [`bindable`]).
+fn clean_slots(bases: &[u16]) -> Vec<u16> {
+    if bases.is_empty() {
+        return Vec::new();
+    }
+    #[cfg(unix)]
+    {
+        const CHECK: &str = r#"
+import errno, socket, sys
+size = int(sys.argv[1])
+for base in map(int, sys.argv[2:]):
+    clean = True
+    for port in range(base, base + size):
+        for family, host in ((socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')):
+            try:
+                s = socket.socket(family)
+            except OSError:
+                continue
+            with s:
+                if family == socket.AF_INET6:
+                    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                try:
+                    s.bind((host, port))
+                except OSError as e:
+                    if family == socket.AF_INET6 and e.errno in (errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT):
+                        continue
+                    clean = False
+            if not clean:
+                break
+        if not clean:
+            break
+    if clean:
+        print(base)
+"#;
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(CHECK)
+            .arg(CHECKED_PER_SLOT.to_string())
+            .args(bases.iter().map(u16::to_string))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("port checks require Python 3");
+        assert!(output.status.success(), "slot check failed");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        bases
+            .iter()
+            .copied()
+            .filter(|base| {
+                (*base..base + CHECKED_PER_SLOT).all(|port| porch::sockets::reserve(port).is_ok())
+            })
+            .collect()
     }
 }
 
@@ -88,6 +229,7 @@ pub fn free_port() -> u16 {
 /// child that a parallel test forks at that moment and stays open there until
 /// the child calls exec: the port this function just found free would then
 /// refuse the bind of the Porch process or fixture it is handed to.
+#[allow(dead_code)]
 pub fn bindable(ports: &[u16]) -> bool {
     #[cfg(unix)]
     {
@@ -210,26 +352,57 @@ pub fn app_ports(slot: u16) -> String {
     format!("{}-{}", slot + APP_OFFSET, slot + SLOT - 1)
 }
 
-/// A loopback port that refuses connections for as long as the returned
-/// socket lives: the socket is bound but never listens, so nothing else can
-/// bind the port and a connection attempt is reset.
+/// A port that refuses connections for as long as the returned sockets
+/// live: they are bound but never listen, so nothing else can bind the port
+/// and a connection attempt is reset.
 ///
 /// A test needing a port where nothing listens must not bind `127.0.0.1:0`
 /// and drop the listener: the OS hands that port to the next `:0` bind, so the
 /// test's probe may reach, and disturb, another test's listener.
+///
+/// Both families are held (all IPv4 and IPv6 interfaces), so no other process
+/// can listen on this port number anywhere and be seen by a port lookup.
 #[allow(dead_code)]
-pub fn refused_port() -> (socket2::Socket, u16) {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )
-    .unwrap();
-    socket
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
-        .unwrap();
-    let port = socket.local_addr().unwrap().as_socket().unwrap().port();
-    (socket, port)
+pub fn refused_port() -> (RefusedPort, u16) {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    loop {
+        let v4 = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        v4.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())
+            .unwrap();
+        let port = v4.local_addr().unwrap().as_socket().unwrap().port();
+        let v6 = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).and_then(|v6| {
+            v6.set_only_v6(true)?;
+            v6.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+            Ok(v6)
+        });
+        match v6 {
+            Ok(v6) => return (RefusedPort(v4, Some(v6)), port),
+            // No IPv6 on this machine: nothing can listen there either.
+            Err(e)
+                if matches!(e.kind(), std::io::ErrorKind::AddrNotAvailable)
+                    || e.raw_os_error() == Some(libc_eafnosupport()) =>
+            {
+                return (RefusedPort(v4, None), port)
+            }
+            // Someone holds this port's IPv6 side: pick another port.
+            Err(_) => continue,
+        }
+    }
+}
+/// The sockets holding a [`refused_port`]; dropping them frees the port.
+#[allow(dead_code)]
+pub struct RefusedPort(socket2::Socket, Option<socket2::Socket>);
+#[allow(dead_code)]
+fn libc_eafnosupport() -> i32 {
+    #[cfg(target_os = "linux")]
+    return 97;
+    #[cfg(target_os = "macos")]
+    return 47;
+    #[cfg(windows)]
+    return 10047;
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    return -1;
 }
 
 /// Create an executable at `path` that this process never holds open for

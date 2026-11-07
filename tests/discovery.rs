@@ -1013,12 +1013,37 @@ async fn a_rogue_machine_claiming_open_pairing_gets_neither_code_nor_credentials
         ],
         "the joiner stops before sending credentials"
     );
+    // Every request carries only the exchange's own fields: values the rogue
+    // issued (salt, session) and fixed-size cryptographic hex. The code has
+    // no field to appear in. (A substring check for "482913" would fail by
+    // chance on random hex.)
+    let hex = |v: &Value, len: usize| {
+        v.as_str()
+            .is_some_and(|s| s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit()))
+    };
     for (path, body) in &seen {
-        assert!(!body.contains("482913"), "{path} carried the code: {body}");
         assert!(
             !body.contains("token"),
             "{path} carried a credential: {body}"
         );
+        if body.is_empty() {
+            continue;
+        }
+        let fields: Value = serde_json::from_str(body).unwrap();
+        let fields = fields.as_object().unwrap();
+        let ok = match path.as_str() {
+            "/v1/pair-code/start" => {
+                fields.len() == 3
+                    && fields["pairing"].is_u64()
+                    && fields["salt"] == "5a".repeat(32)
+                    && hex(&fields["msg"], 66)
+            }
+            "/v1/pair-code/confirm" => {
+                fields.len() == 2 && fields["session"] == "s" && hex(&fields["confirm"], 64)
+            }
+            _ => false,
+        };
+        assert!(ok, "{path} carried unexpected fields: {body}");
     }
 }
 #[tokio::test]

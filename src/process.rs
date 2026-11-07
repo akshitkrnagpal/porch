@@ -150,13 +150,169 @@ impl TreeGuard {
     }
 }
 
+/// Whether `pid` is a child of this process that has not been reaped yet
+/// (running, or exited and waiting to be reaped).
+#[cfg(unix)]
+fn unreaped(pid: libc::pid_t) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return true;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return false;
+        }
+    }
+}
+
+/// Wait for a child to exit without reaping it, and return its status.
+///
+/// A process group's id is the leader's pid. Until the leader is reaped, even
+/// as a zombie, that id cannot name another process or group, so signaling
+/// the group reaches only the leader's own tree. Once it is reaped, the id
+/// can be reused at once (a machine whose pid counter has wrapped reuses
+/// freed pids within milliseconds), and the same signal would reach an
+/// unrelated process group. Callers clean up the group after this returns
+/// and reap the child last, with `Child::wait`.
+pub async fn wait_exit(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let Some(pid) = child.id() else {
+            // Already reaped: its status is cached.
+            return child.wait().await;
+        };
+        let raw = tokio::task::spawn_blocking(move || -> std::io::Result<i32> {
+            let pid = pid as libc::pid_t;
+            let info = loop {
+                if let Some(info) = exited(pid)? {
+                    break info;
+                }
+                block_until_exit(pid)?;
+            };
+            #[cfg(target_os = "linux")]
+            let status = unsafe { info.si_status() };
+            #[cfg(not(target_os = "linux"))]
+            let status = info.si_status;
+            // Encode it like a wait status: exit code in the second byte,
+            // terminating signal in the low bits.
+            Ok(match info.si_code {
+                libc::CLD_EXITED => (status & 0xff) << 8,
+                libc::CLD_DUMPED => status | 0x80,
+                _ => status,
+            })
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        Ok(std::process::ExitStatus::from_raw(raw))
+    }
+    #[cfg(windows)]
+    {
+        // Job objects, not reusable ids, own the tree on Windows.
+        child.wait().await
+    }
+}
+
+/// The exit report of child `pid` if it has exited (not merely stopped),
+/// leaving it unreaped.
+#[cfg(unix)]
+fn exited(pid: libc::pid_t) -> std::io::Result<Option<libc::siginfo_t>> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let reported = unsafe { info.si_pid() } == pid;
+    #[cfg(not(target_os = "linux"))]
+    let reported = info.si_pid == pid;
+    // macOS also reports a stopped child here, despite asking only for exits.
+    let exit = matches!(
+        info.si_code,
+        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+    );
+    Ok((reported && exit).then_some(info))
+}
+
+/// Block until child `pid` exits (or something changes that may be an exit).
+#[cfg(target_os = "linux")]
+fn block_until_exit(pid: libc::pid_t) -> std::io::Result<()> {
+    // Linux reports only exits for WEXITED.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    let error = std::io::Error::last_os_error();
+    if result == 0 || error.raw_os_error() == Some(libc::EINTR) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+/// Block until child `pid` exits. kqueue's exit note, unlike waitid, ignores
+/// a child that is only stopped.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn block_until_exit(pid: libc::pid_t) -> std::io::Result<()> {
+    let queue = unsafe { libc::kqueue() };
+    if queue < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let change = libc::kevent {
+        ident: pid as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::kevent(queue, &change, 1, &mut event, 1, std::ptr::null()) };
+    let error = std::io::Error::last_os_error();
+    unsafe { libc::close(queue) };
+    // ESRCH: it exited before the note was registered; the caller re-checks.
+    if result >= 0 || matches!(error.raw_os_error(), Some(libc::EINTR | libc::ESRCH)) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 impl Drop for TreeGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
         {
             // A negative PID targets the application process group, including
-            // descendants that outlive their original parent.
-            if self.group > 0 {
+            // descendants that outlive their original parent. Only while the
+            // leader is unreaped does the id still name that group (see
+            // `wait_exit`); after an early reap it may name someone else's.
+            if self.group > 0 && unreaped(self.group) {
                 unsafe { libc::kill(-self.group, libc::SIGKILL) };
             }
         }

@@ -826,7 +826,10 @@ async fn real_tls_code_exchange_is_mutual_single_use_and_stores_joiner() {
     let (code, x) = start(&f, &opened.code).await;
     assert_eq!(code, StatusCode::OK);
     let x = x.unwrap();
-    assert!(!x.host_msg.contains(&opened.code));
+    // Only a hex group element crosses the wire (a substring check for the
+    // code would fail by chance on random hex).
+    assert_eq!(x.host_msg.len(), 66, "{}", x.host_msg);
+    assert!(x.host_msg.bytes().all(|b| b.is_ascii_hexdigit()));
     // Credentials cannot skip the joiner's proof.
     let (code, _) = finish(&f, &x, None).await;
     assert_eq!(code, StatusCode::GONE, "finish before confirm");

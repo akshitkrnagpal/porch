@@ -216,28 +216,37 @@ with context.wrap_socket(socket.create_connection(('127.0.0.1',int(sys.argv[2]))
         assert_eq!(h["hops"], "1");
         assert_eq!(h["porch_hops"], "1");
         assert_eq!(h["port"], port.to_string());
-        let mut stream = client
-            .get(format!("{url}/sse"))
-            .send()
+        // The upstream holds the rest of the response until the test confirms
+        // the first event, so the first event (and the headers before it) can
+        // only arrive if the proxy streams. Every step is bounded so a
+        // buffering proxy fails instead of hanging; a passing run never waits
+        // out a bound.
+        let bound = Duration::from_secs(30);
+        let mut stream = tokio::time::timeout(bound, client.get(format!("{url}/sse")).send())
             .await
+            .expect("response headers must stream before the body completes")
             .unwrap()
             .bytes_stream();
-        // The upstream holds the rest of the response until this confirmation,
-        // so receiving the first event proves it was streamed, not buffered.
-        // The timeouts only bound a broken proxy; a passing run never waits.
-        let first = tokio::time::timeout(Duration::from_secs(30), stream.next())
-            .await
-            .expect("first event must stream before the response completes")
-            .unwrap()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&first).contains("first"));
+        // Chunks are not events: read up to each complete SSE frame.
+        let mut buffer = String::new();
+        let mut next_event = async |buffer: &mut String| -> String {
+            loop {
+                if let Some(end) = buffer.find("\n\n") {
+                    let event = buffer[..end].to_owned();
+                    buffer.drain(..end + 2);
+                    return event;
+                }
+                let chunk = tokio::time::timeout(bound, stream.next())
+                    .await
+                    .expect("an event must stream before the response completes")
+                    .expect("stream ended before the event")
+                    .unwrap();
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        };
+        assert_eq!(next_event(&mut buffer).await, "data: first");
         first_seen.notify_one();
-        let second = tokio::time::timeout(Duration::from_secs(30), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&second).contains("second"));
+        assert_eq!(next_event(&mut buffer).await, "data: second");
         if !tls {
             let actual_loop = tokio::time::timeout(
                 Duration::from_secs(5),

@@ -1601,14 +1601,28 @@ mod tests {
         let cli = directory.join("porch");
         let log = directory.join("calls");
         let quoted_log = format!("'{}'", log.display());
+        let release = directory.join("release");
+        let quoted_release = format!("'{}'", release.display());
         let json = serde_json::to_string(&snapshot()).unwrap();
-        // The first discovery is slow, so every flip queues up behind it.
+        // The first discovery blocks until every flip is queued behind it.
         crate::test_support::write_executable(
             &cli,
-            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncase \"$1\" in peers) sleep 0.5;; proxy) exit 0;; esac\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"),
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncase \"$1\" in peers) while [ ! -e {quoted_release} ]; do sleep 0.01; done;; proxy) exit 0;; esac\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"),
         );
         let (commands, updates) =
             worker_with_intervals(cli, Duration::from_secs(60), Duration::from_secs(60));
+        // Queue the flips only once the worker is inside that discovery.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("peers")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "discovery never started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         for flip in 0..flips {
             commands
                 .send(if flip % 2 == 0 {
@@ -1618,8 +1632,9 @@ mod tests {
                 })
                 .unwrap();
         }
+        fs::write(&release, "").unwrap();
         let settled = loop {
-            match updates.recv_timeout(Duration::from_secs(5)).unwrap() {
+            match updates.recv_timeout(Duration::from_secs(30)).unwrap() {
                 done @ Update::ProxyDone { .. } => break done,
                 _ => continue,
             }

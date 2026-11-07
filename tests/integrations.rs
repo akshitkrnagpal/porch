@@ -86,12 +86,12 @@ impl Drop for Sandbox {
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
-/// Wait until `pid` no longer exists. A killed process that Porch did not reap
-/// stays a zombie, which still answers `kill(pid, 0)`, until its new parent
-/// (init) reaps it after Porch exits.
+/// Wait until `pid` has exited. A killed process Porch did not reap stays a
+/// zombie until its new parent reaps it, which a container's init may never
+/// do; a zombie has exited, so it counts as gone.
 fn wait_gone(pid: i32, what: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while unsafe { libc::kill(pid, 0) } == 0 {
+    while porch::state::alive(pid as u32) {
         assert!(std::time::Instant::now() < deadline, "{what}: pid {pid}");
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -742,7 +742,21 @@ fn stalled_external_helper_has_bounded_lifetime() {
             .args(["-f", &helper.to_string_lossy()])
             .output()
             .unwrap();
-        if !running.status.success() {
+        // pgrep exits 1 for "no match"; anything else but 0 is a failed check.
+        match running.status.code() {
+            Some(1) => break,
+            Some(0) => {}
+            other => panic!(
+                "pgrep failed ({other:?}): {}",
+                String::from_utf8_lossy(&running.stderr)
+            ),
+        }
+        // pgrep lists zombies too; an exited helper waiting for its reaper is gone.
+        let pids: Vec<u32> = String::from_utf8_lossy(&running.stdout)
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        if pids.iter().all(|pid| !porch::state::alive(*pid)) {
             break;
         }
         assert!(
