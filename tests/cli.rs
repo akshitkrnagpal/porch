@@ -596,3 +596,40 @@ fn https_opt_in_keeps_the_no_sudo_port() {
     // The standard port is still available when asked for explicitly.
     assert_eq!(url(&[("PORCH_PORT", "443")]), "https://web.localhost");
 }
+
+#[test]
+fn saved_proxy_ports_survive_the_https_default_change() {
+    let s = Sandbox::new();
+    let state = s.root.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let url = |saved: &str, https: &str| {
+        std::fs::write(state.join("proxy.json"), saved).unwrap();
+        let o = s
+            .command(&["get", "web"])
+            .env_remove("PORCH_PORT")
+            .env("PORCH_HTTPS", https)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap().trim().to_owned()
+    };
+    // Existing HTTPS-on-443 setups keep their port.
+    assert_eq!(
+        url(r#"{"port":443,"tls":true,"tlds":["localhost"]}"#, "1"),
+        "https://web.localhost"
+    );
+    // Switching protocols never lands on the other protocol's privileged port.
+    assert_eq!(
+        url(r#"{"port":80,"tls":false,"tlds":["localhost"]}"#, "1"),
+        "https://web.localhost:7462"
+    );
+    assert_eq!(
+        url(r#"{"port":443,"tls":true,"tlds":["localhost"]}"#, "0"),
+        "http://web.localhost:7462"
+    );
+    // A custom high port is kept when HTTPS is turned on.
+    assert_eq!(
+        url(r#"{"port":8080,"tls":false,"tlds":["localhost"]}"#, "1"),
+        "https://web.localhost:8080"
+    );
+}
