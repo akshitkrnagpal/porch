@@ -86,6 +86,10 @@ pub struct PeerCatalog {
     pub last_seen: u64,
     pub catalog: Option<Catalog>,
     pub error: Option<String>,
+    /// Pinned certificate SHA-256 (not secret), to compare with the other
+    /// machine's `porch discovery fingerprint`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -94,6 +98,18 @@ pub struct Snapshot {
     pub peers: Vec<PeerCatalog>,
     pub candidates: Vec<Candidate>,
     pub warnings: Vec<String>,
+    /// This machine's discovery agent. Absent from older CLIs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing: Option<SharingState>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharingState {
+    /// The discovery agent is running.
+    pub running: bool,
+    /// Paired machines may open this machine's apps.
+    pub share_apps: bool,
+    /// The agent starts at login.
+    pub autostart: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -151,7 +167,7 @@ impl PairState {
     }
 }
 /// `porch pair status ID --json` (and `pair cancel ID --json`).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairStatusReport {
     pub version: u32,
     pub id: String,
@@ -167,7 +183,7 @@ pub struct PairStatusReport {
     pub peer: Option<Machine>,
 }
 /// `porch pair --no-wait --json`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairShown {
     pub version: u32,
     pub id: String,
@@ -187,7 +203,7 @@ pub struct JoinCandidate {
 /// Why `porch pair CODE` failed. `code` is stable for scripts and the tray:
 /// wrong_code, not_waiting, rate_limited, certificate_mismatch, host_full,
 /// no_host, multiple_hosts, unreachable, invalid_code, protocol, local.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JoinFailure {
     pub code: String,
     pub message: String,

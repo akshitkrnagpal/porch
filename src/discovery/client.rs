@@ -746,6 +746,7 @@ async fn query_peer_inner(mut peer: Peer, candidates: &[Candidate]) -> PeerCatal
                     last_seen: peer.last_seen,
                     catalog: Some(catalog),
                     error: None,
+                    fingerprint: peer.fingerprint,
                 };
             }
             Err(e) => last_error = e.to_string(),
@@ -759,6 +760,7 @@ async fn query_peer_inner(mut peer: Peer, candidates: &[Candidate]) -> PeerCatal
         last_seen: peer.last_seen,
         catalog: None,
         error: Some(last_error),
+        fingerprint: peer.fingerprint,
     }
 }
 fn unavailable_peer(peer: Peer, message: &str) -> PeerCatalog {
@@ -770,6 +772,7 @@ fn unavailable_peer(peer: Peer, message: &str) -> PeerCatalog {
         last_seen: peer.last_seen,
         catalog: None,
         error: Some(message.into()),
+        fingerprint: peer.fingerprint,
     }
 }
 async fn query_peer(peer: Peer, candidates: &[Candidate]) -> PeerCatalog {
@@ -840,6 +843,11 @@ pub async fn snapshot(refresh: bool) -> Result<Snapshot> {
         peers: results,
         candidates,
         warnings,
+        sharing: Some(SharingState {
+            running: super::running(),
+            share_apps: super::server::config()?.is_some_and(|c| c.share_apps),
+            autostart: super::autostart::installed(),
+        }),
     })
 }
 fn endpoint_ip(endpoint: &str) -> Option<IpAddr> {

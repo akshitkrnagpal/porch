@@ -589,6 +589,7 @@ fn paired_machines_are_not_listed_again_as_discovered() {
         last_seen: 0,
         catalog: None,
         error: None,
+        fingerprint: String::new(),
     };
     let candidate =
         |id: Option<&str>, endpoint: &str, source: Source, node: Option<&str>| Candidate {
