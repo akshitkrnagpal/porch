@@ -2,10 +2,31 @@ name: CI
 # Branches are tested through their pull request; pushes run only for main,
 # so one commit never runs the full matrix twice. Release tags are tested by
 # release.yml.
+#
+# Changes that cannot affect a build or test skip CI entirely: documentation,
+# screenshots and the release workflow (which only runs on tags). Later
+# patterns win, so packaging/README.md still runs CI: release archives ship
+# it as their README and scripts/test_packaging.py checks it is present.
+# Keep both lists the same. No status check is required on main, so a
+# skipped run never blocks a merge.
 on:
   push:
     branches: [main]
+    paths:
+      - '**'
+      - '!**.md'
+      - '!docs/**'
+      - '!assets/screenshots/**'
+      - '!.github/workflows/release.yml'
+      - 'packaging/README.md'
   pull_request:
+    paths:
+      - '**'
+      - '!**.md'
+      - '!docs/**'
+      - '!assets/screenshots/**'
+      - '!.github/workflows/release.yml'
+      - 'packaging/README.md'
   workflow_dispatch:
 permissions:
   contents: read
@@ -44,15 +65,15 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --no-fail-fast --all-targets
-      # The only release build of the CLI. This job never installs desktop
-      # libraries or enables the tray feature, so the check below proves the
-      # headless CLI neither needs nor links them.
-      - run: cargo build --release --bin porch
+      # This job never installs desktop libraries or enables the tray feature,
+      # so the check below proves the headless CLI neither needs nor links
+      # them. It uses the debug binary `cargo test` already built: linkage is
+      # the same as a release build, without a second full compile.
       - if: runner.os == 'Linux'
         name: Headless CLI stays independent of desktop libraries
         run: |
-          env -u DISPLAY -u WAYLAND_DISPLAY target/release/porch --state-dir "$RUNNER_TEMP/porch-headless" list --json
-          if ldd target/release/porch | grep -Ei 'gtk|gdk|appindicator|cairo'; then exit 1; fi
+          env -u DISPLAY -u WAYLAND_DISPLAY target/debug/porch --state-dir "$RUNNER_TEMP/porch-headless" list --json
+          if ldd target/debug/porch | grep -Ei 'gtk|gdk|appindicator|cairo'; then exit 1; fi
   windows:
     # The CLI and tray must build and lint clean, the CLI must smoke-start
     # without state, packaging must work, and unit and integration tests must
