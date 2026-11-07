@@ -1367,6 +1367,194 @@ pub fn package_script_call(command: &[String], cwd: &Path) -> Option<(String, us
     resolve_script_raw(script, cwd).map(|raw| (raw, rest))
 }
 
+/// Port and host arguments for common non-JavaScript dev servers that ignore
+/// `PORT`: Python's http.server, Django, Flask, FastAPI, uvicorn, gunicorn,
+/// Streamlit, MkDocs, Jupyter, Hugo and Jekyll. Runners such as `uv run`,
+/// `poetry run` and `bundle exec`, and `python -m MODULE`, are seen through.
+/// Arguments the user already passed win; nothing is added for other commands.
+/// Returns the insert position and the arguments to insert there.
+fn native_server_flags(command: &[String], port: u16) -> Option<(usize, Vec<String>)> {
+    let mut i = 0;
+    loop {
+        let first = basename(command.get(i)?);
+        let second = command.get(i + 1).map(String::as_str);
+        match (first, second) {
+            ("uv" | "poetry" | "pipenv" | "pdm" | "hatch" | "rye", Some("run"))
+            | ("bundle", Some("exec")) => i += 2,
+            _ => break,
+        }
+    }
+    let first = basename(&command[i]);
+    let python = first == "python"
+        || first == "py"
+        || first
+            .strip_prefix("python")
+            .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'));
+    // `python -m module` and `python manage.py` both name the tool second.
+    let (tool, rest) = if python {
+        match command.get(i + 1).map(String::as_str) {
+            Some("-m") => (command.get(i + 2)?.as_str(), i + 3),
+            Some(script) if basename(script) == "manage.py" => ("manage.py", i + 2),
+            _ => return None,
+        }
+    } else {
+        (first, i + 1)
+    };
+    let end = command
+        .iter()
+        .skip(rest)
+        .position(|a| a == "--")
+        .map_or(command.len(), |p| p + rest);
+    let args = &command[rest..end];
+    let has = |flags: &[&str]| {
+        args.iter().any(|a| {
+            flags.iter().any(|f| {
+                a == f
+                    || a.strip_prefix(f).is_some_and(|r| {
+                        r.starts_with('=') || (!f.starts_with("--") && !r.is_empty())
+                    })
+            })
+        })
+    };
+    let sub = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str);
+    let positional_after = |word: &str| {
+        args.iter()
+            .skip_while(|a| a.as_str() != word)
+            .skip(1)
+            .any(|a| !a.starts_with('-'))
+    };
+    let p = port.to_string();
+    let host = "127.0.0.1".to_owned();
+    let flags: Vec<String> = match tool {
+        "http.server" => {
+            // The port is http.server's only positional argument. A port the
+            // user chose means they chose the whole address: leave it alone.
+            let has_port = args.iter().enumerate().any(|(k, a)| {
+                !a.starts_with('-')
+                    && !matches!(
+                        k.checked_sub(1)
+                            .and_then(|k| args.get(k))
+                            .map(String::as_str),
+                        Some("--bind" | "-b" | "--directory" | "-d" | "--protocol" | "-p")
+                    )
+            });
+            let mut f = vec![];
+            if !has_port {
+                if !has(&["--bind", "-b"]) {
+                    f.extend(["--bind".into(), host]);
+                }
+                f.push(p);
+            }
+            f
+        }
+        "manage.py" | "django-admin" if sub == Some("runserver") => {
+            if positional_after("runserver") {
+                vec![]
+            } else {
+                vec![format!("127.0.0.1:{port}")]
+            }
+        }
+        "flask" if sub == Some("run") => {
+            let mut f = vec![];
+            if !has(&["--port", "-p"]) {
+                f.extend(["--port".into(), p]);
+            }
+            if !has(&["--host", "-h"]) {
+                f.extend(["--host".into(), host]);
+            }
+            f
+        }
+        "fastapi" if matches!(sub, Some("dev" | "run")) => {
+            let mut f = vec![];
+            if !has(&["--port"]) {
+                f.extend(["--port".into(), p]);
+            }
+            if !has(&["--host"]) {
+                f.extend(["--host".into(), host]);
+            }
+            f
+        }
+        "uvicorn" => {
+            let mut f = vec![];
+            if !has(&["--port", "--uds", "--fd"]) {
+                f.extend(["--port".into(), p]);
+            }
+            if !has(&["--host"]) {
+                f.extend(["--host".into(), host]);
+            }
+            f
+        }
+        "gunicorn" => {
+            if has(&["--bind", "-b"]) {
+                vec![]
+            } else {
+                vec!["--bind".into(), format!("127.0.0.1:{port}")]
+            }
+        }
+        "streamlit" if sub == Some("run") => {
+            let mut f = vec![];
+            if !has(&["--server.port"]) {
+                f.extend(["--server.port".into(), p]);
+            }
+            if !has(&["--server.address"]) {
+                f.extend(["--server.address".into(), host]);
+            }
+            if !has(&["--server.headless"]) {
+                f.extend(["--server.headless".into(), "true".into()]);
+            }
+            f
+        }
+        "mkdocs" if sub == Some("serve") => {
+            if has(&["--dev-addr", "-a"]) {
+                vec![]
+            } else {
+                vec!["--dev-addr".into(), format!("127.0.0.1:{port}")]
+            }
+        }
+        "jupyter" | "jupyter-lab" | "jupyter-notebook"
+            if tool != "jupyter" || matches!(sub, Some("lab" | "notebook" | "server")) =>
+        {
+            let mut f = vec![];
+            if !has(&["--port", "--ServerApp.port"]) {
+                // Never let Jupyter wander to another port behind Porch's back.
+                f.extend([
+                    format!("--port={port}"),
+                    "--ServerApp.port_retries=0".into(),
+                ]);
+            }
+            if !has(&["--no-browser"]) {
+                f.push("--no-browser".into());
+            }
+            f
+        }
+        "hugo" if matches!(sub, Some("server" | "serve")) => {
+            let mut f = vec![];
+            if !has(&["--port", "-p"]) {
+                f.extend(["--port".into(), p]);
+            }
+            if !has(&["--bind"]) {
+                f.extend(["--bind".into(), host]);
+            }
+            f
+        }
+        "jekyll" if matches!(sub, Some("serve" | "server" | "s")) => {
+            let mut f = vec![];
+            if !has(&["--port", "-P"]) {
+                f.extend(["--port".into(), p]);
+            }
+            if !has(&["--host", "-H"]) {
+                f.extend(["--host".into(), host]);
+            }
+            f
+        }
+        _ => return None,
+    };
+    (!flags.is_empty()).then_some((end, flags))
+}
+
 /// Adapt direct frameworks and package scripts without retokenizing shell scripts.
 pub fn adapt_command(
     command: &[String],
@@ -1392,6 +1580,11 @@ pub fn adapt_command(
             .and_then(framework_invocation)
             .map(|i| i.name)
     });
+    if direct.is_none() && script_call.is_none() {
+        if let Some((at, flags)) = native_server_flags(command, port) {
+            out.splice(at..at, flags);
+        }
+    }
     if let Some(inv) = direct {
         let flags = framework_flags(&inv, port, lan);
         let mut inserted = Vec::new();

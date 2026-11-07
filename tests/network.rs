@@ -78,6 +78,7 @@ async fn actual_http_tls_h2_ws_streaming_routing_and_redirects() {
     let _ = std::fs::remove_dir_all(&dir);
     std::env::set_var("PORCH_STATE_DIR", &dir);
     std::env::set_var("PORCH_SYNC_HOSTS", "0");
+    std::env::set_var("PORCH_CLEAN_URLS", "0");
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let up = upstream.local_addr().unwrap().port();
     let first_seen = Arc::new(tokio::sync::Notify::new());
@@ -670,6 +671,7 @@ with context.wrap_socket(socket.create_connection(('127.0.0.1',int(sys.argv[2]))
     let _ = proxy.await;
     std::env::remove_var("PORCH_HOSTS_FILE");
     std::env::set_var("PORCH_SYNC_HOSTS", "0");
+    std::env::set_var("PORCH_CLEAN_URLS", "0");
     v6server.abort();
     server.abort();
     std::fs::remove_dir_all(dir).unwrap();

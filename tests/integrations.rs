@@ -50,6 +50,7 @@ impl Sandbox {
     fn cmd(&self) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_porch"));
         c.env("PORCH_STATE_DIR", self.dir.join("state"))
+            .env("PORCH_CLEAN_URLS", "0")
             .env("PORCH_HOSTS_FILE", self.dir.join("hosts"))
             .env("PORCH_SYNC_HOSTS", "0")
             .env("PORCH_PORT", self.port.to_string())

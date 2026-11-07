@@ -34,6 +34,7 @@ impl Sandbox {
         c.args(args)
             .current_dir(&self.root)
             .env("PORCH_STATE_DIR", self.root.join("state"))
+            .env("PORCH_CLEAN_URLS", "0")
             .env("PORCH_PORT", self.port.to_string())
             .env("PORCH_APP_PORTS", common::app_ports(self.port))
             .env("PORCH_HTTPS", "0")
@@ -587,7 +588,7 @@ fn proxy_recovers_after_accept_fd_exhaustion() {
 import os,resource,socket,subprocess,sys,tempfile,time
 with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
  port=int(sys.argv[2])
- env=os.environ.copy();env.update(PORCH_STATE_DIR=root,PORCH_SYNC_HOSTS='0',PORCH_SKIP_TRUST='1')
+ env=os.environ.copy();env.update(PORCH_STATE_DIR=root,PORCH_SYNC_HOSTS='0',PORCH_SKIP_TRUST='1',PORCH_CLEAN_URLS='0')
  def limit():resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
  with open(root+'/log','w+') as log:
   child=subprocess.Popen([sys.argv[1],'proxy','start','--foreground','--no-tls','--bind','127.0.0.1','--port',str(port)],env=env,stdout=log,stderr=log,preexec_fn=limit)

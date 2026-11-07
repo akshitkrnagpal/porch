@@ -38,6 +38,7 @@ impl Sandbox {
             .env_remove("PORTLESS_PORT")
             .env_remove("PORCH_HTTPS")
             .env("PORCH_STATE_DIR", self.root.join("state"))
+            .env("PORCH_CLEAN_URLS", "0")
             .env("PORCH_APP_PORTS", common::app_ports(self.apps))
             .env("PORCH_SYNC_HOSTS", "0")
             .env("PORCH_SKIP_TRUST", "1")
@@ -134,6 +135,35 @@ fn default_is_plain_http_on_7462_without_privileges() {
     assert_eq!(v["proxy"]["port"], 7462);
     assert_eq!(v["proxy"]["tls"], false);
     assert_eq!(v["proxy"]["unprivileged"], true);
+}
+
+/// Could a non-root user bind port 80 on every address right now?
+fn port_80_bindable_without_sudo() -> bool {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        return false;
+    }
+    std::net::TcpListener::bind("0.0.0.0:80").is_ok()
+}
+
+#[test]
+fn fresh_install_uses_port_free_urls_only_when_no_sudo_is_needed() {
+    let s = Sandbox::new();
+    let out = s
+        .command(&["get", "web", "--no-worktree"])
+        .env("PORCH_CLEAN_URLS", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if port_80_bindable_without_sudo() {
+        assert_eq!(url, "http://web.localhost");
+    } else {
+        assert_eq!(url, "http://web.localhost:7462");
+    }
+    // Opting out keeps the high port.
+    let (url, _) = s.ok(&["get", "web", "--no-worktree"]);
+    assert_eq!(url.trim(), "http://web.localhost:7462");
 }
 
 #[test]

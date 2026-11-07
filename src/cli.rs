@@ -694,22 +694,47 @@ pub(crate) fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
     if state::env("PORT").is_some() && explicit_port.is_none() {
         bail!("invalid proxy port; set a number, e.g. `PORCH_PORT={DEFAULT_PROXY_PORT} porch proxy start`")
     }
+    let sync_requested = enabled("SYNC_HOSTS") == Some(true);
+    let fresh = !state::dir().join("proxy.json").exists();
+    let mut clean = false;
     if let Some(p) = explicit_port {
         if p == 0 {
             bail!("proxy port must be 1-65535; run `porch proxy start --port {DEFAULT_PROXY_PORT}`")
         }
         s.port = p
     } else if (s.tls && s.port == 80) || (!s.tls && s.port == 443) {
-        // Switching protocol leaves the other protocol's standard port. HTTPS
-        // keeps the no-sudo high port; 443 takes an explicit `--port 443`.
-        s.port = DEFAULT_PROXY_PORT
+        // Switching protocol leaves the other protocol's standard port. Move to
+        // the new protocol's standard port when no sudo is needed for it,
+        // otherwise to the no-sudo high port; 443 with sudo takes `--port 443`.
+        let standard = if s.tls { 443 } else { 80 };
+        if saved.unprivileged
+            && crate::ports::clean_urls_enabled()
+            && crate::ports::clean_port_bindable(standard)
+        {
+            s.port = standard;
+            clean = true;
+        } else {
+            s.port = DEFAULT_PROXY_PORT
+        }
+    } else if fresh
+        && !sync_requested
+        && unprivileged_choice != Some(false)
+        && crate::ports::clean_urls_enabled()
+    {
+        // First run: serve URLs without a port when this OS lets us bind the
+        // standard port without sudo. Otherwise keep the no-sudo default.
+        let standard = if s.tls { 443 } else { 80 };
+        if crate::ports::clean_port_bindable(standard) {
+            s.port = standard;
+            clean = true;
+        }
     }
     // Port and privilege mode are one choice: high ports never need sudo or
     // hosts-file edits (browsers resolve *.localhost natively), unless the user
     // explicitly asked for hosts synchronization.
-    let sync_requested = enabled("SYNC_HOSTS") == Some(true);
     s.unprivileged = match unprivileged_choice {
         Some(v) => v,
+        None if clean => true,
         None if s.port >= FIRST_UNPRIVILEGED_PORT => !sync_requested,
         None => saved.unprivileged && saved.port == s.port,
     };
@@ -719,7 +744,7 @@ pub(crate) fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
     }
     if let Some(p) = o.redirect_port {
         s.redirect_port = Some(p)
-    } else if s.tls && s.port == 443 {
+    } else if s.tls && s.port == 443 && (!s.unprivileged || crate::ports::clean_port_bindable(80)) {
         s.redirect_port = Some(80)
     }
     if !s.tls {
@@ -840,6 +865,18 @@ pub(crate) fn move_off_busy_port(mut s: ProxySettings, explicit: bool) -> Result
         } else {
             next
         };
+        if s.unprivileged {
+            // A no-sudo standard port (port-free URLs) that something else
+            // took: fall back to the high port rather than failing.
+            s.port = fallback;
+            s.redirect_port = None;
+            state::save_proxy_settings(&s)?;
+            eprintln!(
+                "Port {port} is used by {who}; Porch now uses port {fallback} (saved). Apps: {}. Free port {port} and run `porch setup` to get URLs without a port back.",
+                s.url("<name>")
+            );
+            return Ok(s);
+        }
         if s.tls {
             bail!("proxy port {port} unavailable: it is used by {who}. Use HTTPS on a port that needs no sudo instead: `porch proxy start --https --port {fallback}`")
         }
@@ -988,6 +1025,29 @@ pub(crate) async fn start_proxy(
         }
     }
     let mut elevated = false;
+    if needs_privilege
+        && s.unprivileged
+        && !port_explicit
+        && s.port < crate::ports::FIRST_UNPRIVILEGED_PORT
+    {
+        // Saved port-free settings on an OS (or binary) that no longer allows
+        // binding the low port without sudo: fall back instead of failing.
+        let old = s.port;
+        s.port = if crate::ports::available(crate::ports::DEFAULT_PROXY_PORT) {
+            crate::ports::DEFAULT_PROXY_PORT
+        } else {
+            crate::ports::next_free(crate::ports::DEFAULT_PROXY_PORT)
+                .context("no free proxy port found; run `porch proxy start --port <free port>`")?
+        };
+        s.redirect_port = None;
+        state::save_proxy_settings(&s)?;
+        eprintln!(
+            "This computer doesn't allow port {old} without sudo; Porch now uses port {} (saved). Apps: {}",
+            s.port,
+            s.url("<name>")
+        );
+        needs_privilege = false;
+    }
     if needs_privilege {
         if s.unprivileged {
             bail!(
