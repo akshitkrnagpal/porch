@@ -1,5 +1,6 @@
 //! Opt-in login startup for the discovery agent, so sharing survives restarts.
-//! A per-user LaunchAgent on macOS and a systemd user unit on Linux: no sudo,
+//! A per-user LaunchAgent on macOS, a systemd user unit on Linux and a
+//! scheduled task that runs as the user at logon on Windows: no elevation,
 //! nothing system-wide. Only ever installed by an explicit command or by
 //! `porch setup` when both start-at-login and sharing are chosen.
 use anyhow::{bail, Context, Result};
@@ -12,6 +13,7 @@ use std::{
 
 pub const LABEL: &str = "dev.porch.discovery";
 const UNIT: &str = "porch-discovery.service";
+const TASK: &str = "PorchDiscovery";
 
 fn platform() -> String {
     std::env::var("PORCH_SERVICE_PLATFORM").unwrap_or_else(|_| std::env::consts::OS.into())
@@ -20,6 +22,13 @@ fn platform() -> String {
 fn file(platform: &str) -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("PORCH_DISCOVERY_AUTOSTART_FILE") {
         return Ok(p.into());
+    }
+    // Task Scheduler keeps its own copy; this one marks what Porch installed.
+    if platform == "windows" {
+        return std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(|d| PathBuf::from(d).join("Porch").join(format!("{LABEL}.xml")))
+            .context("LOCALAPPDATA is not set");
     }
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
@@ -35,17 +44,21 @@ fn file(platform: &str) -> Result<PathBuf> {
             .unwrap_or_else(|| home.join(".config"))
             .join("systemd/user")
             .join(UNIT),
-        _ => bail!("discovery autostart supports macOS and Linux"),
+        _ => bail!("discovery autostart supports macOS, Linux and Windows"),
     })
 }
 
 /// The line that ties a startup file to one Porch state directory.
 fn state_marker(platform: &str, state: &Path) -> Result<String> {
-    use crate::integrations::{systemd_quote, xml};
+    use crate::integrations::{systemd_quote, windows_quote, xml};
     Ok(match platform {
         "macos" => format!(
             "<key>PORCH_STATE_DIR</key><string>{}</string>",
             xml(&state.to_string_lossy())
+        ),
+        "windows" => format!(
+            "<Arguments>--state-dir {} ",
+            xml(&windows_quote(&state.to_string_lossy()))
         ),
         _ => format!(
             "Environment={}",
@@ -130,8 +143,48 @@ pub(super) fn render(platform: &str, exe: &Path, state: &Path) -> Result<String>
             systemd_quote(&exe)?,
             systemd_quote(&format!("PORCH_STATE_DIR={}", state.display()))?,
         )),
-        _ => bail!("discovery autostart supports macOS and Linux"),
+        "windows" => render_task(&exe, state, &windows_user()?),
+        _ => bail!("discovery autostart supports macOS, Linux and Windows"),
     }
+}
+
+/// `DOMAIN\user` of the current account, which the logon trigger is bound to.
+fn windows_user() -> Result<String> {
+    let user = std::env::var("USERNAME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .context("USERNAME is not set")?;
+    Ok(match std::env::var("USERDOMAIN") {
+        Ok(domain) if !domain.is_empty() => format!("{domain}\\{user}"),
+        _ => user,
+    })
+}
+
+/// A per-user task: starts at this user's logon, runs as them without
+/// elevation, retries a failed start every minute (Task Scheduler's minimum).
+fn render_task(exe: &str, state: &Path, user: &str) -> Result<String> {
+    use crate::integrations::{windows_quote, xml};
+    Ok(format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">",
+            "<RegistrationInfo><Description>{label}: Porch discovery agent, managed by `porch discovery autostart`</Description></RegistrationInfo>",
+            "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>",
+            "<Principals><Principal id=\"Author\"><UserId>{user}</UserId>",
+            "<LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>",
+            "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+            "<RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure></Settings>",
+            "<Actions Context=\"Author\"><Exec><Command>{exe}</Command>",
+            "<Arguments>--state-dir {state} discovery serve --autostart</Arguments></Exec></Actions></Task>\n"
+        ),
+        label = LABEL,
+        user = xml(user),
+        exe = xml(exe),
+        state = xml(&windows_quote(&state.to_string_lossy())),
+    ))
 }
 
 #[cfg(unix)]
@@ -172,6 +225,10 @@ fn unload(platform: &str, path: &Path) -> Result<()> {
         }
         "linux" => {
             let _ = exec("systemctl", &["--user", "disable", "--now", UNIT]);
+        }
+        "windows" => {
+            let _ = exec("schtasks", &["/End", "/TN", TASK]);
+            let _ = exec("schtasks", &["/Delete", "/TN", TASK, "/F"]);
         }
         _ => {}
     }
@@ -238,6 +295,10 @@ pub async fn enable() -> Result<bool> {
         "linux" => crate::integrations::exec("systemctl", &["--user", "daemon-reload"])
             .and_then(|_| crate::integrations::exec("systemctl", &["--user", "enable", UNIT]))
             .and_then(|_| crate::integrations::exec("systemctl", &["--user", "restart", UNIT])),
+        "windows" => {
+            crate::integrations::exec("schtasks", &["/Create", "/TN", TASK, "/XML", &p, "/F"])
+                .and_then(|_| crate::integrations::exec("schtasks", &["/Run", "/TN", TASK]))
+        }
         _ => unreachable!("file() rejects other platforms"),
     };
     if let Err(e) = started {
@@ -286,7 +347,9 @@ mod tests {
         assert!(body.contains("<string>dev.porch.discovery</string>"));
         assert!(body.contains("<string>/Users/a&amp;b/.local/bin/porch</string><string>discovery</string><string>serve</string><string>--autostart</string>"));
         assert!(body.contains("<key>PORCH_STATE_DIR</key><string>/Users/a&amp;b/state</string>"));
-        assert!(body.contains("<string>/Users/a&amp;b/state/discovery.log</string>"));
+        let log = Path::new("/Users/a&b/state").join("discovery.log");
+        let log = crate::integrations::xml(&log.to_string_lossy());
+        assert!(body.contains(&format!("<string>{log}</string>")));
         assert!(body.contains("<key>SuccessfulExit</key><false/>"));
         assert!(body.contains("<key>RunAtLoad</key><true/>"));
     }
@@ -304,7 +367,26 @@ mod tests {
         assert!(body.contains("Environment=\"PORCH_STATE_DIR=/home/me/.porch\""));
         assert!(body.contains("Restart=on-failure"));
         assert!(body.contains("WantedBy=default.target"));
-        assert!(render("windows", Path::new("p"), Path::new("s")).is_err());
+        assert!(render("freebsd", Path::new("p"), Path::new("s")).is_err());
+    }
+
+    #[test]
+    fn windows_task_runs_as_the_user_at_logon_for_this_state_dir() {
+        let body = render_task(
+            r"C:\Program Files\Porch\porch.exe",
+            Path::new(r"C:\Users\a&b\.porch"),
+            r"PC\a&b",
+        )
+        .unwrap();
+        assert!(body.contains(LABEL));
+        assert!(body.contains("<LogonTrigger><Enabled>true</Enabled><UserId>PC\\a&amp;b</UserId>"));
+        assert!(body.contains(
+            "<LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel>"
+        ));
+        assert!(body.contains(r"<Command>C:\Program Files\Porch\porch.exe</Command>"));
+        let marker = state_marker("windows", Path::new(r"C:\Users\a&b\.porch")).unwrap();
+        assert!(body.contains(&marker), "{marker}");
+        assert!(body.contains("discovery serve --autostart</Arguments>"));
     }
 
     #[test]

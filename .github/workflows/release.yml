@@ -48,7 +48,15 @@ jobs:
           - os: macos-15
             target: x86_64-apple-darwin
             test: false
+          # Built natively. The test suite does not pass on Windows yet; the
+          # smoke steps below still run the built binary.
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            test: false
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     env:
       PORCH_TEST_TURBO_REQUIRED: "1"
       PORCH_NO_UPDATE_CHECK: "1"
@@ -82,10 +90,13 @@ jobs:
         run: cargo test --no-fail-fast --release --target ${{ matrix.target }} --all-targets
       - run: cargo build --release --target ${{ matrix.target }} --bin porch
       - run: cargo build --release --target ${{ matrix.target }} --features tray --bin porch-tray
-      - if: matrix.test
+      - if: matrix.test || runner.os == 'Windows'
         name: Built binary reports the release version
-        run: target/${{ matrix.target }}/release/porch --version | grep -Fx "porch ${{ needs.version.outputs.version }}"
-      - run: python3 scripts/package.py --target ${{ matrix.target }} --binaries target/${{ matrix.target }}/release
+        run: target/${{ matrix.target }}/release/porch --version | tr -d '\r' | grep -Fx "porch ${{ needs.version.outputs.version }}"
+      - if: runner.os == 'Windows'
+        run: python scripts/test_packaging.py
+      # setup-python provides `python` on every runner; `python3` is not on Windows.
+      - run: python scripts/package.py --target ${{ matrix.target }} --binaries target/${{ matrix.target }}/release
       - uses: actions/upload-artifact@v7
         with:
           name: porch-${{ matrix.target }}

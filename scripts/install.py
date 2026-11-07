@@ -6,8 +6,8 @@ Run it from an extracted release directory, or point it at a release tarball:
   python3 install.py                                   # from an extracted archive
   python3 install.py --archive porch-0.3.0-aarch64-apple-darwin.tar.gz
 
-Binaries go to ~/.local/bin (created if needed); on macOS Porch.app goes to
-~/Applications. No hosts, trust stores, running daemons, sharing, or login
+Binaries go to ~/.local/bin (created if needed), or %LOCALAPPDATA%\Programs\Porch\bin
+on Windows; on macOS Porch.app goes to ~/Applications. No hosts, trust stores, running daemons, sharing, or login
 startup are changed.
 """
 import argparse
@@ -17,6 +17,33 @@ import shutil
 import sys
 import tempfile
 
+WINDOWS = os.name == 'nt'
+EXE = '.exe' if WINDOWS else ''
+
+
+def default_prefix():
+    if WINDOWS and os.environ.get('LOCALAPPDATA'):
+        return Path(os.environ['LOCALAPPDATA']) / 'Programs' / 'Porch'
+    return Path.home() / '.local'
+
+
+def move_aside(destination):
+    """Windows cannot replace a running executable but can rename it."""
+    if not (WINDOWS and destination.exists()):
+        return
+    aside = destination.with_name(f'{destination.name}.old')
+    try:
+        if aside.exists():
+            aside.unlink()
+    except OSError:
+        # An earlier copy is still running; leave it and use a unique name.
+        aside = destination.with_name(f'{destination.name}.{os.getpid()}.old')
+    os.replace(destination, aside)
+    try:
+        aside.unlink()
+    except OSError:
+        pass  # still running; removed by a later install
+
 
 def atomic_copy(source, destination, mode=0o755):
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -25,14 +52,17 @@ def atomic_copy(source, destination, mode=0o755):
         with os.fdopen(fd, 'wb') as output, open(source, 'rb') as original:
             shutil.copyfileobj(original, output)
             output.flush()
-            os.fchmod(output.fileno(), mode)
+            if hasattr(os, 'fchmod'):
+                os.fchmod(output.fileno(), mode)
             os.fsync(output.fileno())
+        move_aside(destination)
         os.replace(temporary, destination)
-        directory = os.open(destination.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        if not WINDOWS:
+            directory = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -85,18 +115,25 @@ def extract_archive(archive, destination):
             tar.extractall(destination, filter='data')
         else:
             tar.extractall(destination)
-    packages = [path for path in destination.iterdir() if (path / 'porch').is_file()]
+    packages = [path for path in destination.iterdir()
+                if (path / 'porch').is_file() or (path / 'porch.exe').is_file()]
     if len(packages) != 1:
         raise RuntimeError(f'{archive} is not a Porch release archive')
     return packages[0]
 
 
-def path_hint(bin_dir, path=None):
+def path_hint(bin_dir, path=None, windows=WINDOWS):
     """Return the exact line to add to a shell profile, or None if on PATH."""
     path = os.environ.get('PATH', '') if path is None else path
-    resolved = os.path.realpath(bin_dir)
-    if any(entry and os.path.realpath(os.path.expanduser(entry)) == resolved for entry in path.split(os.pathsep)):
+    norm = os.path.normcase if windows else (lambda p: p)
+    resolved = norm(os.path.realpath(bin_dir))
+    separator = ';' if windows else os.pathsep
+    if any(entry and norm(os.path.realpath(os.path.expanduser(entry))) == resolved
+           for entry in path.split(separator)):
         return None
+    if windows:
+        return ("[Environment]::SetEnvironmentVariable('Path', "
+                f"'{bin_dir};' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')")
     home = str(Path.home())
     shown = str(bin_dir)
     if shown == home or shown.startswith(home + os.sep):
@@ -110,8 +147,8 @@ def main():
                         help='extracted package directory (or target/release)')
     parser.add_argument('--archive', type=Path,
                         help='release tarball (porch-VERSION-TARGET.tar.gz) to install from')
-    parser.add_argument('--prefix', type=Path, default=Path.home() / '.local',
-                        help='binary install prefix; default ~/.local')
+    parser.add_argument('--prefix', type=Path, default=default_prefix(),
+                        help='binary install prefix; default ~/.local (Windows: %%LOCALAPPDATA%%\\Programs\\Porch)')
     parser.add_argument('--app-dir', type=Path, default=Path.home() / 'Applications',
                         help='macOS app destination; default ~/Applications')
     parser.add_argument('--no-app', action='store_true', help='install binaries only')
@@ -130,15 +167,16 @@ def main():
 
 def install(parser, args):
     source = args.source.resolve()
-    for name in ['porch'] + ([] if args.cli_only else ['porch-tray']):
+    names = [name + EXE for name in ['porch'] + ([] if args.cli_only else ['porch-tray'])]
+    for name in names:
         binary = source / name
         if not binary.is_file():
             parser.error(f'{binary} is missing; extract a package or pass --source target/release')
-    names = ['porch'] + ([] if args.cli_only else ['porch-tray'])
     login = source / 'porch-login'
     if not login.is_file():
         login = Path(__file__).resolve().parent / 'porch-login'
-    if not args.cli_only and login.is_file():
+    # porch-login drives launchd/systemd only.
+    if not args.cli_only and not WINDOWS and login.is_file():
         atomic_copy(login, args.prefix / 'bin/porch-login')
     for name in names:
         atomic_copy(source / name, args.prefix / 'bin' / name)
@@ -151,7 +189,11 @@ def install(parser, args):
         print(f'Launch explicitly: open "{destination}"')
     print('Running apps and proxies are unchanged. Sharing and login startup remain unchanged.')
     hint = path_hint(args.prefix / 'bin')
-    if hint:
+    if hint and WINDOWS:
+        print(f'{args.prefix / "bin"} is not on your PATH. Add it for your account in')
+        print('PowerShell, then open a new terminal:')
+        print(f'  {hint}')
+    elif hint:
         print(f'{args.prefix / "bin"} is not on your PATH. Add this line to your shell profile')
         print('(~/.zshrc, ~/.bashrc, or ~/.profile), then open a new terminal:')
         print(f'  {hint}')

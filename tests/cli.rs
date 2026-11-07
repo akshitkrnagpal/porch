@@ -214,15 +214,23 @@ fn real_autostart_launch_forward_env_signal_and_readiness() {
         libc::kill(child.id() as i32, libc::SIGTERM);
     };
     #[cfg(windows)]
-    child.kill().unwrap();
-    let status = child.wait().unwrap();
-    #[cfg(unix)]
-    assert_eq!(status.code(), Some(143));
-    #[cfg(windows)]
     {
-        let _ = status;
-        s.ok(&["prune", "--force"]);
+        assert!(
+            porch::shutdown::request(child.id()),
+            "launcher must accept a graceful stop request"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("launcher did not exit after a graceful stop request");
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
     }
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(143));
     assert!(s.state()["routes"].as_array().unwrap().is_empty());
 }
 #[test]

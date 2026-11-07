@@ -42,10 +42,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binaries', type=Path, default=ROOT / 'target/release')
     parser.add_argument('--output', type=Path, default=ROOT / 'dist')
-    parser.add_argument('--target', required=True, choices=['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-unknown-linux-gnu'])
+    parser.add_argument('--target', required=True, choices=['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc'])
     args = parser.parse_args()
     version = next(line.split('"')[1] for line in (ROOT / 'Cargo.toml').read_text().splitlines() if line.startswith('version ='))
-    for name in ['porch', 'porch-tray']:
+    windows = 'windows' in args.target
+    executables = [name + ('.exe' if windows else '') for name in ['porch', 'porch-tray']]
+    for name in executables:
         if not (args.binaries / name).is_file():
             parser.error(f'missing {args.binaries / name}; build both binaries with --features tray')
     args.output.mkdir(parents=True, exist_ok=True)
@@ -53,9 +55,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix='porch-package-') as temporary:
         package = Path(temporary) / name
         package.mkdir()
-        for executable in ['porch', 'porch-tray']:
+        for executable in executables:
             shutil.copy2(args.binaries / executable, package / executable)
-        for script in ['install.py', 'porch-login']:
+        # porch-login drives launchd/systemd; Windows has no equivalent yet.
+        for script in ['install.py'] + ([] if windows else ['porch-login']):
             shutil.copy2(ROOT / 'scripts' / script, package / script)
         shutil.copy2(ROOT / 'packaging/README.md', package / 'README.md')
         shutil.copy2(ROOT / 'LICENSE', package / 'LICENSE')

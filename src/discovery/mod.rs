@@ -44,7 +44,16 @@ fn private_file(path: PathBuf) -> Result<fs::File> {
 }
 fn lock(name: &str) -> Result<fs::File> {
     crate::state::load()?;
-    let file = private_file(crate::state::dir().join(name))?;
+    // Not private_file: that opens append-only, and Windows refuses to lock a
+    // handle without read or write access.
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(crate::state::dir().join(name))?;
     file.try_lock_exclusive()
         .context("another Porch operation is in progress; retry shortly")?;
     Ok(file)
@@ -99,6 +108,13 @@ fn detach(command: &mut tokio::process::Command) {
         use std::os::unix::process::CommandExt;
         command.as_std_mut().process_group(0);
     }
+    // Outlive the launching console: no console of its own, and Ctrl+C in the
+    // terminal that ran `porch pair` must not reach it.
+    #[cfg(windows)]
+    command.creation_flags(
+        windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
+            | windows_sys::Win32::System::Threading::DETACHED_PROCESS,
+    );
 }
 struct AgentGuard;
 impl Drop for AgentGuard {
@@ -112,6 +128,8 @@ impl Drop for AgentGuard {
 }
 pub async fn serve(autostart: bool) -> Result<()> {
     if autostart {
+        #[cfg(windows)]
+        log_without_console()?;
         // Login startup must not fail-loop: an agent that is already running, or
         // sharing that was turned off, is a clean exit for launchd/systemd.
         if running() {
@@ -124,6 +142,7 @@ pub async fn serve(autostart: bool) -> Result<()> {
         }
     }
     let _lock = lock("discovery.agent.lock")?;
+    crate::shutdown::listen()?;
     let identity = crate::state::identity(std::process::id()).context("cannot identify agent")?;
     crate::state::atomic_write("discovery.identity", &serde_json::to_vec(&identity)?)?;
     let _guard = AgentGuard;
@@ -134,8 +153,31 @@ pub async fn serve(autostart: bool) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        tokio::select! { r=server::serve()=>r, _=tokio::signal::ctrl_c()=>Ok(()) }
+        tokio::select! {
+            r=server::serve()=>r,
+            _=tokio::signal::ctrl_c()=>Ok(()),
+            _=crate::shutdown::requested()=>Ok(()),
+        }
     }
+}
+/// Task Scheduler starts the agent with a console window and no output
+/// redirection: send output to discovery.log, then let the window close.
+#[cfg(windows)]
+fn log_without_console() -> Result<()> {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{
+        FreeConsole, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    let log = private_file(crate::state::dir().join("discovery.log"))?;
+    let out = log.try_clone()?.into_raw_handle();
+    let err = log.into_raw_handle();
+    // Rust's stdout/stderr look the standard handles up on every write.
+    unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, out);
+        SetStdHandle(STD_ERROR_HANDLE, err);
+        FreeConsole();
+    }
+    Ok(())
 }
 async fn stop_identity(identity: &crate::state::ProcessIdentity) -> Result<()> {
     if !crate::state::matches(identity) {
@@ -145,11 +187,22 @@ async fn stop_identity(identity: &crate::state::ProcessIdentity) -> Result<()> {
     unsafe {
         libc::kill(identity.pid as i32, libc::SIGTERM);
     }
-    #[cfg(not(unix))]
-    bail!("discovery supports macOS and Linux");
+    #[cfg(windows)]
+    if !crate::shutdown::request(identity.pid) {
+        crate::shutdown::kill_tree(identity.pid);
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
     while crate::state::matches(identity) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    // The agent may be wedged; on Windows there is no later chance to force it.
+    #[cfg(windows)]
+    if crate::state::matches(identity) {
+        crate::shutdown::kill_tree(identity.pid);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while crate::state::matches(identity) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
     }
     if crate::state::matches(identity) {
         bail!("agent did not stop; no other process was signaled")
@@ -388,23 +441,23 @@ async fn disconnect_matching(peer: Option<&str>) -> Result<()> {
     Ok(())
 }
 pub fn open_url(url: &str) -> Result<()> {
-    let mut command;
     #[cfg(target_os = "macos")]
-    {
-        command = std::process::Command::new("open");
-        command.arg(url);
-    }
+    let mut command = std::process::Command::new("open");
     #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("xdg-open");
+    // `cmd /c start` would reinterpret `&` and `^` in the URL; the URL protocol
+    // handler takes it as a single argument.
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    bail!("opening apps supports macOS, Linux and Windows");
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
-        command = std::process::Command::new("xdg-open");
         command.arg(url);
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        bail!("opening apps supports macOS and Linux")
-    }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
         if !command
             .status()
             .context("opening browser; use --url-only in a headless session")?
@@ -424,7 +477,9 @@ pub fn copy_url(url: &str) -> Result<()> {
         ("xclip", vec!["-selection", "clipboard"]),
         ("xsel", vec!["--clipboard", "--input"]),
     ];
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    let candidates: Vec<(&str, Vec<&str>)> = vec![("clip", vec![])];
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let candidates: Vec<(&str, Vec<&str>)> = vec![];
     for (bin, args) in candidates {
         if let Ok(mut child) = std::process::Command::new(bin)

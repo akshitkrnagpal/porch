@@ -5,6 +5,33 @@
 use anyhow::{Context, Result};
 use tokio::process::{Child, Command};
 
+/// Stop child processes from inheriting this process's own stdin, stdout and
+/// stderr by accident. Call once at startup.
+///
+/// Windows hands every inheritable handle to every child, not only the three
+/// it is given. A daemon started with its output in a log file would still
+/// hold the caller's stdout pipe open, so a script reading `porch` output
+/// never sees it end. Children meant to share the terminal are unaffected:
+/// `Stdio::inherit` gives each one its own inheritable duplicate.
+pub fn keep_std_handles_private() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT},
+            System::Console::{
+                GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            },
+        };
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = unsafe { GetStdHandle(id) };
+            // Null or invalid means no such stream; nothing to protect.
+            if !handle.is_null() && handle as isize != -1 {
+                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+            }
+        }
+    }
+}
+
 /// Put each application in an independent process tree before it starts.
 pub fn configure(command: &mut Command) {
     command.kill_on_drop(true);

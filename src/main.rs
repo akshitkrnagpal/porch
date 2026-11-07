@@ -1,5 +1,6 @@
 #[tokio::main]
 async fn main() {
+    porch::process::keep_std_handles_private();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let notice = porch::update::Notice::start(&args);
     let result = porch::cli::run().await;

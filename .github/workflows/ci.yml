@@ -53,6 +53,37 @@ jobs:
         run: |
           env -u DISPLAY -u WAYLAND_DISPLAY target/release/porch --state-dir "$RUNNER_TEMP/porch-headless" list --json
           if ldd target/release/porch | grep -Ei 'gtk|gdk|appindicator|cairo'; then exit 1; fi
+  windows:
+    # The CLI and tray must build and lint clean, the CLI must smoke-start
+    # without state, packaging must work, and unit and integration tests must
+    # pass. Some integration suites are still Unix-only and run nothing here.
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --features tray --all-targets -- -D warnings
+      - run: cargo build --release --bin porch
+      - run: cargo build --release --features tray --bin porch-tray
+      - name: CLI starts without existing state
+        shell: pwsh
+        run: target/release/porch.exe --state-dir "$env:RUNNER_TEMP/porch-smoke" list --json
+      - run: python scripts/test_packaging.py
+      - run: python scripts/package.py --target x86_64-pc-windows-msvc --binaries target/release
+      - run: cargo test --no-fail-fast --lib
+      - name: Integration tests
+        # A hung test must not hold the job until GitHub's 6-hour limit.
+        timeout-minutes: 15
+        run: cargo test --no-fail-fast --tests
   tray:
     strategy:
       fail-fast: false

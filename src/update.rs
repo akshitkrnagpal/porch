@@ -31,6 +31,11 @@ const FINISH_WAIT: Duration = Duration::from_millis(500);
 const APP_BUNDLE_ID: &str = "dev.porch.tray";
 const COMPANIONS: [&str; 2] = ["porch-tray", "porch-login"];
 
+/// Executable file name on this platform (`porch` or `porch.exe`).
+fn exe_name(base: &str) -> String {
+    format!("{base}{}", std::env::consts::EXE_SUFFIX)
+}
+
 #[derive(clap::Args, Debug, Default, Clone)]
 pub struct SelfUpdateArgs {
     /// Only compare versions: exit 0 when up to date, 1 when an update is available, 2 on error.
@@ -116,6 +121,8 @@ pub fn current_target() -> Option<&'static str> {
         target_env = "gnu"
     )) {
         Some("x86_64-unknown-linux-gnu")
+    } else if cfg!(all(windows, target_arch = "x86_64", target_env = "msvc")) {
+        Some("x86_64-pc-windows-msvc")
     } else {
         None
     }
@@ -410,6 +417,7 @@ impl TempDir {
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         let path = parent.join(format!(".porch-{label}-{}-{nanos}", std::process::id()));
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -485,6 +493,7 @@ pub fn replace_executable(
             output.sync_all()?;
         }
         let had_original = dest.exists();
+        #[cfg(unix)]
         if had_original {
             let _ = fs::remove_file(&backup);
             if fs::hard_link(dest, &backup).is_err() {
@@ -492,7 +501,30 @@ pub fn replace_executable(
                     .with_context(|| format!("cannot back up {}", dest.display()))?;
             }
         }
-        fs::rename(&staging, dest).with_context(|| format!("cannot replace {}", dest.display()))?;
+        // A running executable cannot be replaced or deleted on Windows, but it
+        // can be renamed. Move it aside; a backup from an earlier update that is
+        // still running keeps its name and this one gets a unique one.
+        #[cfg(windows)]
+        let backup = if had_original {
+            let _ = fs::remove_file(&backup);
+            let aside = if backup.exists() {
+                dest.with_file_name(format!("{name}.{}.old", std::process::id()))
+            } else {
+                backup
+            };
+            fs::rename(dest, &aside)
+                .with_context(|| format!("cannot move {} aside", dest.display()))?;
+            aside
+        } else {
+            backup
+        };
+        if let Err(error) = fs::rename(&staging, dest) {
+            #[cfg(windows)]
+            if had_original {
+                let _ = fs::rename(&backup, dest);
+            }
+            return Err(error).with_context(|| format!("cannot replace {}", dest.display()));
+        }
         sync_dir(dir);
         if let Err(error) = verify(dest) {
             if had_original {
@@ -644,14 +676,20 @@ pub async fn perform(
         bail!("tar could not extract {}", asset.name);
     }
     let package = work.0.join(asset.name.trim_end_matches(".tar.gz"));
-    let new_porch = package.join("porch");
+    let new_porch = package.join(exe_name("porch"));
     if !new_porch.is_file() {
         bail!("{} does not contain porch", asset.name);
     }
     replace_executable(&new_porch, exe, version_check(latest.clone()))?;
     writeln!(out, "Updated {} to {latest}", exe.display())?;
     for companion in COMPANIONS {
-        let (source, dest) = (package.join(companion), exe_dir.join(companion));
+        // porch-login is a script on every platform; the tray is an executable.
+        let companion = if companion == "porch-tray" {
+            exe_name(companion)
+        } else {
+            companion.to_owned()
+        };
+        let (source, dest) = (package.join(&companion), exe_dir.join(&companion));
         if source.is_file() && dest.is_file() {
             replace_executable(&source, &dest, |_| Ok(()))?;
             writeln!(out, "Updated {}", dest.display())?;

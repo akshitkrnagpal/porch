@@ -2,7 +2,8 @@
 
 The archive contains `porch`, `porch-tray`, `porch-login`, and `install.py`. The
 macOS archives (`aarch64-apple-darwin`, `x86_64-apple-darwin`) also include
-`Porch.app`. Linux x86_64 uses a GTK 3 / AppIndicator tray. Windows is deferred.
+`Porch.app`. Linux x86_64 uses a GTK 3 / AppIndicator tray. Windows x86_64 (preview) ships
+`porch.exe` and `porch-tray.exe`, a notification-area app, without `porch-login`.
 Archives are attached to tagged GitHub Releases with a `SHA256SUMS` file; they
 are not signed or notarized. `homebrew/porch.rb` is the Homebrew formula
 template rendered by `scripts/render_formula.py` for each release.

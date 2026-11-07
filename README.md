@@ -12,7 +12,7 @@
   <a href="https://github.com/akshitkrnagpal/porch/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/akshitkrnagpal/porch?label=release"></a>
   <a href="https://github.com/akshitkrnagpal/porch/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/akshitkrnagpal/porch/ci.yml?branch=main&label=CI"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/akshitkrnagpal/porch"></a>
-  <img alt="macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555">
+  <img alt="macOS, Linux and Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-555">
 </p>
 
 <p align="center">
@@ -59,7 +59,7 @@ tar -xzf porch-*-aarch64-apple-darwin.tar.gz
 python3 porch-*-aarch64-apple-darwin/install.py
 ```
 
-The installer puts `porch` in `~/.local/bin` and, on macOS, `Porch.app` in `~/Applications`. Every release ships a `SHA256SUMS` file to check the download against.
+The installer puts `porch` in `~/.local/bin` and, on macOS, `Porch.app` in `~/Applications`. On Windows, extract `porch-<version>-x86_64-pc-windows-msvc.tar.gz` with `tar -xzf` and run `py install.py` from the extracted folder: it installs `porch.exe` and `porch-tray.exe` to `%LOCALAPPDATA%\Programs\Porch\bin` and prints the command that adds that folder to your PATH. Every release ships a `SHA256SUMS` file to check the download against.
 
 **From source:**
 
@@ -148,7 +148,7 @@ Porch is a standalone Rust rewrite of [Portless](https://github.com/vercel-labs/
 | macOS, Apple Silicon | Supported, tested in CI |
 | macOS, Intel | Release builds, not tested in CI |
 | Linux x86_64 (glibc 2.39+) | Supported, tested in CI |
-| Windows | Not yet |
+| Windows 10/11 x86_64 | Preview: tested in CI; some lifecycle and terminal tests are Unix-only so far |
 
 macOS builds are not notarized. On older Linux distributions, build from source.
 

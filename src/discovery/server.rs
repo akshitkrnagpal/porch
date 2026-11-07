@@ -90,6 +90,9 @@ pub(super) fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(path, dir.join(name))?;
+    // Windows cannot open a directory as a file, and its renames need no
+    // directory sync to be durable.
+    #[cfg(unix)]
     fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
@@ -203,29 +206,29 @@ struct Invitation {
     hash: String,
     expires: u64,
 }
+#[cfg(unix)]
+fn os_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len() - 1) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+#[cfg(not(unix))]
+fn os_hostname() -> Option<String> {
+    None
+}
 fn machine(dir: &Path) -> Result<Machine> {
     let _lock = lock(dir)?;
     if let Some(value) = read(&dir.join("discovery-machine.json"))? {
         return Ok(value);
     }
-    let name = std::env::var("HOSTNAME")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            let mut buf = [0u8; 256];
-            #[cfg(unix)]
-            {
-                if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len() - 1) } == 0 {
-                    return Some(
-                        String::from_utf8_lossy(
-                            &buf[..buf.iter().position(|b| *b == 0).unwrap_or(buf.len())],
-                        )
-                        .into_owned(),
-                    );
-                }
-            }
-            None
-        })
+    // Windows has no HOSTNAME; COMPUTERNAME is always set there.
+    let name = ["HOSTNAME", "COMPUTERNAME"]
+        .into_iter()
+        .find_map(|v| std::env::var(v).ok().filter(|s| !s.trim().is_empty()))
+        .or_else(os_hostname)
         .unwrap_or_else(|| "Porch machine".into());
     let value = Machine {
         id: random()?,
@@ -317,7 +320,11 @@ fn interface_addresses() -> Vec<std::net::Ipv4Addr> {
     }
     out
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn interface_addresses() -> Vec<std::net::Ipv4Addr> {
+    crate::win_net::interface_addresses()
+}
+#[cfg(not(any(unix, windows)))]
 fn interface_addresses() -> Vec<std::net::Ipv4Addr> {
     vec![]
 }

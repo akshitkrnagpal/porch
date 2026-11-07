@@ -256,12 +256,49 @@ impl IconState {
                 }
             };
         }
-        if cfg!(target_os = "macos") {
+        // The macOS template art is a dark mark: right for light Windows
+        // taskbars too. Dark taskbars and Linux panels get the light mark.
+        if cfg!(target_os = "macos") || (cfg!(windows) && light_taskbar()) {
             (art!("macos", "36"), 36)
         } else {
             (art!("linux", "32"), 32)
         }
     }
+}
+
+/// Whether the Windows taskbar uses the light theme. Read once: a theme
+/// change takes effect when the menu restarts.
+fn light_taskbar() -> bool {
+    #[cfg(windows)]
+    {
+        use std::sync::OnceLock;
+        static LIGHT: OnceLock<bool> = OnceLock::new();
+        *LIGHT.get_or_init(|| {
+            use windows_sys::Win32::System::Registry::{
+                RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD,
+            };
+            let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+            let key = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            let value = wide("SystemUsesLightTheme");
+            let mut data = 0u32;
+            let mut size = std::mem::size_of::<u32>() as u32;
+            let status = unsafe {
+                RegGetValueW(
+                    HKEY_CURRENT_USER,
+                    key.as_ptr(),
+                    value.as_ptr(),
+                    RRF_RT_REG_DWORD,
+                    std::ptr::null_mut(),
+                    (&mut data as *mut u32).cast(),
+                    &mut size,
+                )
+            };
+            // Missing value: Windows 10 before 1903, whose taskbar is dark.
+            status == 0 && data == 1
+        })
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 pub fn menu_model(
@@ -376,22 +413,34 @@ pub fn cli_path() -> Result<PathBuf> {
         }
         return Ok(path);
     }
+    let cli = format!("porch{}", std::env::consts::EXE_SUFFIX);
     let current = std::env::current_exe()?;
     if let Some(parent) = current.parent() {
-        let sibling = parent.join("porch");
+        let sibling = parent.join(&cli);
         if sibling.is_file() {
             return Ok(sibling);
         }
     }
-    let home = std::env::var_os("HOME").context("HOME is unavailable; set PORCH_BIN to the CLI")?;
-    let installed = PathBuf::from(home).join(".local/bin/porch");
+    let installed = if cfg!(windows) {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .context("LOCALAPPDATA is unavailable; set PORCH_BIN to the CLI")?;
+        PathBuf::from(base).join(r"Programs\Porch\bin").join(&cli)
+    } else {
+        let home =
+            std::env::var_os("HOME").context("HOME is unavailable; set PORCH_BIN to the CLI")?;
+        PathBuf::from(home).join(".local/bin/porch")
+    };
     if installed.is_file() {
         return Ok(installed);
     }
     bail!("Porch CLI not found. Install porch beside porch-tray or set PORCH_BIN")
 }
 async fn invoke(cli: &Path, args: &[String]) -> Result<Vec<u8>> {
-    let mut child = tokio::process::Command::new(cli)
+    let mut command = tokio::process::Command::new(cli);
+    // The menu has no console, so each CLI call would open its own window.
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -598,7 +647,7 @@ fn worker_with_intervals(
     (commands, update_rx)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 mod native {
     use super::*;
     #[cfg(not(target_os = "macos"))]
@@ -962,7 +1011,7 @@ mod native {
             let icon_state = IconState::from_snapshot(None);
             #[cfg(target_os = "macos")]
             let builder = builder.with_icon_templated(icon(icon_state)?);
-            #[cfg(target_os = "linux")]
+            #[cfg(not(target_os = "macos"))]
             let builder = builder.with_icon(icon(icon_state)?);
             let tray = builder.build().context("create native Porch menu")?;
             Ok(Self {
@@ -1008,7 +1057,7 @@ mod native {
                     #[cfg(target_os = "macos")]
                     let result = icon(icon_state)
                         .and_then(|icon| Ok(self.tray.set_icon_templated(Some(icon))?));
-                    #[cfg(target_os = "linux")]
+                    #[cfg(not(target_os = "macos"))]
                     let result =
                         icon(icon_state).and_then(|icon| Ok(self.tray.set_icon(Some(icon))?));
                     match result {
@@ -1092,15 +1141,19 @@ mod native {
             true
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     pub fn run(cli: PathBuf) -> Result<()> {
         use tao::{
             event::{Event, StartCause},
             event_loop::{ControlFlow, EventLoopBuilder},
-            platform::macos::{ActivationPolicy, EventLoopExtMacOS},
         };
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut event_loop = EventLoopBuilder::new().build();
-        event_loop.set_activation_policy(ActivationPolicy::Accessory);
+        #[cfg(target_os = "macos")]
+        {
+            use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+            event_loop.set_activation_policy(ActivationPolicy::Accessory);
+        }
         let (commands, updates) = worker(cli);
         let mut ui: Option<Ui> = None;
         event_loop.run(move |event, _, control_flow| {
@@ -1210,12 +1263,12 @@ pub fn run() -> Result<()> {
         _ => bail!("usage: porch-tray [--state-dir DIR]"),
     }
     let cli = cli_path()?;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     return native::run(cli);
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = cli;
-        bail!("Porch tray supports macOS and Linux; use the headless Porch CLI on this platform")
+        bail!("Porch tray supports macOS, Linux and Windows; use the headless Porch CLI on this platform")
     }
 }
 
