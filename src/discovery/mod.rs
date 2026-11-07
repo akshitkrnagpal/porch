@@ -130,6 +130,7 @@ pub async fn serve(autostart: bool) -> Result<()> {
         }
     }
     let _lock = lock("discovery.agent.lock")?;
+    crate::shutdown::listen()?;
     let identity = crate::state::identity(std::process::id()).context("cannot identify agent")?;
     crate::state::atomic_write("discovery.identity", &serde_json::to_vec(&identity)?)?;
     let _guard = AgentGuard;
@@ -140,7 +141,11 @@ pub async fn serve(autostart: bool) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        tokio::select! { r=server::serve()=>r, _=tokio::signal::ctrl_c()=>Ok(()) }
+        tokio::select! {
+            r=server::serve()=>r,
+            _=tokio::signal::ctrl_c()=>Ok(()),
+            _=crate::shutdown::requested()=>Ok(()),
+        }
     }
 }
 async fn stop_identity(identity: &crate::state::ProcessIdentity) -> Result<()> {
@@ -151,17 +156,22 @@ async fn stop_identity(identity: &crate::state::ProcessIdentity) -> Result<()> {
     unsafe {
         libc::kill(identity.pid as i32, libc::SIGTERM);
     }
-    // A windowless console process ignores taskkill's close request, so stop
-    // it outright. Its guard does not run; the records it leaves fail the
-    // identity check and are overwritten by the next agent.
     #[cfg(windows)]
-    {
-        let _ =
-            crate::integrations::exec("taskkill", &["/PID", &identity.pid.to_string(), "/T", "/F"]);
+    if !crate::shutdown::request(identity.pid) {
+        crate::shutdown::kill_tree(identity.pid);
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
     while crate::state::matches(identity) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    // The agent may be wedged; on Windows there is no later chance to force it.
+    #[cfg(windows)]
+    if crate::state::matches(identity) {
+        crate::shutdown::kill_tree(identity.pid);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while crate::state::matches(identity) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
     }
     if crate::state::matches(identity) {
         bail!("agent did not stop; no other process was signaled")

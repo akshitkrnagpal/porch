@@ -1033,14 +1033,10 @@ fn signal_pid(pid: u32, signal: i32) {
     unsafe {
         libc::kill(pid as i32, signal);
     };
+    // Only Porch processes are signalled by PID; they listen for stop requests.
     #[cfg(windows)]
-    {
-        let mut command = Command::new("taskkill");
-        command.args(["/PID", &pid.to_string(), "/T"]);
-        if signal == 9 {
-            command.arg("/F");
-        }
-        let _ = command.status();
+    if signal == 9 || !crate::shutdown::request(pid) {
+        crate::shutdown::kill_tree(pid);
     }
 }
 fn signal_group(pid: u32, signal: i32) {
@@ -1051,8 +1047,15 @@ fn signal_group(pid: u32, signal: i32) {
     unsafe {
         libc::kill(-(pid as i32), signal);
     };
+    // Children lead their own console process group. Ctrl+Break reaches them
+    // from the launcher that shares their console; from anywhere else, ask
+    // their launcher instead (callers do) and force only when told to.
     #[cfg(windows)]
-    signal_pid(pid, signal);
+    if signal == 9 {
+        crate::shutdown::kill_tree(pid);
+    } else {
+        crate::shutdown::interrupt_group(pid);
+    }
 }
 struct TerminationSignals {
     #[cfg(unix)]
@@ -1065,6 +1068,8 @@ struct TerminationSignals {
     int: tokio::signal::windows::CtrlC,
     #[cfg(windows)]
     brk: tokio::signal::windows::CtrlBreak,
+    #[cfg(windows)]
+    close: tokio::signal::windows::CtrlClose,
 }
 impl TerminationSignals {
     fn new() -> Result<Self> {
@@ -1079,9 +1084,11 @@ impl TerminationSignals {
         }
         #[cfg(windows)]
         {
+            crate::shutdown::listen()?;
             Ok(Self {
                 int: tokio::signal::windows::ctrl_c()?,
                 brk: tokio::signal::windows::ctrl_break()?,
+                close: tokio::signal::windows::ctrl_close()?,
             })
         }
     }
@@ -1092,7 +1099,13 @@ impl TerminationSignals {
         }
         #[cfg(windows)]
         {
-            tokio::select! {_=self.int.recv()=>Ok(2),_=self.brk.recv()=>Ok(2)}
+            // A stop request from another Porch process is the SIGTERM equivalent.
+            tokio::select! {
+                _=self.int.recv()=>Ok(2),
+                _=self.brk.recv()=>Ok(2),
+                _=self.close.recv()=>Ok(1),
+                _=crate::shutdown::requested()=>Ok(15),
+            }
         }
     }
 }

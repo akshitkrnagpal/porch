@@ -1418,14 +1418,12 @@ pub fn prune_shares(force: bool) -> Result<()> {
                         if force { libc::SIGKILL } else { libc::SIGTERM },
                     );
                 }
+                // The tunnel's launcher is gone, so nothing shares its console
+                // to interrupt it: end it outright.
                 #[cfg(windows)]
                 {
-                    let pid = tunnel.pid.to_string();
-                    let mut args = vec!["/PID", &pid, "/T"];
-                    if force {
-                        args.push("/F");
-                    }
-                    let _ = exec("taskkill", &args);
+                    let _ = force;
+                    crate::shutdown::kill_tree(tunnel.pid);
                 }
             }
         }
@@ -2115,14 +2113,14 @@ async fn stop_compose(child: &mut tokio::process::Child, signal: i32) {
             libc::kill(-(pid as i32), signal);
         }
     }
+    // Compose runs in its own console process group under this console.
     #[cfg(windows)]
     if let Some(pid) = child.id() {
-        let pid = pid.to_string();
-        let mut args = vec!["/PID", &pid, "/T"];
         if signal == 9 {
-            args.push("/F");
+            crate::shutdown::kill_tree(pid);
+        } else {
+            crate::shutdown::interrupt_group(pid);
         }
-        let _ = exec("taskkill", &args);
     }
     if tokio::time::timeout(Duration::from_secs(5), child.wait())
         .await
@@ -2146,7 +2144,15 @@ async fn terminate_signal() {
             signal.recv().await;
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if crate::shutdown::listen().is_ok() {
+            crate::shutdown::requested().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     std::future::pending::<()>().await;
 }
 
