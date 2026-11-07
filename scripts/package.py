@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build CLI + native tray release archives; never publish or install."""
 import argparse
+import os
 from pathlib import Path
 import plistlib
 import shutil
@@ -21,12 +22,17 @@ def icns():
     return b'icns' + struct.pack('>I', len(blocks) + 8) + blocks
 
 
-def bundle(destination, binaries, version):
+def bundle(destination, binaries, version, link=False):
+    """Write Porch.app. With link=True the executables are hard links to the
+    files in `binaries`, so the release tarball stores each payload once."""
     contents = destination / 'Contents'
     (contents / 'MacOS').mkdir(parents=True)
     (contents / 'Resources').mkdir()
     for name in ['porch', 'porch-tray']:
-        shutil.copy2(binaries / name, contents / 'MacOS' / name)
+        if link:
+            os.link(binaries / name, contents / 'MacOS' / name)
+        else:
+            shutil.copy2(binaries / name, contents / 'MacOS' / name)
     metadata = {'CFBundleName': 'Porch', 'CFBundleDisplayName': 'Porch',
                 'CFBundleIdentifier': 'dev.porch.tray', 'CFBundleExecutable': 'porch-tray',
                 'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': version,
@@ -36,6 +42,16 @@ def bundle(destination, binaries, version):
     with open(contents / 'Info.plist', 'wb') as output:
         plistlib.dump(metadata, output)
     (contents / 'Resources/Porch.icns').write_bytes(icns())
+
+
+def write_archive(archive, package, name, first):
+    """Tar `package` as `name/`. The root executables are added first, so they
+    are the regular-file entries and any hard links in Porch.app refer to them."""
+    first = [package / entry for entry in first]
+    with tarfile.open(archive, 'w:gz') as tar:
+        tar.add(package, arcname=name, recursive=False)
+        for path in first + sorted(p for p in package.iterdir() if p not in first):
+            tar.add(path, arcname=f'{name}/{path.name}')
 
 
 def main():
@@ -69,10 +85,13 @@ def main():
             if source.exists():
                 shutil.copy2(source, package / 'docs' / document)
         if 'apple' in args.target:
-            bundle(package / 'Porch.app', args.binaries, version)
+            # The app runs the same porch and porch-tray as the archive root.
+            # Hard links make tar store each executable once; every extractor
+            # (tar, Homebrew, install.py, porch self-update) still writes both
+            # paths as ordinary files.
+            bundle(package / 'Porch.app', package, version, link=True)
         archive = args.output / f'{name}.tar.gz'
-        with tarfile.open(archive, 'w:gz') as tar:
-            tar.add(package, arcname=name)
+        write_archive(archive, package, name, executables)
         if 'apple' in args.target:
             app = args.output / 'Porch.app'
             if app.exists(): shutil.rmtree(app)
