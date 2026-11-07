@@ -57,9 +57,13 @@ tar -xzf porch-*-aarch64-apple-darwin.tar.gz
 python3 porch-*-aarch64-apple-darwin/install.py
 ```
 
-This puts `porch` in `~/.local/bin` and, on macOS, `Porch.app` in `~/Applications`.
+This puts `porch`, `porch-tray` and `porch-login` in `~/.local/bin` and, on macOS, `Porch.app` in `~/Applications`. Use `porch` in a terminal and open `Porch.app` for the menu bar. The app carries its own copy of `porch`, so it keeps working if you move it. `install.py --cli-only` installs just `porch`. Each download is about 4 MB.
+
+On Linux, `porch` needs only glibc 2.39 or newer (no OpenSSL). The tray also needs GTK 3 and an AppIndicator host.
 
 On Windows, extract `porch-<version>-x86_64-pc-windows-msvc.tar.gz` with `tar -xzf` and run `py install.py` from the extracted folder. It installs `porch.exe` and `porch-tray.exe` to `%LOCALAPPDATA%\Programs\Porch\bin` and prints the command that adds that folder to your PATH.
+
+[Release archive contents](packaging/README.md) lists what each archive holds.
 
 **From source:**
 
@@ -67,7 +71,7 @@ On Windows, extract `porch-<version>-x86_64-pc-windows-msvc.tar.gz` with `tar -x
 cargo install --git https://github.com/akshitkrnagpal/porch porch
 ```
 
-To update, run `porch self-update`. On a Homebrew install it runs `brew upgrade` for you.
+To update, run `porch self-update`. It replaces `porch`, the tray beside it and `Porch.app` in `~/Applications` (set `PORCH_APP_DIR` if you keep the app elsewhere, or rerun a newer `install.py`). On a Homebrew install it runs `brew upgrade` for you. Running apps and the proxy keep running while you update.
 
 ## Quick start
 
@@ -169,7 +173,7 @@ cargo build --release
 cargo test --all-targets
 ```
 
-The tests start real processes, so you need Node.js with npm, Python 3 and Git. They use temporary state and never touch your hosts file, trust store or startup services. To build the menu bar app, run `cargo build --release --features tray --bins`.
+The tests start real processes, so you need Node.js with npm, Python 3 and Git. They use temporary state and never touch your hosts file, trust store or startup services. To build the menu bar app, run `cargo build --release --features tray --bins`. Release builds are optimized for size (fat LTO, one codegen unit), so they take a few minutes; plain `cargo build` is the quick one for day-to-day work. [Release size](docs/release-size.md) has the measurements behind these settings.
 
 To cut a release, bump `version` in `Cargo.toml`, merge, then push a matching tag such as `v0.4.0`. The [release workflow](.github/workflows/release.yml) builds the archives and publishes the GitHub Release.
 

@@ -17,10 +17,14 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 fs2 = "0.4"
 libc = "0.2"
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+# Default features off: they add native-tls (OpenSSL on Linux) beside rustls.
+# HTTP/2, system proxy settings and charset decoding are the remaining
+# defaults, kept on purpose. rustls uses the OS trust store like native-tls did.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots", "http2", "charset", "system-proxy"] }
 axum = { version = "0.8", features = ["ws"] }
 hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
+# Only what Porch uses: the legacy pooled client and the HTTP/1+2 auto server.
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "tokio", "http1", "http2"] }
 http-body-util = "0.1"
 futures-util = "0.3"
 tokio-tungstenite = "0.28"
@@ -74,3 +78,14 @@ gtk = { version = "0.18", optional = true }
 # Keep only line tables in debug builds: much smaller target/, and
 # backtraces still show file:line.
 debug = "line-tables-only"
+
+[profile.release]
+# Release archives were mostly symbol tables and duplicated generic code. These
+# settings cut `porch` from 15.7 MB to about 6 MB on aarch64-apple-darwin with
+# no measurable change in proxy CPU per request; opt-level "z" was smaller
+# still but cost 15-25% more CPU. Panics still unwind. See
+# docs/release-size.md for the measurements.
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

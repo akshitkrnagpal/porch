@@ -8,6 +8,8 @@ Each release archive contains:
 
 Archives are attached to tagged GitHub Releases along with a `SHA256SUMS` file. They aren't signed or notarized. `homebrew/porch.rb` is the Homebrew formula template that `scripts/render_formula.py` fills in for each release.
 
+**What's in `Porch.app`.** The app runs the same `porch-tray` as the archive root and carries its own `porch` in `Porch.app/Contents/MacOS`, so it keeps working wherever you move it, even without the command-line install. In the download, those two files are tar hard links to the files at the archive root, so each program is downloaded once. The usual extractors (`tar`, Finder's Archive Utility, Homebrew, `install.py`, `porch self-update`) write them back as ordinary, complete files; nothing extracted is a symlink or depends on a relative path. A tool that can't recreate tar hard links would leave the app without its executables, so use `tar -xzf`. Homebrew installs only `porch`.
+
 To pair machines over your LAN or Tailscale, see the [guide to apps across machines](docs/discovery.md) included in the archive ([`../docs/discovery.md`](../docs/discovery.md) in a source checkout).
 
 ## Install
@@ -20,7 +22,9 @@ python3 install.py
 python3 install.py --archive porch-VERSION-TARGET.tar.gz
 ```
 
-On macOS and Linux this installs the binaries in `~/.local/bin`, and on macOS also `~/Applications/Porch.app`. On Windows (`py install.py`) the binaries go to `%LOCALAPPDATA%\Programs\Porch\bin`. If the folder isn't on your PATH, the installer prints the line to add. It writes each binary to a temporary file and renames it into place, so a running copy is never overwritten mid-write.
+On macOS and Linux this installs `porch`, `porch-tray` and `porch-login` in `~/.local/bin`, and on macOS also `~/Applications/Porch.app`. On Windows (`py install.py`) the binaries go to `%LOCALAPPDATA%\Programs\Porch\bin`. If the folder isn't on your PATH, the installer prints the line to add. It writes each binary to a temporary file and renames it into place, so a running copy is never overwritten mid-write.
+
+The installed `Porch.app` is a complete copy with its own `porch` inside: the terminal runs `~/.local/bin/porch` and the menu runs the copy in the app. Both come from the same release. `porch self-update` replaces both, but it finds the app only in `~/Applications` or in the folder named by `PORCH_APP_DIR`. Rerunning a newer `install.py` (or an older one with `--archive`) or `brew upgrade akshitkrnagpal/tap/porch` also upgrades.
 
 Installing doesn't touch running apps, the proxy, sharing, trust stores, the hosts file or login startup. `--cli-only` installs only the CLI, and `--prefix PATH` and `--app-dir PATH` change where files go. To update later, run `porch self-update`.
 
@@ -39,7 +43,7 @@ macOS may ask you to approve an unsigned app downloaded from the internet in Sys
 
 ## Linux desktop requirements
 
-The `porch` CLI doesn't link GTK or AppIndicator and works without a display. Only `porch-tray` needs them. Prebuilt Linux binaries need glibc 2.39 or newer; build from source on older distributions.
+The `porch` CLI doesn't link GTK, AppIndicator or OpenSSL and works without a display. Only `porch-tray` needs the desktop libraries. Prebuilt Linux binaries need glibc 2.39 or newer; build from source on older distributions.
 
 Build dependencies on Debian and Ubuntu:
 
@@ -74,6 +78,6 @@ python3 scripts/package.py --target aarch64-apple-darwin
 # Windows: --target x86_64-pc-windows-msvc
 ```
 
-The script creates `dist/porch-VERSION-TARGET.tar.gz`, and on macOS also `dist/Porch.app`. For a cross-compiled build, pass `--binaries target/TARGET/release`.
+The release profile is tuned for size (`opt-level = "s"`, fat LTO, one codegen unit, stripped symbols), so release builds take a few minutes. The script creates `dist/porch-VERSION-TARGET.tar.gz`, and on macOS also `dist/Porch.app`. For a cross-compiled build, pass `--binaries target/TARGET/release`. `python3 scripts/release_size.py BEFORE_DIR AFTER_DIR` compares two sets of archives; `docs/release-size.md` in a source checkout has the current numbers.
 
 CI builds the tray on macOS, Linux and Windows, tests the menu contents and actions, and checks that the Linux tray fails cleanly without a display. The release workflow publishes a GitHub Release only for a pushed `v*` tag that matches the version in `Cargo.toml`; running it by hand only uploads build artifacts. Whether the tray icon actually shows on a Linux desktop, how the macOS menu behaves when clicked, and whether login startup works still have to be checked by hand on a real desktop.

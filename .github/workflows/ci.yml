@@ -70,10 +70,10 @@ jobs:
       # them. It uses the debug binary `cargo test` already built: linkage is
       # the same as a release build, without a second full compile.
       - if: runner.os == 'Linux'
-        name: Headless CLI stays independent of desktop libraries
+        name: Headless CLI stays independent of desktop libraries and OpenSSL
         run: |
           env -u DISPLAY -u WAYLAND_DISPLAY target/debug/porch --state-dir "$RUNNER_TEMP/porch-headless" list --json
-          if ldd target/debug/porch | grep -Ei 'gtk|gdk|appindicator|cairo'; then exit 1; fi
+          if ldd target/debug/porch | grep -Ei 'gtk|gdk|appindicator|cairo|libssl|libcrypto'; then exit 1; fi
   windows:
     # The CLI and tray must build and lint clean, the CLI must smoke-start
     # without state, packaging must work, and unit and integration tests must

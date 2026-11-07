@@ -24,6 +24,7 @@ def load(name, path):
 installer = load('porch_installer', ROOT / 'scripts/install.py')
 packager = load('porch_packager', ROOT / 'scripts/package.py')
 formula = load('porch_formula', ROOT / 'scripts/render_formula.py')
+sizes = load('porch_release_size', ROOT / 'scripts/release_size.py')
 
 
 class PackageTests(unittest.TestCase):
@@ -131,9 +132,125 @@ class PackageTests(unittest.TestCase):
                 self.assertTrue(os.access(installed, os.X_OK), name)
             self.assertIn(f'export PATH="{prefix / "bin"}:$PATH"', result.stdout)
             if sys.platform == 'darwin':
-                self.assertTrue((apps / 'Porch.app/Contents/MacOS/porch-tray').is_file())
+                for name in ['porch', 'porch-tray']:
+                    bundled = apps / 'Porch.app/Contents/MacOS' / name
+                    self.assertEqual(bundled.read_bytes(), (prefix / 'bin' / name).read_bytes(), name)
+                    self.assertTrue(os.access(bundled, os.X_OK), name)
             else:
                 self.assertFalse(apps.exists())
+
+    def package(self, root, target='aarch64-apple-darwin', payload=b'#!/bin/sh\necho porch 0.2.0\n'):
+        binaries, output = root / 'bin', root / 'out'
+        binaries.mkdir()
+        windows = 'windows' in target
+        for name in ['porch', 'porch-tray']:
+            path = binaries / (name + ('.exe' if windows else ''))
+            path.write_bytes(payload + name.encode())
+            path.chmod(0o755)
+        subprocess.run([sys.executable, str(ROOT / 'scripts/package.py'), '--target', target,
+                        '--binaries', str(binaries), '--output', str(output)], check=True, capture_output=True)
+        archive, = output.glob('*.tar.gz')
+        return archive
+
+    def test_macos_archive_stores_each_executable_once(self):
+        with tempfile.TemporaryDirectory(prefix='porch-hardlink-archive-') as temporary:
+            archive = self.package(Path(temporary))
+            name = archive.name[:-len('.tar.gz')]
+            with tarfile.open(archive) as tar:
+                members = {member.name: member for member in tar.getmembers()}
+            for executable in ['porch', 'porch-tray']:
+                root = members[f'{name}/{executable}']
+                bundled = members[f'{name}/Porch.app/Contents/MacOS/{executable}']
+                self.assertTrue(root.isfile(), executable)
+                self.assertTrue(bundled.islnk(), executable)
+                self.assertEqual(bundled.linkname, root.name)
+            # Exactly one regular-file entry per executable name.
+            stored = [m for m in members.values() if m.isfile() and m.name.rsplit('/', 1)[-1] in ('porch', 'porch-tray')]
+            self.assertEqual(len(stored), 2)
+
+    @unittest.skipIf(os.name == 'nt', 'Unix modes; Windows archives have no app bundle')
+    def test_hard_linked_archive_extracts_to_real_files_everywhere(self):
+        """install.py, system tar (porch self-update, Homebrew) and the size
+        report all see the app executables as complete files."""
+        import shutil
+        with tempfile.TemporaryDirectory(prefix='porch-hardlink-extract-') as temporary:
+            root = Path(temporary)
+            archive = self.package(root)
+            extractors = {'install.py': lambda d: installer.extract_archive(archive, d)}
+            if shutil.which('tar'):
+                def system_tar(destination):
+                    subprocess.run(['tar', '-xzf', str(archive), '-C', str(destination)], check=True)
+                    return destination / archive.name[:-len('.tar.gz')]
+                extractors['tar'] = system_tar
+            for label, extract in extractors.items():
+                destination = root / f'x-{label}'
+                destination.mkdir()
+                package = extract(destination)
+                for name in ['porch', 'porch-tray']:
+                    top, bundled = package / name, package / 'Porch.app/Contents/MacOS' / name
+                    self.assertEqual(bundled.read_bytes(), top.read_bytes(), f'{label}: {name}')
+                    self.assertTrue(os.access(bundled, os.X_OK), f'{label}: {name}')
+            table = sizes.report({'aarch64-apple-darwin': archive}, {'aarch64-apple-darwin': archive})
+            self.assertIn('`Porch.app/Contents/MacOS/porch` (hard link)', table)
+            self.assertIn('**archives total**', table)
+
+    def test_hard_link_outside_archive_is_rejected(self):
+        import io
+        with tempfile.TemporaryDirectory(prefix='porch-evil-link-') as temporary:
+            root = Path(temporary)
+            archive = root / 'evil.tar.gz'
+            with tarfile.open(archive, 'w:gz') as tar:
+                info = tarfile.TarInfo('porch-1/porch')
+                info.type = tarfile.LNKTYPE
+                info.linkname = '../../etc/passwd'
+                tar.addfile(info)
+            (root / 'x').mkdir()
+            with self.assertRaisesRegex(RuntimeError, 'unsafe link'):
+                installer.extract_archive(archive, root / 'x')
+
+    def test_symlink_chains_are_rejected_before_extraction(self):
+        """Symlinks that point inside the archive one by one, but escape
+        together, must fail even on Pythons without tarfile.data_filter."""
+        import io
+        with tempfile.TemporaryDirectory(prefix='porch-evil-symlinks-') as temporary:
+            root = Path(temporary)
+            archive = root / 'evil.tar.gz'
+            with tarfile.open(archive, 'w:gz') as tar:
+                for name, target in [('a', 'b'), ('b', '.'), ('a/c', '..')]:
+                    info = tarfile.TarInfo(name)
+                    info.type, info.linkname = tarfile.SYMTYPE, target
+                    tar.addfile(info)
+                info = tarfile.TarInfo('pkg/porch')
+                info.type, info.linkname = tarfile.LNKTYPE, 'c/victim'
+                tar.addfile(info)
+                data = b'owned'
+                info = tarfile.TarInfo('pkg/porch')
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+            (root / 'x').mkdir()
+            (root / 'victim').write_bytes(b'safe')
+            with self.assertRaisesRegex(RuntimeError, 'unsupported entry|unsafe'):
+                installer.extract_archive(archive, root / 'x')
+            self.assertEqual((root / 'victim').read_bytes(), b'safe')
+            self.assertEqual(list((root / 'x').iterdir()), [])
+
+    def test_size_report_finds_archives_in_artifact_subdirectories(self):
+        with tempfile.TemporaryDirectory(prefix='porch-size-report-') as temporary:
+            root = Path(temporary)
+            archive = self.package(root)
+            for side in ['before', 'after']:
+                (root / side / 'porch-aarch64-apple-darwin').mkdir(parents=True)
+                (root / side / 'porch-aarch64-apple-darwin' / archive.name).write_bytes(archive.read_bytes())
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/release_size.py'),
+                                     str(root / 'before'), str(root / 'after')],
+                                    check=True, capture_output=True, text=True)
+            self.assertIn('| aarch64-apple-darwin | **archive (.tar.gz)** |', result.stdout)
+            (root / 'after' / 'copy').mkdir()
+            (root / 'after' / 'copy' / archive.name).write_bytes(archive.read_bytes())
+            duplicate = subprocess.run([sys.executable, str(ROOT / 'scripts/release_size.py'),
+                                        str(root / 'before'), str(root / 'after')], capture_output=True, text=True)
+            self.assertNotEqual(duplicate.returncode, 0)
+            self.assertIn('two archives', duplicate.stderr)
 
     def test_archive_extraction_rejects_traversal(self):
         import io

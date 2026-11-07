@@ -160,8 +160,11 @@ async fn actual_http_tls_h2_ws_streaming_routing_and_redirects() {
         .unwrap();
         let proxy = tokio::spawn(porch::proxy::serve_config(settings));
         ready(port).await;
+        // HTTP/1.1, so the Host-header routing checks below mean the same
+        // thing over TLS; HTTP/2 is exercised separately further down.
         let mut builder = reqwest::Client::builder()
             .no_proxy()
+            .http1_only()
             .redirect(reqwest::redirect::Policy::none())
             .resolve(
                 "app.localhost",
@@ -404,6 +407,7 @@ with context.wrap_socket(socket.create_connection(('127.0.0.1',int(sys.argv[2]))
         // IPv6 listener is simultaneous with IPv4, not a choice between them.
         let client6 = reqwest::Client::builder()
             .no_proxy()
+            .http1_only()
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap();

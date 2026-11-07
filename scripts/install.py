@@ -101,15 +101,22 @@ def extract_archive(archive, destination):
     with tarfile.open(archive, 'r:gz') as tar:
         members = tar.getmembers()
         root = destination.resolve()
+        files = set()
         for member in members:
             target = (destination / member.name).resolve()
             if root != target and root not in target.parents:
                 raise RuntimeError(f'unsafe path in archive: {member.name}')
-            if member.issym() or member.islnk():
-                link = (target.parent / member.linkname).resolve()
-                if root != link and root not in link.parents:
+            if member.islnk():
+                # Release archives store Porch.app's executables as hard links
+                # to files earlier in the archive. Only those are accepted.
+                if os.path.normpath(member.linkname) not in files:
                     raise RuntimeError(f'unsafe link in archive: {member.name}')
-            elif not (member.isfile() or member.isdir()):
+            elif member.isfile():
+                files.add(os.path.normpath(member.name))
+            elif not member.isdir():
+                # Release archives never contain symlinks. Rejecting them means
+                # no member path can be redirected outside the destination, even
+                # on Pythons without tarfile's extraction filters.
                 raise RuntimeError(f'unsupported entry in archive: {member.name}')
         if hasattr(tarfile, 'data_filter'):
             tar.extractall(destination, filter='data')

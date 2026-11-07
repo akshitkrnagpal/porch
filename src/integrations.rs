@@ -398,8 +398,10 @@ pub async fn request_hosts_sync() -> Result<()> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
+    // HTTP/1.1 as before: reqwest's rustls backend would otherwise offer h2.
     let mut builder = reqwest::Client::builder()
         .no_proxy()
+        .http1_only()
         .timeout(Duration::from_secs(3));
     if settings.tls {
         let pem = fs::read(crate::state::dir().join("ca.pem"))?;

@@ -1373,9 +1373,18 @@ mod tests {
     fn tarball(dir: &Path, version: &str, target: &str) -> (String, Vec<u8>) {
         let name = format!("porch-{version}-{target}");
         let package = dir.join("pkg").join(&name);
-        fs::create_dir_all(package.join("Porch.app/Contents")).unwrap();
+        fs::create_dir_all(package.join("Porch.app/Contents/MacOS")).unwrap();
         fake_binary(&package.join("porch"), version);
         fake_binary(&package.join("porch-tray"), version);
+        // Release archives store the app's executables as hard links to the
+        // copies at the package root (scripts/package.py).
+        for name in ["porch", "porch-tray"] {
+            fs::hard_link(
+                package.join(name),
+                package.join("Porch.app/Contents/MacOS").join(name),
+            )
+            .unwrap();
+        }
         fs::write(
             package.join("Porch.app/Contents/Info.plist"),
             format!("<string>{APP_BUNDLE_ID}</string><string>{version}</string>"),
@@ -1488,6 +1497,14 @@ mod tests {
         assert!(fs::read_to_string(app.join("Contents/Info.plist"))
             .unwrap()
             .contains("99.1.0"));
+        for name in ["porch", "porch-tray"] {
+            assert!(
+                fs::read_to_string(app.join("Contents/MacOS").join(name))
+                    .unwrap()
+                    .contains("99.1.0"),
+                "{name} inside the app"
+            );
+        }
         assert!(!backup_path(&exe).exists());
 
         // A release for another platform is reported, not guessed.
