@@ -44,7 +44,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [features]
 default = []
-tray = ["dep:tray-icon", "dep:tao", "dep:gtk"]
+tray = ["dep:tray-icon", "dep:tao", "dep:gtk", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [[bin]]
 name = "porch-tray"
@@ -56,6 +56,9 @@ tray-icon = { version = "0.26", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tao = { version = "0.37", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSGeometry", "NSObject", "NSRunLoop", "NSString"] }
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "objc2-core-foundation", "NSCell", "NSControl", "NSFont", "NSMenu", "NSEvent", "NSMenuItem", "NSProgressIndicator", "NSResponder", "NSSwitch", "NSText", "NSTextField", "NSView"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", optional = true }
