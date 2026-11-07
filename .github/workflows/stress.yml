@@ -31,6 +31,13 @@ jobs:
         with:
           python-version: '3.12'
       - run: npm install --global turbo@2.6.3
+      - name: Probe what Ctrl+Break to a group id reaches (Windows, own console)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "$env:RUNNER_TEMP\probe.txt"
+          $p = Start-Process python -ArgumentList ".github/stress/ctrl_break_probe.py", $out -PassThru -Wait
+          Get-Content $out
       - name: Build test binaries (release, like the release workflow)
         shell: bash
         run: |
@@ -44,7 +51,6 @@ jobs:
           # Windows runs one test at a time so the test in flight is known if
           # the console is torn down.
           threads=""
-          if [ "$RUNNER_OS" = Windows ]; then threads="--test-threads=1"; fi
           loop() {
             local fails=0
             for round in $(seq "$ROUNDS"); do

@@ -112,6 +112,9 @@ class Fixture:
         deadline = time.monotonic() + 60
         while self.status is None and time.monotonic() < deadline:
             self.read()
+            if self.status is None:
+                stopped = stopped_in_tree(self.pid)
+                assert not stopped, f'stopped by the terminal: {stopped}; output={self.output!r}'
         assert self.status == expected, f'exit={self.status}; output={self.output!r}'
 
     def close(self):
