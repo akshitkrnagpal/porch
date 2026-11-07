@@ -2677,7 +2677,18 @@ async fn doctor() -> Result<()> {
             tokio::task::spawn_blocking(move || crate::health::target_listening(&target))
                 .await
                 .unwrap_or(false);
-        if !resolves {
+        if !resolves && (host == "localhost" || host.ends_with(".localhost")) {
+            // Browsers resolve *.localhost themselves, so the URL works there;
+            // only tools that ask the system resolver (curl, older macOS) miss it.
+            println!(
+                "  {} {label}  {}",
+                style::yellow(Stdout, "!"),
+                style::dim(
+                    Stdout,
+                    &format!("{detail} · browsers open it; for curl and other tools on this computer, run `sudo porch hosts sync`")
+                )
+            );
+        } else if !resolves {
             bad(
                 &label,
                 &format!("{host} does not resolve on this computer; run `sudo porch hosts sync`"),

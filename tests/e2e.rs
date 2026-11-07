@@ -284,7 +284,7 @@ fn python_http_server_gets_its_port_from_porch() {
         port,
         "py.localhost",
         "served by python through porch",
-        Duration::from_secs(30),
+        Duration::from_secs(120), // http.server calls getfqdn(), slow where reverse DNS times out (CI)
     ));
     drop(launch);
 }

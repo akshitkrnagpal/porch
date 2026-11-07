@@ -918,7 +918,7 @@ fn detached_runs_answer_log_and_stop() {
     let s = Sandbox::new();
     let o = s.run(&[
         "run", "--detach", "--name", "bg", "python3", "-c",
-        "import http.server,os;print('hello from bg',flush=True);http.server.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),http.server.SimpleHTTPRequestHandler).serve_forever()",
+        "import os,socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',int(os.environ['PORT'])))\ns.listen()\nprint('hello from bg',flush=True)\nwhile True: time.sleep(1)",
     ]);
     let out = String::from_utf8_lossy(&o.stdout).into_owned();
     assert!(

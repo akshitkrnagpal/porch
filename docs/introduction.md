@@ -53,8 +53,8 @@ URLs carry no port where your OS lets Porch serve port 80 without sudo (macOS, W
 | Client | How `web.localhost` resolves | How the HTTPS certificate is trusted |
 | --- | --- | --- |
 | Chrome, Edge, Firefox, Arc, Brave | The browser itself sends every `*.localhost` name to loopback | macOS keychain or Windows user store; on Linux, the NSS databases `porch trust` writes |
-| Safari | The system resolver, which on macOS answers every `*.localhost` name with 127.0.0.1 and ::1 | macOS login keychain |
-| `curl`, Python, Go, Java | The system resolver: works on macOS and on Linux with systemd (`nss-myhostname`); elsewhere use `curl --resolve` or `sudo porch hosts sync` | Pass `--cacert ~/.porch/ca.pem`, or run `porch trust --system` |
+| Safari | The system resolver: recent macOS versions answer every `*.localhost` name with 127.0.0.1 and ::1; on older ones run `sudo porch hosts sync` | macOS login keychain |
+| `curl`, Python, Go, Java | The system resolver: works on recent macOS and on Linux with systemd (`nss-myhostname`); elsewhere use `curl --resolve` or `sudo porch hosts sync` | Pass `--cacert ~/.porch/ca.pem`, or run `porch trust --system` |
 | Node apps Porch starts | Same as above | Automatic: Porch sets `NODE_EXTRA_CA_CERTS` |
 | Phones on your network (`--lan`) | mDNS `NAME.local` | Install the CA on the device, or use plain HTTP |
 
