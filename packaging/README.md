@@ -4,6 +4,7 @@ Each release archive contains:
 
 - macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`): `porch`, `porch-tray`, `porch-login`, `install.py` and `Porch.app`.
 - Linux (`x86_64-unknown-linux-gnu`): `porch`, `porch-tray` (a GTK 3 / AppIndicator tray), `porch-login` and `install.py`.
+- Linux, static (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`): `porch` and `install.py` only. These run on any distribution, including Alpine and ARM64 servers.
 - Windows (`x86_64-pc-windows-msvc`, preview): `porch.exe`, `porch-tray.exe` (a notification-area app) and `install.py`. There is no `porch-login` on Windows.
 
 Archives are attached to tagged GitHub Releases along with a `SHA256SUMS` file. They aren't signed or notarized. `homebrew/porch.rb` is the Homebrew formula template that `scripts/render_formula.py` fills in for each release.
@@ -43,7 +44,7 @@ macOS may ask you to approve an unsigned app downloaded from the internet in Sys
 
 ## Linux desktop requirements
 
-The `porch` CLI doesn't link GTK, AppIndicator or OpenSSL and works without a display. Only `porch-tray` needs the desktop libraries. Prebuilt Linux binaries need glibc 2.39 or newer; build from source on older distributions.
+The `porch` CLI doesn't link GTK, AppIndicator or OpenSSL and works without a display. Only `porch-tray` needs the desktop libraries. The `linux-gnu` binaries need glibc 2.39 or newer; on older distributions use a static `linux-musl` archive. Every archive has a signed build-provenance attestation (`gh attestation verify porch-*.tar.gz --repo akshitkrnagpal/porch`), and `scripts/install.sh` installs the right one without Python.
 
 Build dependencies on Debian and Ubuntu:
 

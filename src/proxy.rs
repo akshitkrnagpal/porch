@@ -6,11 +6,15 @@ use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::{body::Incoming, header, Method, Request, Response, StatusCode, Version};
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder,
 };
 use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 type Body = UnsyncBoxBody<Bytes, hyper::Error>;
+/// Open client connections the proxy serves at once; more are refused.
+const MAX_CONNECTIONS: usize = 4096;
+/// Time a client gets to send a complete HTTP/1 request head.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 type Upstream = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 #[derive(Clone)]
 struct ProxyContext {
@@ -967,6 +971,11 @@ async fn listen(
                 continue;
             }
         };
+        // Bound the work a flood of (or a LAN full of) idle clients can pin.
+        if connections.len() >= MAX_CONNECTIONS {
+            drop(stream);
+            continue;
+        }
         let context = context.clone();
         let acceptor = acceptor.clone();
         connections.spawn(async move {
@@ -985,7 +994,18 @@ async fn listen(
                 forward(req,peer,tls,redirect_plain,context.clone())
             });
             let mut builder = Builder::new(TokioExecutor::new());
-            builder.http2().enable_connect_protocol();
+            // Slow or silent clients can't hold a connection open forever
+            // before sending a full request head.
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_READ_TIMEOUT);
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .enable_connect_protocol()
+                .keep_alive_interval(Some(Duration::from_secs(30)))
+                .keep_alive_timeout(Duration::from_secs(20));
             if tls {
                 if let Some(acceptor) = acceptor {
                     if let Ok(Ok(stream)) =
