@@ -174,6 +174,10 @@ def main():
 
 def install(parser, args):
     source = args.source.resolve()
+    if not args.cli_only and not (source / ('porch-tray' + EXE)).is_file() and (source / ('porch' + EXE)).is_file() and (source / 'install.py').is_file():
+        # CLI-only archives (the static Linux builds) have no tray.
+        print('This package has no tray app; installing the CLI only.')
+        args.cli_only = True
     names = [name + EXE for name in ['porch'] + ([] if args.cli_only else ['porch-tray'])]
     for name in names:
         binary = source / name

@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / 'packaging/homebrew/porch.rb'
 DEFAULT_REPO = 'akshitkrnagpal/porch'
 # Every target the formula references. Each must be present in SHA256SUMS.
-TARGETS = ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-unknown-linux-gnu']
+TARGETS = ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-musl']
 VERSION = re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')
 
 

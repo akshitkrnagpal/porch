@@ -167,13 +167,14 @@ Setup then saves the settings, starts or restarts the proxy, and prints a short 
 
 ## Updates
 
-`porch self-update` installs the latest release. If `porch` was installed with Homebrew, it runs `brew upgrade akshitkrnagpal/tap/porch`. Otherwise it downloads `porch-VERSION-TARGET.tar.gz` from the latest GitHub Release, checks it against the release's `SHA256SUMS`, and replaces the running binary safely: it writes a temporary file beside it, syncs and renames it, and keeps `porch.old` until the new binary reports its version. It also replaces `porch-tray` and `porch-login` if they sit beside `porch`, and on macOS the installed `~/Applications/Porch.app`. Running apps, the proxy and the tray keep running, and a proxy started by the old version restarts the next time you use Porch. Binaries inside a Cargo `target/` directory are left alone unless you pass `--force`.
+`porch self-update` installs the latest release. If `porch` was installed with Homebrew, it runs `brew upgrade akshitkrnagpal/tap/porch`. Otherwise it downloads `porch-VERSION-TARGET.tar.gz` from the latest GitHub Release, checks it against the release's `SHA256SUMS` and, when the GitHub CLI is installed, verifies its build attestation (`gh attestation verify`), which proves the Porch release workflow built it. Set `PORCH_UPDATE_VERIFY=require` to refuse updates when the attestation can't be checked. It then replaces the running binary safely: it writes a temporary file beside it, syncs and renames it, and keeps `porch.old` until the new binary reports its version. It also replaces `porch-tray` and `porch-login` if they sit beside `porch`, and on macOS the installed `~/Applications/Porch.app`. Running apps, the proxy and the tray keep running, and a proxy started by the old version restarts the next time you use Porch. Binaries inside a Cargo `target/` directory are left alone unless you pass `--force`.
 
 `--check` prints the current and latest versions and exits with 0 (up to date), 1 (update available) or 2 (error). `--dry-run` prints what would happen without downloading anything. `--force` reinstalls the latest release.
 
 | Variable | Meaning |
 | --- | --- |
 | `PORCH_UPDATE_REPO` | Release repository, default `akshitkrnagpal/porch` |
+| `PORCH_UPDATE_VERIFY` | `require` refuses an update unless its build attestation verifies (needs `gh`) |
 | `PORCH_UPDATE_API` | GitHub API base URL, default `https://api.github.com` |
 | `GITHUB_TOKEN`, `GH_TOKEN` | Token for a private repository; `porch self-update` also tries `gh auth token` |
 | `PORCH_NO_UPDATE_CHECK=1` | Turns off the update notice |
@@ -204,4 +205,4 @@ cargo test --all-targets
 cargo build --release
 ```
 
-CI runs these on Ubuntu x86_64 and macOS ARM64. A Windows job lints and builds the CLI and tray, runs the unit and integration tests, and checks packaging; the `config`, `first_run`, `integrations`, `lifecycle` and `pty` suites run only on macOS and Linux. Pushing a `v*` tag builds the release archives (CLI and tray, plus `Porch.app` on macOS and `.exe` files on Windows), publishes them with `SHA256SUMS` on GitHub Releases, and updates the Homebrew formula when the `HOMEBREW_TAP_TOKEN` secret is set. Archives aren't signed or notarized.
+CI runs these on Ubuntu x86_64 and macOS ARM64. A Windows job lints and builds the CLI and tray, runs the unit and integration tests, and checks packaging; the `config`, `first_run`, `integrations`, `lifecycle` and `pty` suites run only on macOS and Linux. Pushing a `v*` tag builds the release archives (CLI and tray, plus `Porch.app` on macOS and `.exe` files on Windows), publishes them with `SHA256SUMS` and a signed build-provenance attestation on GitHub Releases, and updates the Homebrew formula when the `HOMEBREW_TAP_TOKEN` secret is set. Static, CLI-only Linux archives (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) run on any distribution, including Alpine and ARM64 servers. Verify any archive with `gh attestation verify porch-*.tar.gz --repo akshitkrnagpal/porch`. macOS builds aren't notarized yet.

@@ -121,6 +121,15 @@ pub fn current_target() -> Option<&'static str> {
         target_env = "gnu"
     )) {
         Some("x86_64-unknown-linux-gnu")
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "musl"
+    )) {
+        Some("x86_64-unknown-linux-musl")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        // Only a static build is published for ARM64 Linux.
+        Some("aarch64-unknown-linux-musl")
     } else if cfg!(all(windows, target_arch = "x86_64", target_env = "msvc")) {
         Some("x86_64-pc-windows-msvc")
     } else {
@@ -219,6 +228,56 @@ pub fn verify_checksum(bytes: &[u8], name: &str, sums: &BTreeMap<String, String>
     if &actual != expected {
         bail!("checksum mismatch for {name}: expected {expected}, got {actual}");
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Build provenance
+
+/// Check the archive's GitHub build attestation with `gh attestation verify`.
+///
+/// `SHA256SUMS` only proves the download is intact; the attestation proves the
+/// release workflow in the Porch repository built it. Verification runs when
+/// the GitHub CLI is installed, and `PORCH_UPDATE_VERIFY=require` makes it
+/// mandatory. A failed verification always stops the update.
+fn verify_provenance(github: &GitHub, tarball: &Path, out: &mut dyn Write) -> Result<()> {
+    if github.api != DEFAULT_API {
+        // A mirror or test server: attestations live on github.com only.
+        return Ok(());
+    }
+    let required = env_nonempty("PORCH_UPDATE_VERIFY").is_some_and(|v| v == "require");
+    let gh = Command::new("gh")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !gh {
+        if required {
+            bail!("PORCH_UPDATE_VERIFY=require needs the GitHub CLI (gh) to check the build attestation");
+        }
+        writeln!(
+            out,
+            "Skipped build attestation check (install the GitHub CLI to enable it)"
+        )?;
+        return Ok(());
+    }
+    let workflow = format!("{}/.github/workflows/release.yml", github.repo);
+    let result = Command::new("gh")
+        .args(["attestation", "verify"])
+        .arg(tarball)
+        .args(["--repo", &github.repo, "--signer-workflow", &workflow])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("cannot run gh attestation verify")?;
+    if !result.status.success() {
+        bail!(
+            "the release archive's build attestation did not verify; not installing it.\n{}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        );
+    }
+    writeln!(out, "Verified build attestation from {workflow}")?;
     Ok(())
 }
 
@@ -664,6 +723,7 @@ pub async fn perform(
     let work = TempDir::new(&std::env::temp_dir(), "update")?;
     let tarball = work.0.join(&asset.name);
     fs::write(&tarball, &archive)?;
+    verify_provenance(github, &tarball, out)?;
     let status = Command::new("tar")
         .arg("-xzf")
         .arg(&tarball)
