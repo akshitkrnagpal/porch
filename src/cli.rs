@@ -338,6 +338,11 @@ enum Commands {
     #[command(external_subcommand)]
     Named(Vec<String>),
 }
+/// The CLI definition, for tests that keep other surfaces (MCP) in sync.
+#[cfg(test)]
+pub(crate) fn command() -> clap::Command {
+    Cli::command()
+}
 fn merge(mut a: RunOptions, b: RunOptions) -> RunOptions {
     if b.name.is_some() {
         a.name = b.name

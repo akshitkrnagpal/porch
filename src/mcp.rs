@@ -26,10 +26,10 @@ fn description(n: &str) -> &'static str {
     match n {
         "list" => "List the apps Porch is serving on this computer: name, URL, upstream target, owning pid, health (ok, not listening, stopped, dead) and any sharing URLs. Use this to find the URL of a running dev server instead of guessing a localhost port.",
         "get" => "Print the stable URL for an app name, applying the current Git worktree prefix unless noWorktree is set. Works before the app runs, so it is safe for wiring one app's URL into another's config.",
-        "alias_add" => "Route NAME.localhost to an existing local port that Porch did not start (a database UI, a Docker container). Fails if the name is taken unless force is set. private keeps it off paired machines; upstream (https, https://HOST or http://HOST) sets TLS and the Host sent to the port.",
+        "alias_add" => "Route NAME.localhost to an existing local port that Porch did not start (a database UI, a Docker container). Fails if the name is taken unless force is set. private keeps it off paired machines; upstream (https, https://HOST or http://HOST) sets TLS and the Host sent to the port; insecure skips certificate checks for an https upstream (self-signed dev servers; trusting its CA is better).",
         "alias_remove" => "Remove a static alias created with alias_add. Never stops a process.",
         "tools_profiles" => "Report which tool profiles are active and which exist (core, proxy, diagnostics, all).",
-        "proxy_start" => "Start the Porch proxy in the background if it is not running. Apps start it automatically, so this is rarely needed.",
+        "proxy_start" => "Start the Porch proxy in the background if it is not running. Apps start it automatically, so this is rarely needed. https serves HTTPS with a local CA trusted for the user.",
         "proxy_stop" => "Stop the Porch proxy. Running apps keep their routes but their URLs stop answering until the proxy starts again.",
         "doctor" => "Read-only health check: proxy listeners, routes, name resolution, HTTPS trust and optional tools. Returns a non-zero exit code when it finds problems. Never changes anything; use doctor_fix to apply fixes.",
         "prune" => "Remove routes whose apps have exited. With force, also stop processes those routes left behind.",
@@ -105,9 +105,9 @@ fn definition(n: &str) -> Value {
     }
     let fields: &[&str] = match n {
         "get" => &["name", "noWorktree"],
-        "alias_add" => &["name", "port", "force", "tld", "private", "upstream"],
+        "alias_add" => &["name", "port", "force", "tld", "private", "upstream", "insecure"],
         "alias_remove" => &["name", "tld"],
-        "proxy_start" => &["port", "noTls", "lan", "tld", "wildcard", "unprivileged"],
+        "proxy_start" => &["port", "https", "noTls", "lan", "tld", "wildcard", "unprivileged"],
         "proxy_stop" => &["port"],
         "prune" => &["force"],
         "doctor_fix" => &["yes"],
@@ -242,6 +242,8 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
         ("unprivileged", "--unprivileged"),
         ("yes", "--yes"),
         ("private", "--private"),
+        ("insecure", "--insecure"),
+        ("https", "--https"),
     ] {
         if a[key] == true {
             argv.push(flag.into());
@@ -487,6 +489,57 @@ mod tests {
             definition("doctor_fix")["annotations"]["destructiveHint"],
             true
         );
+    }
+    /// Every flag of the commands MCP wraps is either a typed tool argument
+    /// or deliberately left out, so the two can't drift apart.
+    #[test]
+    fn tool_arguments_cover_the_cli_flags() {
+        let cli = crate::cli::command();
+        let camel = |flag: &str| {
+            let mut out = String::new();
+            let mut upper = false;
+            for c in flag.chars() {
+                if c == '-' {
+                    upper = true;
+                } else if upper {
+                    out.extend(c.to_uppercase());
+                    upper = false;
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        for (path, tool, excluded) in [
+            (vec!["alias"], "alias_add", vec!["remove", "help"]),
+            (
+                vec!["proxy", "start"],
+                "proxy_start",
+                // Foreground can't work over MCP; the rest need files or are
+                // saved settings an agent shouldn't change behind the user.
+                vec!["foreground", "skip-trust", "ip", "cert", "key", "bind", "redirect-port", "state-dir", "help"],
+            ),
+            (vec!["get"], "get", vec!["help"]),
+            (vec!["stop"], "stop", vec!["help"]),
+            (vec!["logs"], "logs", vec!["follow", "help"]),
+        ] {
+            let mut command = &cli;
+            for part in &path {
+                command = command.find_subcommand(part).unwrap();
+            }
+            let properties = definition(tool)["inputSchema"]["properties"].clone();
+            for arg in command.get_arguments() {
+                let Some(long) = arg.get_long() else { continue };
+                if excluded.contains(&long) {
+                    continue;
+                }
+                assert!(
+                    !properties[camel(long)].is_null(),
+                    "MCP tool {tool} has no argument for `porch {} --{long}`",
+                    path.join(" ")
+                );
+            }
+        }
     }
     #[tokio::test]
     async fn lifecycle() {

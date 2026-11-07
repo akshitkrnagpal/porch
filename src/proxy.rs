@@ -116,10 +116,12 @@ const COPY_SCRIPT: &str = "document.addEventListener('click',e=>{const b=e.targe
 const DASHBOARD_SCRIPT: &str = r#"<script>
 (()=>{const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const row=(url,label,up,detail)=>`<li><a href="${esc(url)}"><span class="name"><span class="dot ${up?'up':'down'}"></span>${esc(label)}</span><span class="target">${esc(detail)}</span></a><button class="copy" data-url="${esc(url)}" title="Copy URL" aria-label="Copy URL">Copy</button></li>`;
-async function local(){try{const r=await fetch('/_porch/apps.json',{cache:'no-store'});const d=await r.json();const q=document.querySelector('input[type=search]');const f=q?q.value.toLowerCase():'';
-const el=document.getElementById('local');if(!d.apps.length){el.innerHTML='<p class="muted">No apps are running. Start one with <code>porch run pnpm dev</code>.</p>';return}
-const ul=el.querySelector('ul.apps');d.apps.sort((a,b)=>a.host.localeCompare(b.host));const html=d.apps.map(a=>row(a.url,a.host,a.health==='ok',a.health==='ok'?a.target:a.target+' · not listening')).join('');
-if(ul){ul.innerHTML=html;if(f)for(const li of ul.children)li.hidden=!li.textContent.toLowerCase().includes(f)}else el.innerHTML='<ul class="apps">'+html+'</ul>'}catch(e){}}
+async function local(){const st=document.getElementById('status');try{const r=await fetch('/_porch/apps.json',{cache:'no-store'});if(!r.ok)throw 0;const d=await r.json();if(st)st.hidden=true;
+const el=document.getElementById('local');if(!d.apps.length){el.dataset.empty='1';el.innerHTML='<p class="muted">No apps are running. Start one with <code>porch run pnpm dev</code>.</p>';return}
+d.apps.sort((a,b)=>a.host.localeCompare(b.host));const html=d.apps.map(a=>row(a.url,a.host,a.health==='ok',a.health==='ok'?a.target:a.target+' · not listening')).join('');
+let ul=el.querySelector('ul.apps');if(!ul||el.dataset.empty){delete el.dataset.empty;el.innerHTML=(d.apps.length>5?'<input type="search" placeholder="Filter apps" aria-label="Filter apps"><p id="nomatch" class="muted" role="status" hidden>No apps match.</p>':'')+'<ul class="apps"></ul>';ul=el.querySelector('ul.apps');const q=el.querySelector('input[type=search]');if(q)q.oninput=filter}
+ul.innerHTML=html;filter()}catch(e){if(st)st.hidden=false}}
+function filter(){const q=document.querySelector('#local input[type=search]');const f=q?q.value.toLowerCase():'';let n=0;for(const li of document.querySelectorAll('#local ul.apps li')){li.hidden=!!f&&!li.textContent.toLowerCase().includes(f);n+=!li.hidden}const nm=document.getElementById('nomatch');if(nm)nm.hidden=n>0}
 async function peers(){try{const r=await fetch('/_porch/apps.json?peers=1',{cache:'no-store'});const d=await r.json();const el=document.getElementById('peers');
 el.innerHTML=(d.machines||[]).map(m=>`<h2>${esc(m.machine)}${m.error?' · unreachable':''}</h2>`+(m.apps.length?'<ul class="apps">'+m.apps.map(a=>a.url?row(a.url,a.name,a.health==='healthy',''):`<li><a><span class="name"><span class="dot down"></span>${esc(a.name)}</span><span class="target">${esc(a.note||'not shared')}</span></a></li>`).join('')+'</ul>':'<p class="muted">No apps.</p>')).join('')}catch(e){}}
 setInterval(local,3000);peers();setInterval(peers,30000);})();
@@ -687,7 +689,7 @@ async fn forward(
                     StatusCode::OK,
                     "Your apps",
                     &format!(
-                        "<p class=\"muted\">Every app Porch is serving on this computer. This page updates by itself.</p><div id=\"local\">{list}</div><div id=\"peers\"></div>{live}"
+                        "<p class=\"muted\">Every app Porch is serving on this computer. This page updates by itself.</p><p id=\"status\" class=\"muted\" role=\"status\" hidden>Can't reach Porch's proxy right now; retrying…</p><div id=\"local\">{list}</div><div id=\"peers\"></div>{live}"
                     ),
                     "",
                 )
