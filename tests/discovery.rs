@@ -1057,3 +1057,188 @@ async fn joiners_refuse_to_downgrade_to_the_insecure_exchange() {
         "nothing is sent to an old-protocol agent"
     );
 }
+
+/// A paired machine serving one catalog over pinned TLS, counting requests.
+async fn catalog_peer(
+    catalog: Value,
+    token: &'static str,
+) -> (
+    String,
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use hyper::{body::Incoming, Request, Response};
+    use sha2::Digest;
+    use std::sync::{atomic::Ordering, Arc};
+    let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let pin: String = sha2::Sha256::digest(cert.cert.der())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert.cert.der().clone()], key)
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("https://{}/", listener.local_addr().unwrap());
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = hits.clone();
+    let body = catalog.to_string();
+    let task = tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let (acceptor, counted, body) = (acceptor.clone(), counted.clone(), body.clone());
+            tokio::spawn(async move {
+                let Ok(stream) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    let authorized = req.uri().path() == "/v1/catalog"
+                        && req
+                            .headers()
+                            .get("authorization")
+                            .is_some_and(|h| h.as_bytes() == format!("Bearer {token}").as_bytes());
+                    let mut response = Response::new(http_body_util::Full::new(
+                        bytes::Bytes::from(if authorized {
+                            body.clone()
+                        } else {
+                            String::new()
+                        }),
+                    ));
+                    if !authorized {
+                        *response.status_mut() = hyper::StatusCode::UNAUTHORIZED;
+                    }
+                    async move { Ok::<_, std::convert::Infallible>(response) }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (endpoint, pin, hits, task)
+}
+#[tokio::test]
+async fn opening_an_app_on_one_peer_never_waits_on_an_unreachable_other_peer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = std::env::temp_dir().join(format!("porch-open-one-peer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let node = root.join("node-a");
+    std::fs::create_dir_all(&node).unwrap();
+    let _nodes = Nodes(vec![node.clone()]);
+    let token = "t0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let app = |id: &str, name: &str| {
+        serde_json::json!({
+            "id": id, "name": name, "local_url": "http://app.localhost:7462",
+            "health": "healthy", "remote_access": true, "unavailable_reason": null
+        })
+    };
+    let catalog = serde_json::json!({
+        "version": PROTOCOL_VERSION,
+        "machine": {"id": "machine-b", "name": "Remote Mac"},
+        // "My Notes" cannot be a hostname, so it needs a relay; "web" can.
+        "apps": [app("notes", "My Notes"), app("web", "web")],
+        "proxy_running": true,
+        "generated_at": 1
+    });
+    let (endpoint, pin, reachable_hits, reachable) = catalog_peer(catalog, token).await;
+    // An offline machine that accepts TCP and never answers: contacting it at
+    // all would cost the client its connect and request timeouts.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_endpoint = format!("https://{}/", silent.local_addr().unwrap());
+    let silent_hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = silent_hits.clone();
+    let offline = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((tcp, _)) = silent.accept().await {
+            counted.fetch_add(1, Ordering::Relaxed);
+            held.push(tcp);
+        }
+    });
+    let peer = |id: &str, name: &str, endpoint: &str, pin: &str| {
+        serde_json::json!({
+            "machine": {"id": id, "name": name}, "endpoint": endpoint,
+            "fingerprint": pin, "token": token, "sources": ["explicit"], "last_seen": 0
+        })
+    };
+    // The offline machine is enrolled first, as a refresh of every peer would
+    // meet it first.
+    let peers = serde_json::json!([
+        peer(
+            "machine-offline",
+            "Offline Box",
+            &silent_endpoint,
+            &"0".repeat(64)
+        ),
+        peer("machine-b", "Remote Mac", &endpoint, &pin),
+    ]);
+    std::fs::write(
+        node.join("discovery-peers.json"),
+        serde_json::to_vec(&peers).unwrap(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            node.join("discovery-peers.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+
+    // The relay path: `porch open` starts a relay and prints its URL.
+    let url = ok(
+        &node,
+        &["open", "notes", "--peer", "machine-b", "--url-only"],
+    )
+    .await;
+    let url = url.trim();
+    assert!(
+        url.starts_with("http://porch-") && url.contains(".localhost:"),
+        "{url}"
+    );
+    // A hostname-routed app gets as far as the local-proxy check, which means
+    // the selected peer's catalog was fetched and the app matched.
+    let web = command(
+        &node,
+        &["open", "web", "--peer", "remote-mac", "--url-only"],
+        None,
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&web.stderr).contains("local proxy is stopped"),
+        "{}",
+        String::from_utf8_lossy(&web.stderr)
+    );
+    assert!(reachable_hits.load(Ordering::Relaxed) >= 2);
+    assert_eq!(
+        silent_hits.load(Ordering::Relaxed),
+        0,
+        "opening an app on machine-b must not contact another paired machine"
+    );
+    // The selected peer's authenticated refresh is still recorded.
+    let stored: Value =
+        serde_json::from_slice(&std::fs::read(node.join("discovery-peers.json")).unwrap()).unwrap();
+    let last_seen = |id: &str| {
+        stored
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["machine"]["id"] == id)
+            .unwrap()["last_seen"]
+            .as_u64()
+            .unwrap()
+    };
+    assert!(last_seen("machine-b") > 0);
+    assert_eq!(last_seen("machine-offline"), 0);
+    reachable.abort();
+    offline.abort();
+}

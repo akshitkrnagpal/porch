@@ -265,17 +265,25 @@ fn relay_key(peer: &str, app: &str) -> String {
         Sha256::digest(format!("{peer}\0{app}"))
     )
 }
+/// The browser URL of a peer's app on this machine's proxy, `APP.SLUG.localhost`,
+/// or `None` when the app's name cannot be a hostname and it needs a relay.
+/// `porch open` and the menu's app rows (which open it directly) both use this.
+pub fn hostname_url(
+    settings: &crate::state::ProxySettings,
+    peer_slug: &str,
+    app_name: &str,
+) -> Option<String> {
+    gateway::hostname_app(app_name).map(|name| settings.url(&format!("{name}.{peer_slug}")))
+}
 /// Start a loopback browser transport. The agent URL is never opened directly.
 pub async fn app_url(app: &str, peer: Option<&str>) -> Result<String> {
     if let Some(peer_id) = peer {
         let selected = client::find_peer(peer_id)?;
         let peer_id = &selected.machine.id;
-        let all = client::snapshot(false).await?;
-        let remote = all
-            .peers
-            .iter()
-            .find(|p| &p.machine.id == peer_id)
-            .context("paired peer unavailable")?;
+        let local = server::local_catalog()?;
+        // Query only the selected machine: another paired peer being offline
+        // must not delay opening this one.
+        let remote = client::refresh_peer(&local.machine.id, peer_id).await?;
         let catalog = remote.catalog.as_ref().with_context(|| {
             remote
                 .error
@@ -301,12 +309,13 @@ pub async fn app_url(app: &str, peer: Option<&str>) -> Result<String> {
             )
         }
         // Readable, stable URL served by the local proxy: APP.MACHINE.localhost.
-        if let Some(name) = gateway::hostname_app(&found.name) {
-            if !all.local.proxy_running {
+        if gateway::hostname_app(&found.name).is_some() {
+            if !local.proxy_running {
                 bail!("the local proxy is stopped; start it with `porch proxy start` to open apps on {}", selected.machine.name)
             }
             let settings = crate::state::proxy_settings()?;
-            return Ok(settings.url(&format!("{name}.{}", selected.slug)));
+            return hostname_url(&settings, &selected.slug, &found.name)
+                .context("app name cannot be a hostname");
         }
         // Path-routed apps cannot be named in a hostname; use a dedicated relay.
         let _lock = lock("discovery.relay.lock")?;
