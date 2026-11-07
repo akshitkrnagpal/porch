@@ -62,41 +62,49 @@ fn exclusive(socket: &socket2::Socket) -> io::Result<()> {
 
 /// Windows lets a specific address bind succeed while another process holds
 /// the wildcard on that port, and then routes that address to us: we would
-/// take its traffic. Unix refuses such a bind. Probe the wildcard first; a
-/// plain (non-exclusive) probe still allows other specific addresses on the
+/// take its traffic. Unix refuses such a bind. Probe the wildcards first;
+/// plain (non-exclusive) probes still allow other specific addresses on the
 /// port, as Unix does.
+///
+/// A dual-stack `[::]` listener also receives IPv4 there without holding
+/// `0.0.0.0`, so IPv4 addresses probe `[::]` too. A probe cannot tell that
+/// listener from an IPv6-only one, so the latter is refused as well: the
+/// safe side, since guessing wrong the other way steals traffic.
 #[cfg(windows)]
 fn wildcard_free(addr: SocketAddr) -> io::Result<()> {
     if addr.ip().is_unspecified() || addr.port() == 0 {
         return Ok(());
     }
-    let (domain, wildcard) = if addr.is_ipv6() {
-        (
-            socket2::Domain::IPV6,
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), addr.port()),
-        )
-    } else {
-        (
-            socket2::Domain::IPV4,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), addr.port()),
-        )
-    };
-    let probe = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    if addr.is_ipv6() {
-        probe.set_only_v6(true)?;
+    let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), addr.port());
+    let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), addr.port());
+    let wildcards: &[SocketAddr] = if addr.is_ipv6() { &[v6] } else { &[v4, v6] };
+    for wildcard in wildcards {
+        let domain = if wildcard.is_ipv6() {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        };
+        let probe =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        if wildcard.is_ipv6() {
+            probe.set_only_v6(true)?;
+        }
+        match probe.bind(&(*wildcard).into()) {
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "port {} is held on all interfaces by another process",
+                        addr.port()
+                    ),
+                ))
+            }
+            // Bound, or failed for another reason (no IPv6, say) that the
+            // real bind will report if it matters.
+            _ => {}
+        }
     }
-    match probe.bind(&wildcard.into()) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AddrInUse => Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            format!(
-                "port {} is held on all interfaces by another process",
-                addr.port()
-            ),
-        )),
-        // Anything else (no IPv6, say) is for the real bind to report.
-        Err(_) => Ok(()),
-    }
+    Ok(())
 }
 
 /// Hold both address families, including wildcard interfaces, until the app starts.
