@@ -325,7 +325,15 @@ pub async fn disable() -> Result<()> {
     if !installed_here(&platform, &path) {
         return Ok(());
     }
+    // The supervised agent being unloaded. Unloading only asks the service
+    // manager to stop it, so it can still look like the running agent right
+    // after: wait until it is gone before deciding whether to start a
+    // replacement, or sharing would silently end when it exits.
+    let supervised = super::process_identity("discovery");
     unload(&platform, &path)?;
+    if let Some(identity) = supervised {
+        super::stop_identity(&identity).await?;
+    }
     if super::server::config()?.is_some() && !super::running() {
         super::spawn_agent().await?;
     }

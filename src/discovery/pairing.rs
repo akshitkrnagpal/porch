@@ -632,10 +632,19 @@ async fn refused(response: reqwest::Response) -> anyhow::Error {
 async fn step<T: serde::de::DeserializeOwned>(
     request: reqwest::RequestBuilder,
 ) -> std::result::Result<T, anyhow::Error> {
-    let response = request
-        .send()
-        .await
-        .map_err(|e| fail("unreachable", format!("pairing connection failed: {e}")))?;
+    let response = request.send().await.map_err(|e| {
+        // reqwest's own message omits the cause (timeout, refused, reset).
+        let mut detail = e.to_string();
+        let mut source = std::error::Error::source(&e);
+        while let Some(cause) = source {
+            detail.push_str(&format!(": {cause}"));
+            source = cause.source();
+        }
+        fail(
+            "unreachable",
+            format!("pairing connection failed: {detail}"),
+        )
+    })?;
     if !response.status().is_success() {
         return Err(refused(response).await);
     }

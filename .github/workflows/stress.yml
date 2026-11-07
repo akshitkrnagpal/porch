@@ -35,7 +35,7 @@ jobs:
         shell: bash
         run: |
           cargo test --release --all-targets --no-run --message-format=json \
-            | jq -r 'select(.profile.test==true) | .executable' > bins.txt
+            | jq -r 'select(.profile.test==true) | .executable' | tr -d '\r' > bins.txt
           cat bins.txt
       - name: Repeat the suite with two concurrent loops for extra load
         shell: bash

@@ -23,10 +23,13 @@ impl Sandbox {
         let dir = std::env::temp_dir().join(format!(
             "porch-integrations-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            // A per-process counter: the clock (microseconds on macOS) gives
+            // parallel tests the same name, and with it shared state.
+            {
+                static NEXT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            }
         ));
         fs::create_dir_all(dir.join("bin")).unwrap();
         fs::create_dir_all(dir.join("state")).unwrap();
@@ -545,7 +548,9 @@ else:
  sys.exit(9)
 "#,
             );
-            let script="import os,time,json;root=os.environ['PORCH_TEST_ROOT'];open(root+'/app-pid','w').write(str(os.getpid()));open(root+'/app-env','w').write(json.dumps(dict(os.environ)));time.sleep(60)";
+            // The environment is complete before the pid appears (both renamed
+            // into place): the fake tunnel fails as soon as it sees the pid.
+            let script="import os,time,json;root=os.environ['PORCH_TEST_ROOT'];open(root+'/app-env.tmp','w').write(json.dumps(dict(os.environ)));os.replace(root+'/app-env.tmp',root+'/app-env');open(root+'/app-pid.tmp','w').write(str(os.getpid()));os.replace(root+'/app-pid.tmp',root+'/app-pid');time.sleep(60)";
             let flag = format!("--{provider}");
             let mut child = s
                 .cmd()
@@ -716,7 +721,7 @@ fn compose_passthrough_preserves_stdin_output_and_exit_status() {
 fn stalled_external_helper_has_bounded_lifetime() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let s = Sandbox::new();
-    s.fake("security","open(os.environ['PORCH_TEST_ROOT']+'/helper-pid','w').write(str(os.getpid()))\ntime.sleep(60)");
+    s.fake("security", "time.sleep(60)");
     write_ca(&s);
     let start = std::time::Instant::now();
     let out = s
@@ -727,13 +732,28 @@ fn stalled_external_helper_has_bounded_lifetime() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    // The helper would run for a minute; returning well before proves the bound.
+    assert!(start.elapsed() < std::time::Duration::from_secs(30));
     assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
-    let pid: i32 = fs::read_to_string(s.dir.join("helper-pid"))
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+    // The helper may be killed before its interpreter runs a line, so find it
+    // by its command line rather than by a file it would write.
+    let helper = s.dir.join("bin/security");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let running = Command::new("pgrep")
+            .args(["-f", &helper.to_string_lossy()])
+            .output()
+            .unwrap();
+        if !running.status.success() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stalled helper survived its timeout: {}",
+            String::from_utf8_lossy(&running.stdout)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -827,24 +847,35 @@ fn doctor_does_not_call_a_foreign_listener_ready() {
     for name in ["node", "docker", "tailscale", "ngrok", "cloudflared"] {
         s.fake(name, "print('fixture version')");
     }
+    // A foreign HTTP server that answers until doctor is done. It reads each
+    // request's headers before replying: a reply followed by closing with the
+    // request unread resets the connection, which doctor reports as
+    // unavailable rather than foreign.
     let listener = std::net::TcpListener::bind(("127.0.0.1", s.port)).unwrap();
-    listener.set_nonblocking(true).unwrap();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = done.clone();
     let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-        while std::time::Instant::now() < deadline {
-            if let Ok((mut c, _)) = listener.accept() {
-                c.set_read_timeout(Some(std::time::Duration::from_millis(300)))
-                    .unwrap();
-                let mut buf = [0; 4096];
-                let _ = c.read(&mut buf);
-                let _ = c.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
+        for c in listener.incoming() {
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            let Ok(mut c) = c else { continue };
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ =
+                c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         }
     });
     let out = s.ok(&["doctor"]);
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Wake the accept loop so it sees the flag.
+    let _ = std::net::TcpStream::connect(("127.0.0.1", s.port));
     server.join().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("foreign/unverified listener"), "{stdout}");

@@ -1276,6 +1276,13 @@ pub fn run() -> Result<()> {
 mod tests {
     use super::*;
     use crate::discovery::types::{Catalog, Machine, PeerCatalog, PROTOCOL_VERSION};
+    /// A per-process counter for fixture directories: the clock (microseconds
+    /// on macOS) can give parallel tests the same name.
+    #[cfg(unix)]
+    fn unique() -> usize {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
     fn app(remote: bool) -> App {
         App {
             id: "app-stable-id".into(),
@@ -1424,18 +1431,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn worker_discovers_initially_refreshes_and_dispatches_real_cli_arguments() {
-        use std::{
-            fs,
-            os::unix::fs::PermissionsExt,
-            time::{SystemTime, UNIX_EPOCH},
-        };
+        use std::{fs, os::unix::fs::PermissionsExt};
         let directory = std::env::temp_dir().join(format!(
             "porch-tray-worker-{}-{}",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            unique()
         ));
         fs::create_dir(&directory).unwrap();
         let cli = directory.join("porch");
@@ -1554,18 +1554,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn proxy_switch_gets_fresh_state_before_it_settles() {
-        use std::{
-            fs,
-            os::unix::fs::PermissionsExt,
-            time::{SystemTime, UNIX_EPOCH},
-        };
+        use std::{fs, os::unix::fs::PermissionsExt};
         let directory = std::env::temp_dir().join(format!(
             "porch-tray-toggle-{}-{}",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            unique()
         ));
         fs::create_dir(&directory).unwrap();
         let cli = directory.join("porch");
@@ -1601,18 +1594,11 @@ mod tests {
     /// running proxy, and return the CLI calls and the settled update.
     #[cfg(unix)]
     fn rapid_flips(flips: usize) -> (String, Update) {
-        use std::{
-            fs,
-            os::unix::fs::PermissionsExt,
-            time::{SystemTime, UNIX_EPOCH},
-        };
+        use std::{fs, os::unix::fs::PermissionsExt};
         let directory = std::env::temp_dir().join(format!(
             "porch-tray-flips-{flips}-{}-{}",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            unique()
         ));
         fs::create_dir(&directory).unwrap();
         let cli = directory.join("porch");

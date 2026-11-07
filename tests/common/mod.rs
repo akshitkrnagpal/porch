@@ -44,29 +44,39 @@ pub fn free_port() -> u16 {
     // Start each process at a different slot so concurrent processes rarely
     // contend for the same lock files.
     let start = std::process::id() as usize % all.len();
-    let mut claimed = CLAIMS.lock().unwrap_or_else(|e| e.into_inner());
-    for port in all[start..].iter().chain(&all[..start]).copied() {
-        if claimed.iter().any(|(p, _)| *p == port) {
-            continue;
+    // Concurrent test processes can claim every slot. Their claims end when
+    // they exit, and TIME_WAIT on a slot's port expires within minutes, so
+    // wait for a slot rather than fail.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        let mut claimed = CLAIMS.lock().unwrap_or_else(|e| e.into_inner());
+        for port in all[start..].iter().chain(&all[..start]).copied() {
+            if claimed.iter().any(|(p, _)| *p == port) {
+                continue;
+            }
+            let Ok(claim) = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(claims.join(port.to_string()))
+            else {
+                continue;
+            };
+            if claim.try_lock_exclusive().is_err() {
+                continue;
+            }
+            if bindable(&[port]) {
+                claimed.push((port, claim));
+                return port;
+            }
         }
-        let Ok(claim) = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(claims.join(port.to_string()))
-        else {
-            continue;
-        };
-        if claim.try_lock_exclusive().is_err() {
-            continue;
-        }
-        if bindable(&[port]) {
-            claimed.push((port, claim));
-            return port;
-        }
+        drop(claimed);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "every test port slot stayed claimed by a test or busy (TIME_WAIT)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    drop(claimed);
-    panic!("every test port slot is claimed by a test or still busy (TIME_WAIT)")
 }
 
 /// Whether every one of `ports` can be bound on all IPv4 and IPv6 interfaces

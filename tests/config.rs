@@ -733,7 +733,7 @@ fn simultaneous_leaf_launches_keep_distinct_workspace_routes_and_ports() {
             &format!("apps/{app}/package.json"),
             json!({"name":app,"scripts":{"dev":"node server.cjs","wrong":"node missing.cjs"}}),
         );
-        fs::write(f.0.join(format!("apps/{app}/server.cjs")), r#"const fs=require('fs');require('http').createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT),'127.0.0.1',()=>fs.writeFileSync('ready.json',JSON.stringify({port:process.env.PORT,url:process.env.PORCH_URL||process.env.PORTLESS_URL})))"#).unwrap();
+        fs::write(f.0.join(format!("apps/{app}/server.cjs")), r#"const fs=require('fs');require('http').createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT),'127.0.0.1',()=>{fs.writeFileSync('ready.tmp',JSON.stringify({port:process.env.PORT,url:process.env.PORCH_URL||process.env.PORTLESS_URL}));fs.renameSync('ready.tmp','ready.json')})"#).unwrap();
         running.children.push(
             Command::new(env!("CARGO_BIN_EXE_porch"))
                 .current_dir(f.0.join(format!("apps/{app}")))

@@ -1381,8 +1381,12 @@ async fn evict_conflicts(names: &[String], settings: &ProxySettings, force: bool
                 signal_pid(owner.pid, 9);
             }
             // Kernel release of a forced child's listening sockets can follow its signal briefly.
+            // SIGKILL cannot be ignored, so wait for the group to be gone: on a
+            // loaded machine its exit can take well over a second, and reusing
+            // its fixed port before then fails. The bound only covers a process
+            // stuck in the kernel.
             if let Some(pid) = owner.child {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
                 while state::group_matches(pid, owner.child_started.as_deref())
                     && tokio::time::Instant::now() < deadline
                 {
