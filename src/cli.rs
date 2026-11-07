@@ -70,6 +70,9 @@ struct RunOptions {
     /// Framework whose port and host flags to add (detected automatically)
     #[arg(long)]
     framework: Option<String>,
+    /// Keep this app off paired machines, even when sharing is on
+    #[arg(long)]
+    private: bool,
 }
 #[derive(Parser, Debug)]
 struct App {
@@ -221,6 +224,9 @@ enum Commands {
         /// Only register under these domains
         #[arg(long, value_delimiter = ',')]
         tld: Vec<String>,
+        /// Keep this alias off paired machines, even when sharing is on
+        #[arg(long)]
+        private: bool,
     },
     /// Remove an alias
     #[command(alias = "rm")]
@@ -327,6 +333,7 @@ fn merge(mut a: RunOptions, b: RunOptions) -> RunOptions {
     a.ngrok |= b.ngrok;
     a.cloudflare |= b.cloudflare;
     a.lan |= b.lan;
+    a.private |= b.private;
     a
 }
 pub async fn run() -> Result<i32> {
@@ -353,6 +360,9 @@ pub async fn run() -> Result<i32> {
     }
     if let Some(ip) = &options.ip {
         std::env::set_var("PORCH_LAN_IP", ip)
+    }
+    if options.private {
+        std::env::set_var("PORCH_PRIVATE", "1")
     }
     for (key, on) in [
         ("TAILSCALE", options.tailscale),
@@ -443,7 +453,11 @@ pub async fn run() -> Result<i32> {
             remove,
             force,
             tld,
+            private,
         }) => {
+            if private {
+                std::env::set_var("PORCH_PRIVATE", "1")
+            }
             if let Some(n) = remove {
                 remove_alias(&n, &tld)?
             } else {
@@ -1342,6 +1356,7 @@ fn list(json: bool) -> Result<()> {
                 "pid": r.pid,
                 "urls": s.shares.get(&r.name),
                 "health": row.health.label(),
+                "private": s.private.contains(&r.name),
                 "stopped_seconds": row.stopped_for.map(|d| d.as_secs()),
             })
         })
@@ -1521,6 +1536,9 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
                 target: target.clone(),
                 pid: None,
             });
+            if enabled("PRIVATE") == Some(true) {
+                s.private.insert(n.clone());
+            }
         }
         Ok(())
     })?;
@@ -1822,6 +1840,9 @@ fn reserve(
             target: format!("http://127.0.0.1:{port}"),
             pid: Some(owner),
         });
+        if enabled("PRIVATE") == Some(true) {
+            s.private.insert(name.clone());
+        }
         s.owners.insert(name.clone(), identity);
         Ok(listener)
     })?;

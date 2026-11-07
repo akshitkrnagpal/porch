@@ -811,6 +811,7 @@ fn catalog(dir: &Path, machine: Machine, share: bool) -> Result<Catalog> {
     let apps = data
         .routes
         .iter()
+        .filter(|route| !data.private.contains(&route.name))
         .take(MAX_ROUTES)
         .map(|route| {
             let alive = state::route_alive(&data, route);
@@ -1319,11 +1320,11 @@ async fn request(
         return Ok(response(StatusCode::NOT_FOUND, "unknown app"));
     }
     let data: State = read(&context.dir.join("state.json"))?.unwrap_or_default();
-    let Some(route) = data
-        .routes
-        .iter()
-        .find(|r| route_id(&context.machine, &r.name) == app_id && state::route_alive(&data, r))
-    else {
+    let Some(route) = data.routes.iter().find(|r| {
+        route_id(&context.machine, &r.name) == app_id
+            && !data.private.contains(&r.name)
+            && state::route_alive(&data, r)
+    }) else {
         return Ok(response(
             StatusCode::NOT_FOUND,
             "app is no longer registered",

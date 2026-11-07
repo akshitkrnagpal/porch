@@ -100,6 +100,40 @@ fn catalog_keeps_identity_stable_and_reports_local_only_routes_without_leaking_t
     let _ = fs::remove_dir_all(dir);
 }
 #[test]
+fn private_routes_and_remote_targets_are_never_offered_to_peers() {
+    let dir = temp();
+    let m = machine(&dir).unwrap();
+    let route = |name: &str, target: &str| Route {
+        name: name.into(),
+        target: target.into(),
+        pid: None,
+    };
+    let data = State {
+        routes: vec![
+            route("web", "http://127.0.0.1:9000"),
+            route("secret", "http://127.0.0.1:9001"),
+            route("router", "http://192.168.1.1"),
+            route("metadata", "http://169.254.169.254"),
+        ],
+        private: ["secret".to_owned()].into_iter().collect(),
+        ..Default::default()
+    };
+    write(&dir, "state.json", &serde_json::to_vec(&data).unwrap()).unwrap();
+    let apps = catalog(&dir, m, true).unwrap().apps;
+    let names: Vec<_> = apps.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["web", "router", "metadata"]);
+    assert!(apps[0].remote_access);
+    for app in &apps[1..] {
+        assert!(!app.remote_access, "{}", app.name);
+        assert!(app
+            .unavailable_reason
+            .as_ref()
+            .unwrap()
+            .contains("on this machine"));
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+#[test]
 fn catalog_health_matches_porch_list() {
     let dir = temp();
     let m = machine(&dir).unwrap();

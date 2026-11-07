@@ -17,6 +17,9 @@ pub struct State {
     pub shares: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     pub compose_projects: BTreeMap<String, Vec<String>>,
+    /// Routes never offered to paired machines (`--private`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub private: std::collections::BTreeSet<String>,
     /// Unix seconds when a route's processes were first seen job-control stopped.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub stopped_since: BTreeMap<String, u64>,
@@ -319,6 +322,7 @@ pub fn remove_route(s: &mut State, name: &str) {
     s.owners.remove(name);
     s.shares.remove(name);
     s.stopped_since.remove(name);
+    s.private.remove(name);
     for names in s.compose_projects.values_mut() {
         names.retain(|n| n != name);
     }
