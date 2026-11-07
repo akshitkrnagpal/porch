@@ -296,6 +296,24 @@ fn config_in_dir(
             lock.lock_exclusive()?;
             let cert_path = dir.join("ca.pem");
             let key_path = dir.join("ca-key.pem");
+            // A name-constrained CA can't sign for domains added later. Retire
+            // it (kept beside, so `porch clean` can still find it) and make a
+            // new one for the current domains; trust is offered again.
+            if let Ok(existing) = fs::read_to_string(&cert_path) {
+                let uncovered = uncovered_tlds(&existing, settings);
+                if !uncovered.is_empty() {
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or_default();
+                    fs::rename(&cert_path, dir.join(format!("ca.pem.retired-{stamp}")))?;
+                    fs::rename(&key_path, dir.join(format!("ca-key.pem.retired-{stamp}")))?;
+                    eprintln!(
+                        "Porch made a new local CA, because the old one didn't cover {}. Browsers need it trusted once: run `porch trust` (no sudo).",
+                        uncovered.join(", ")
+                    );
+                }
+            }
             if !cert_path.exists() && !key_path.exists() {
                 let key = KeyPair::generate()?;
                 let params = ca_params(settings)?;
@@ -311,13 +329,6 @@ fn config_in_dir(
                 route_state: dir.join("state.json"),
             };
             resolver.issue("localhost").context("Invalid local CA")?;
-            let uncovered = uncovered_tlds(&resolver.ca_pem, settings);
-            if !uncovered.is_empty() {
-                bail!(
-                    "your local CA is limited to the domains it was created for, and doesn't cover {}. Run `porch clean` and start the proxy again to create a CA for the current domains, then `porch trust`",
-                    uncovered.join(", ")
-                );
-            }
             // There are no persisted leaf certificates: profile v2 takes effect on
             // every new handshake after restart. Preserve an existing root and key
             // byte-for-byte, since silently rotating them would invalidate trust.
@@ -473,7 +484,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(uncovered_tlds(&cert, &other), ["dev.example.com"]);
-        assert!(config_in_dir(&other, &path).is_err());
+        // A new domain gets a new CA that covers it; the old one is retired.
+        config_in_dir(&other, &path).unwrap();
+        let rotated = fs::read_to_string(path.join("ca.pem")).unwrap();
+        assert_ne!(rotated, cert);
+        assert!(uncovered_tlds(&rotated, &other).is_empty());
+        assert!(fs::read_dir(&path)
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().starts_with("ca.pem.retired-")));
+        // Back to the defaults for the legacy-profile checks below.
+        config_in_dir(&settings, &path).unwrap();
         // Install an old profile only in this temporary fixture; no system trust.
         let resolver = test_resolver();
         fs::write(path.join("ca.pem"), &resolver.ca_pem).unwrap();
