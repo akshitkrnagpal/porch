@@ -15,6 +15,7 @@ pub mod state;
 pub mod style;
 pub mod tls;
 pub mod update;
+pub mod upstream;
 #[cfg(windows)]
 pub mod win_net;
 

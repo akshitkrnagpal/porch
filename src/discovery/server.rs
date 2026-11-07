@@ -953,6 +953,9 @@ struct ContextState {
     /// `porch pair` can turn sharing on without restarting the agent.
     share_apps: bool,
     client: Upstream,
+    /// For `--upstream` aliases: verified, and `--insecure` (loopback only).
+    loopback: crate::upstream::LoopbackClient<Body>,
+    loopback_insecure: crate::upstream::LoopbackClient<Body>,
     tunnels: Arc<tokio::sync::Semaphore>,
     attempts: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
     /// In-progress code-pairing key exchanges, by random session ID.
@@ -1355,6 +1358,22 @@ async fn request(
             .map(|q| format!("?{q}"))
             .unwrap_or_default()
     );
+    // `--upstream` aliases: the same scheme, Host and certificate policy as
+    // the local proxy uses, still dialing only this computer.
+    let upstream_spec = data.upstreams.get(&route.name).cloned();
+    let uri = match &upstream_spec {
+        Some(up) => {
+            let pq = format!(
+                "{path}{}",
+                req.uri()
+                    .query()
+                    .map(|q| format!("?{q}"))
+                    .unwrap_or_default()
+            );
+            crate::upstream::request(up, target.port_or_known_default().unwrap_or(80), &pq).0
+        }
+        None => uri,
+    };
     let uri: hyper::Uri = uri.parse().context("invalid route URI")?;
     let websocket = req
         .headers()
@@ -1402,9 +1421,12 @@ async fn request(
     if let Some(v) = original_host {
         req.headers_mut().insert("x-forwarded-host", v);
     }
-    let host = route_url(&settings, &route.name);
-    let host = url::Url::parse(&host)?;
-    let host = &host[url::Position::BeforeHost..url::Position::AfterPort];
+    let public = route_url(&settings, &route.name);
+    let public = url::Url::parse(&public)?;
+    let host = match upstream_spec.as_ref().and_then(|u| u.authority.clone()) {
+        Some(authority) => authority,
+        None => public[url::Position::BeforeHost..url::Position::AfterPort].to_owned(),
+    };
     req.headers_mut().insert(header::HOST, host.parse()?);
     // The scheme the browser used on the paired machine, so apps build
     // correct redirects and secure cookies.
@@ -1431,16 +1453,23 @@ async fn request(
             .map_err(|e| -> BoxError { e })
             .boxed_unsync(),
     );
-    let mut upstream =
-        match tokio::time::timeout(Duration::from_secs(15), context.client.request(req)).await {
-            Ok(Ok(v)) => v,
-            _ => {
-                return Ok(response(
-                    StatusCode::BAD_GATEWAY,
-                    "registered app is unavailable",
-                ))
-            }
-        };
+    let mut upstream = match tokio::time::timeout(Duration::from_secs(15), async {
+        match &upstream_spec {
+            Some(up) if up.insecure => context.loopback_insecure.request(req).await,
+            Some(_) => context.loopback.request(req).await,
+            None => context.client.request(req).await,
+        }
+    })
+    .await
+    {
+        Ok(Ok(v)) => v,
+        _ => {
+            return Ok(response(
+                StatusCode::BAD_GATEWAY,
+                "registered app is unavailable",
+            ))
+        }
+    };
     if upstream.status() == StatusCode::SWITCHING_PROTOCOLS {
         if let Some(downstream) = downstream {
             let remote = hyper::upgrade::on(&mut upstream);
@@ -1457,10 +1486,43 @@ async fn request(
         }
     } else {
         strip(upstream.headers_mut());
+        // An `--upstream` backend's redirects to itself become redirects to
+        // the app's Porch URL, which the paired machine's relay maps onward.
+        if let Some(up) = &upstream_spec {
+            let public_origin = public.origin().ascii_serialization();
+            let rewritten = upstream
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|l| {
+                    crate::upstream::rewrite_location(
+                        l,
+                        &crate::upstream::origins(up),
+                        &public_origin,
+                    )
+                })
+                .and_then(|l| header::HeaderValue::from_str(&l).ok());
+            if let Some(v) = rewritten {
+                upstream.headers_mut().insert(header::LOCATION, v);
+            }
+        }
     }
     Ok(upstream.map(|body| body.map_err(|e| -> BoxError { Box::new(e) }).boxed_unsync()))
 }
 fn upstream(dir: &Path) -> Result<Upstream> {
+    let tls = tls_roots(dir)?;
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_connect_timeout(Some(Duration::from_secs(5)));
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http);
+    Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+/// TLS for reaching apps: the system roots plus Porch's own CA.
+fn tls_roots(dir: &Path) -> Result<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().certs {
         let _ = roots.add(cert);
@@ -1476,15 +1538,7 @@ fn upstream(dir: &Path) -> Result<Upstream> {
     .with_safe_default_protocol_versions()?
     .with_root_certificates(roots)
     .with_no_client_auth();
-    let mut http = HttpConnector::new();
-    http.enforce_http(false);
-    http.set_connect_timeout(Some(Duration::from_secs(5)));
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls)
-        .https_or_http()
-        .enable_http1()
-        .wrap_connector(http);
-    Ok(Client::builder(TokioExecutor::new()).build(connector))
+    Ok(tls)
 }
 struct Advertisement {
     daemon: mdns_sd::ServiceDaemon,
@@ -1549,6 +1603,8 @@ pub async fn serve() -> Result<()> {
         machine,
         share_apps: config.share_apps,
         client: upstream(&dir)?,
+        loopback: crate::upstream::client(tls_roots(&dir)?),
+        loopback_insecure: crate::upstream::client(crate::upstream::insecure_tls()?),
         tunnels: Arc::new(tokio::sync::Semaphore::new(64)),
         attempts: Arc::default(),
         sessions: Arc::default(),

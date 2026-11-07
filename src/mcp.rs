@@ -515,7 +515,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            6
+            7
         );
         let tools = s
             .handle(r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#)

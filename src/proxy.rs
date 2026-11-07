@@ -16,7 +16,7 @@ const MAX_CONNECTIONS: usize = 4096;
 /// Time a client gets to send a complete HTTP/1 request head.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 type Upstream = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
-type LoopbackUpstream = Client<hyper_rustls::HttpsConnector<HttpConnector<LoopbackResolver>>, Body>;
+type LoopbackUpstream = crate::upstream::LoopbackClient<Body>;
 #[derive(Clone)]
 struct ProxyContext {
     client: Upstream,
@@ -744,21 +744,7 @@ async fn forward(
     );
     // `--upstream`: same loopback port, but our own scheme and TLS name.
     let uri = match &upstream_spec {
-        Some(up) => {
-            let name = up
-                .authority
-                .as_deref()
-                .and_then(|a| a.parse::<hyper::http::uri::Authority>().ok())
-                .map(|a| a.host().to_owned())
-                .unwrap_or_else(|| "127.0.0.1".to_owned());
-            format!(
-                "{}://{}:{}{}",
-                if up.tls { "https" } else { "http" },
-                name,
-                target.port_u16().unwrap_or(80),
-                path
-            )
-        }
+        Some(up) => crate::upstream::request(up, target.port_u16().unwrap_or(80), path).0,
         None => uri,
     };
     let Ok(uri) = uri.parse::<hyper::Uri>() else {
@@ -933,23 +919,21 @@ async fn forward(
                 }
             } else {
                 strip(response.headers_mut());
-                if let Some(origin) = &remote_origin {
-                    let rewritten = response
-                        .headers()
-                        .get(header::LOCATION)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|l| {
-                            let rest = l
-                                .get(..origin.len())
-                                .filter(|p| p.eq_ignore_ascii_case(origin))
-                                .map(|_| &l[origin.len()..])?;
-                            (rest.is_empty() || rest.starts_with(['/', '?', '#']))
-                                .then(|| format!("{public_origin}{rest}"))
-                        })
-                        .and_then(|l| header::HeaderValue::from_str(&l).ok());
-                    if let Some(v) = rewritten {
-                        response.headers_mut().insert(header::LOCATION, v);
-                    }
+                // Redirects a backend sends to its own address stay on the
+                // Porch URL: remote aliases and `--upstream` authorities.
+                let origins: Vec<String> = match (&upstream_spec, &remote_origin) {
+                    (Some(up), _) => crate::upstream::origins(up),
+                    (None, Some(origin)) => vec![origin.clone()],
+                    (None, None) => vec![],
+                };
+                let rewritten = response
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|l| crate::upstream::rewrite_location(l, &origins, &public_origin))
+                    .and_then(|l| header::HeaderValue::from_str(&l).ok());
+                if let Some(v) = rewritten {
+                    response.headers_mut().insert(header::LOCATION, v);
                 }
             }
             let mut r = response.map(|b| b.boxed_unsync());
@@ -1140,26 +1124,8 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
         .enable_http2()
         .wrap_connector(http);
     let client = Client::builder(TokioExecutor::new()).build::<_, Body>(connector);
-    let loopback_client = |tls: rustls::ClientConfig| {
-        let mut http = HttpConnector::new_with_resolver(LoopbackResolver);
-        http.enforce_http(false);
-        http.set_connect_timeout(Some(Duration::from_secs(10)));
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls)
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(http);
-        Client::builder(TokioExecutor::new()).build::<_, Body>(connector)
-    };
-    let loopback = loopback_client(tls_config.clone());
-    let insecure_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .dangerous()
-    .with_custom_certificate_verifier(Arc::new(NoVerify))
-    .with_no_client_auth();
-    let loopback_insecure = loopback_client(insecure_config);
+    let loopback = crate::upstream::client(tls_config.clone());
+    let loopback_insecure = crate::upstream::client(crate::upstream::insecure_tls()?);
     let binds = if let Some(bind) = &settings.bind {
         vec![bind.clone()]
     } else if settings.lan
@@ -1230,6 +1196,32 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
         None => anyhow::bail!("proxy has no listeners"),
     };
     Ok(())
+}
+/// Did the upstream TLS handshake fail on the backend's certificate?
+fn certificate_error(e: &(dyn std::error::Error + 'static)) -> bool {
+    let is_cert = |tls: &rustls::Error| {
+        matches!(
+            tls,
+            rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented
+        )
+    };
+    let mut source = Some(e);
+    while let Some(err) = source {
+        if let Some(tls) = err.downcast_ref::<rustls::Error>() {
+            return is_cert(tls);
+        }
+        // hyper-rustls nests the rustls error inside io::Error wrappers,
+        // which don't expose it through source().
+        let mut io = err.downcast_ref::<std::io::Error>();
+        while let Some(inner) = io.and_then(|e| e.get_ref()) {
+            if let Some(tls) = inner.downcast_ref::<rustls::Error>() {
+                return is_cert(tls);
+            }
+            io = inner.downcast_ref::<std::io::Error>();
+        }
+        source = err.source();
+    }
+    false
 }
 #[cfg(test)]
 mod tests {
@@ -1317,101 +1309,4 @@ mod tests {
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
         assert_eq!(escape("<script>\"'&"), "&lt;script&gt;&quot;&#39;&amp;");
     }
-}
-
-/// Resolves every name to this computer's loopback addresses, so an
-/// `--upstream` alias can present a TLS server name while dialing locally.
-#[derive(Clone)]
-struct LoopbackResolver;
-impl tower_service::Service<hyper_util::client::legacy::connect::dns::Name> for LoopbackResolver {
-    type Response = std::vec::IntoIter<SocketAddr>;
-    type Error = std::io::Error;
-    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
-    fn poll_ready(
-        &mut self,
-        _: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-    fn call(&mut self, _: hyper_util::client::legacy::connect::dns::Name) -> Self::Future {
-        std::future::ready(Ok(vec![
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
-        ]
-        .into_iter()))
-    }
-}
-/// Accepts any backend certificate. Used only for aliases registered with an
-/// explicit `--insecure`, which always dial loopback.
-#[derive(Debug)]
-struct NoVerify;
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-/// Did the upstream TLS handshake fail on the backend's certificate?
-fn certificate_error(e: &(dyn std::error::Error + 'static)) -> bool {
-    let is_cert = |tls: &rustls::Error| {
-        matches!(
-            tls,
-            rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented
-        )
-    };
-    let mut source = Some(e);
-    while let Some(err) = source {
-        if let Some(tls) = err.downcast_ref::<rustls::Error>() {
-            return is_cert(tls);
-        }
-        // hyper-rustls nests the rustls error inside io::Error wrappers,
-        // which don't expose it through source().
-        let mut io = err.downcast_ref::<std::io::Error>();
-        while let Some(inner) = io.and_then(|e| e.get_ref()) {
-            if let Some(tls) = inner.downcast_ref::<rustls::Error>() {
-                return is_cert(tls);
-            }
-            io = inner.downcast_ref::<std::io::Error>();
-        }
-        source = err.source();
-    }
-    false
 }
