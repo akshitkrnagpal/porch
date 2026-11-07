@@ -259,7 +259,7 @@ enum Commands {
     },
     /// Run an MCP server over stdio so coding agents can find and manage your apps
     Mcp {
-        /// Tool profiles: core, proxy, diagnostics or all
+        /// Tool profiles: core, proxy, diagnostics, readonly or all
         #[arg(long, alias = "tools-profiles")]
         tools: Option<String>,
         /// Same as --tools

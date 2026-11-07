@@ -53,7 +53,7 @@ fn profiles(s: &str) -> Result<Vec<String>> {
             "full" => "all",
             p => p,
         };
-        if !["core", "all", "proxy", "diagnostics"].contains(&p) {
+        if !["core", "all", "proxy", "diagnostics", "readonly"].contains(&p) {
             bail!("Unknown tools profile: {p}");
         }
         if !out.iter().any(|x| x == p) {
@@ -72,6 +72,8 @@ fn enabled(p: &[String], n: &str) -> bool {
                 "core" => NAMES[..5].contains(&n),
                 "proxy" => NAMES[5..7].contains(&n),
                 "diagnostics" => NAMES[7..].contains(&n),
+                // Inspection only: nothing that changes routes, the proxy or processes.
+                "readonly" => ["list", "get", "tools_profiles", "doctor", "version"].contains(&n),
                 _ => false,
             }
     })
@@ -148,7 +150,7 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
     validate(n, a)?;
     if n == "tools_profiles" {
         return Ok(tool_result(
-            json!({"activeProfiles":p,"availableProfiles":["core","proxy","diagnostics","all"]}),
+            json!({"activeProfiles":p,"availableProfiles":["core","proxy","diagnostics","readonly","all"]}),
             false,
         ));
     }
@@ -379,6 +381,11 @@ mod tests {
         );
         assert!(profiles("bad").is_err());
         assert!(!enabled(&profiles("core").unwrap(), "proxy_start"));
+        let ro = profiles("readonly").unwrap();
+        for n in NAMES {
+            let read = definition(n)["annotations"]["readOnlyHint"] == true;
+            assert_eq!(enabled(&ro, n), read, "{n}");
+        }
     }
     #[test]
     fn arguments() {

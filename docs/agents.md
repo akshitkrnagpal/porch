@@ -109,30 +109,31 @@ Any client that launches stdio servers works. Use command `porch` and arguments 
 | --- | --- |
 | `core` (also `default`) | `list`, `get`, `alias_add`, `alias_remove`, `tools_profiles` |
 | `proxy` | `proxy_start`, `proxy_stop` |
-| `diagnostics` | `doctor`, `prune`, `version` |
+| `diagnostics` | `doctor`, `prune`, `version`, `doctor_fix` |
+| `readonly` | `list`, `get`, `tools_profiles`, `doctor`, `version`: nothing that changes routes, the proxy or processes |
 | `all` (also `full`) | Everything above |
 
 Example: `porch mcp --tools core,diagnostics`. Calling a tool outside the active profiles returns "Tool is disabled; restart porch mcp --tools all".
 
 ## Tools
 
-Except `tools_profiles`, every tool accepts `cwd` (directory to run in), `extraArgs` (extra CLI arguments, appended as is) and `timeoutMs` (default 120000). Each runs the matching `porch` command and returns its exit code, stdout and stderr; the call is marked as an error when the command fails.
+Except `tools_profiles`, every tool accepts `cwd` (directory to run in), `extraArgs` (extra CLI arguments) and `timeoutMs` (default 120000). Read-only tools accept only read-only `extraArgs` (`list`: `--all`, `--json`; `get`: `--no-worktree`; `doctor` and `version`: none), so an agent can't turn an inspection into a change. Each runs the matching `porch` command and returns its exit code, stdout and stderr; the call is marked as an error when the command fails.
 
 | Tool | Arguments | Runs | Notes |
 | --- | --- | --- | --- |
-| `list` | none | reads state directly | Returns `{"routes": [{name, url, target, pid, urls}]}` for live routes. Read-only |
-| `list` | `cwd` or `extraArgs` | `porch list --json` | Adds health and proxy settings. `extraArgs: ["--all"]` includes paired machines. Read-only |
+| `list` | none | `porch list --json` | Routes with name, URL, target, pid, health, `private` and sharing URLs, plus proxy settings. `extraArgs: ["--all"]` includes paired machines. Read-only |
 | `get` | `name` (required), `noWorktree` | `porch get NAME` | Pass `cwd` as the project directory so the worktree prefix matches. Read-only |
 | `alias_add` | `name`, `port` (required), `force`, `tld` | `porch alias NAME http://127.0.0.1:PORT` | Routes a name to a local port |
 | `alias_remove` | `name` (required), `tld` | `porch remove NAME` | Removes an alias; app routes aren't touched |
 | `tools_profiles` | none | — | Active and available profiles. Read-only |
 | `proxy_start` | `port`, `noTls`, `lan`, `tld`, `wildcard`, `unprivileged` | `porch proxy start` | `--foreground` is refused over MCP |
 | `proxy_stop` | `port` | `porch proxy stop` | Apps keep running |
-| `doctor` | none | `porch doctor` | Report only. `extraArgs: ["--fix"]` applies safe fixes; it never stops processes without `--yes` |
+| `doctor` | none | `porch doctor` | Report only; exits 1 when it finds a problem. Read-only |
+| `doctor_fix` | `yes` | `porch doctor --fix` | Applies safe fixes; stops stopped or orphaned launches only with `yes`. Destructive |
 | `prune` | `force` | `porch prune` | `force` also stops processes left behind |
 | `version` | none | `porch --version` | Read-only |
 
-Tools carry MCP annotations: `list`, `get`, `tools_profiles`, `doctor` and `version` are read-only; `alias_add`, `alias_remove`, `proxy_stop` and `prune` are marked destructive, so clients that ask before destructive calls will ask.
+Tools carry MCP annotations: `list`, `get`, `tools_profiles`, `doctor` and `version` are read-only; `alias_add`, `alias_remove`, `proxy_stop`, `prune` and `doctor_fix` are marked destructive, so clients that ask before destructive calls will ask.
 
 The server runs commands non-interactively (`CI=1`, no colour), so nothing prompts. Stdout carries only protocol messages.
 
