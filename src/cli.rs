@@ -1145,7 +1145,13 @@ pub(crate) async fn start_proxy(
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    eprintln!("Porch proxy ready on {}", s.url("app"));
+    eprintln!(
+        "{}",
+        crate::style::dim(
+            crate::style::Stream::Stderr,
+            &format!("Porch proxy ready on {}", s.url("app"))
+        )
+    );
     trust_if_needed(&s, skip_trust).await?;
     Ok(())
 }
@@ -1353,37 +1359,75 @@ fn list(json: bool) -> Result<()> {
     } else if routes.is_empty() {
         println!("No active routes")
     } else {
-        println!("{:<14} URL -> TARGET", "HEALTH");
+        use crate::style::{self, Stream::Stdout};
+        let width = routes
+            .iter()
+            .map(|r| r["url"].as_str().unwrap_or("").len())
+            .max()
+            .unwrap_or(0)
+            .max(3);
+        println!(
+            "{}",
+            style::dim(
+                Stdout,
+                &format!("  {:<14} {:<width$}  TARGET", "HEALTH", "URL")
+            )
+        );
         for (row, r) in rows.iter().zip(&routes) {
+            let label = format!("{:<14}", row.health.label());
+            let (dot, label) = match row.health {
+                crate::health::Health::Ok => {
+                    (style::green(Stdout, "●"), style::green(Stdout, &label))
+                }
+                crate::health::Health::NotListening | crate::health::Health::Stopped => {
+                    (style::yellow(Stdout, "●"), style::yellow(Stdout, &label))
+                }
+                crate::health::Health::Dead { .. } => {
+                    (style::red(Stdout, "●"), style::red(Stdout, &label))
+                }
+            };
+            let url = r["url"].as_str().unwrap_or("");
             println!(
-                "{:<14} {}  -> {}{}",
-                row.health.label(),
-                r["url"].as_str().unwrap_or(""),
-                r["target"].as_str().unwrap_or(""),
-                r["pid"]
-                    .as_u64()
-                    .map(|p| format!(" (pid {p})"))
-                    .unwrap_or_default()
+                "{dot} {label} {}{}  {}",
+                style::url(Stdout, url),
+                " ".repeat(width.saturating_sub(url.len())),
+                style::dim(
+                    Stdout,
+                    &format!(
+                        "{}{}",
+                        r["target"].as_str().unwrap_or(""),
+                        r["pid"]
+                            .as_u64()
+                            .map(|p| format!(" (pid {p})"))
+                            .unwrap_or_default()
+                    )
+                )
             );
             if let Some(urls) = r["urls"].as_object() {
                 for url in urls.values() {
-                    println!("  {}", url.as_str().unwrap_or(""));
+                    println!(
+                        "                   {}",
+                        style::url(Stdout, url.as_str().unwrap_or(""))
+                    );
                 }
             }
-            match row.health {
-                crate::health::Health::Ok => {}
-                crate::health::Health::NotListening => println!(
-                    "  nothing accepts connections on the target; make sure the app uses the PORT env var, then run `porch doctor`"
+            let hint = match row.health {
+                crate::health::Health::Ok => None,
+                crate::health::Health::NotListening => Some(
+                    "nothing accepts connections on the target; make sure the app uses the PORT env var, then run `porch doctor`".to_owned(),
                 ),
-                crate::health::Health::Stopped => println!(
-                    "  processes are stopped{} (frozen by job control); run `porch doctor --fix`",
+                crate::health::Health::Stopped => Some(format!(
+                    "processes are stopped{} (frozen by job control); run `porch doctor --fix`",
                     row.stopped_for
                         .map(|d| format!(" for {}s", d.as_secs()))
                         .unwrap_or_default()
+                )),
+                crate::health::Health::Dead { .. } => Some(
+                    "its launcher exited but app processes remain; run `porch prune --force`".to_owned(),
                 ),
-                crate::health::Health::Dead { .. } => println!(
-                    "  its launcher exited but app processes remain; run `porch prune --force`"
-                ),
+            };
+            if let Some(hint) = hint {
+                println!("  {}", style::dim(Stdout, &hint));
             }
         }
     }
@@ -1880,11 +1924,14 @@ async fn spawn_prepared(
                 i.child_started = state::identity(id).map(|p| p.started);
             }
         })?;
-        eprintln!(
-            "{} -> {}",
-            p.env.get("PORCH_URL").unwrap_or(&p.plan.name),
-            p.port.unwrap()
-        );
+        {
+            use crate::style::{self, Stream::Stderr};
+            eprintln!(
+                "{} {}",
+                style::url(Stderr, p.env.get("PORCH_URL").unwrap_or(&p.plan.name)),
+                style::dim(Stderr, &format!("-> {}", p.port.unwrap()))
+            );
+        }
     }
     let listen_check = p.port.filter(|_| p.lease.is_some()).map(|port| {
         tokio::spawn(crate::health::listen_check(

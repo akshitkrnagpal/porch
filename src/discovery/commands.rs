@@ -432,6 +432,16 @@ pub async fn peers(command: Peers) -> Result<()> {
     }
     Ok(())
 }
+fn health_label(h: &super::types::Health) -> String {
+    use super::types::Health;
+    use crate::style::{self, Stream::Stdout};
+    match h {
+        Health::Healthy => style::green(Stdout, "● ok"),
+        Health::Unreachable => style::yellow(Stdout, "● not listening"),
+        Health::Stopped => style::red(Stdout, "● stopped"),
+        Health::Unknown => style::dim(Stdout, "● unknown"),
+    }
+}
 pub fn print_snapshot(snapshot: Snapshot, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -450,7 +460,12 @@ pub fn print_snapshot(snapshot: Snapshot, json: bool) -> Result<()> {
         println!("  No local apps registered");
     }
     for app in &snapshot.local.apps {
-        println!("  {}  {:?}  {}", app.name, app.health, app.local_url);
+        println!(
+            "  {}  {}  {}",
+            app.name,
+            health_label(&app.health),
+            app.local_url
+        );
     }
     let settings = crate::state::proxy_settings().unwrap_or_default();
     for peer in &snapshot.peers {
@@ -464,9 +479,9 @@ pub fn print_snapshot(snapshot: Snapshot, json: bool) -> Result<()> {
             }
             for app in &catalog.apps {
                 println!(
-                    "  {}  {:?}  {}",
+                    "  {}  {}  {}",
                     app.name,
-                    app.health,
+                    health_label(&app.health),
                     if !app.remote_access {
                         app.unavailable_reason
                             .clone()

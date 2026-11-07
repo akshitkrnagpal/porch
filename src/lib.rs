@@ -11,6 +11,7 @@ pub mod setup;
 pub mod shutdown;
 pub mod sockets;
 pub mod state;
+pub mod style;
 pub mod tls;
 pub mod update;
 #[cfg(windows)]
