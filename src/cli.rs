@@ -125,6 +125,8 @@ enum Commands {
     /// Forget a paired machine on both sides.
     Unpair {
         machine: String,
+        #[arg(long)]
+        json: bool,
     },
     Peers(crate::discovery::commands::Peers),
     Discovery {
@@ -207,7 +209,12 @@ enum Commands {
     },
     /// Interactive first-run setup: port, HTTPS, start at login, sharing.
     Setup(crate::setup::SetupArgs),
-    Trust,
+    /// Trust Porch's local CA for your user (login keychain / NSS databases; no sudo).
+    Trust {
+        /// Trust it system-wide instead, so every tool on the machine accepts it (asks for sudo).
+        #[arg(long)]
+        system: bool,
+    },
     Workspace,
     /// Update porch to the latest release (or run `brew upgrade` for Homebrew installs).
     SelfUpdate(crate::update::SelfUpdateArgs),
@@ -327,7 +334,9 @@ pub async fn run() -> Result<i32> {
             }
         }
         Some(Commands::Pair(p)) => crate::discovery::commands::pair(p).await?,
-        Some(Commands::Unpair { machine }) => crate::discovery::commands::unpair(&machine).await?,
+        Some(Commands::Unpair { machine, json }) => {
+            crate::discovery::commands::unpair(&machine, json).await?
+        }
         Some(Commands::Peers(p)) => crate::discovery::commands::peers(p).await?,
         Some(Commands::Discovery { command }) => crate::discovery::commands::run(command).await?,
         Some(Commands::Open {
@@ -376,6 +385,8 @@ pub async fn run() -> Result<i32> {
             crate::integrations::prune_shares(force)?;
         }
         Some(Commands::Clean { force }) => {
+            // Per-user trust is removed as this user, before any elevation.
+            crate::integrations::untrust_user_scope()?;
             if clean_needs_elevation() {
                 return elevate(&raw).await;
             }
@@ -439,7 +450,15 @@ pub async fn run() -> Result<i32> {
             crate::doctor::run(fix, yes).await?;
         }
         Some(Commands::Setup(args)) => crate::setup::run(args).await?,
-        Some(Commands::Trust) => integration("trust", vec![]).await?,
+        Some(Commands::Trust { system }) => {
+            if system {
+                // Per-user trust lives in this user's stores: remove it before elevating.
+                crate::integrations::untrust_user_scope()?;
+                integration("trust", vec!["--system".into()]).await?
+            } else {
+                integration("trust", vec![]).await?
+            }
+        }
         Some(Commands::Workspace) => {
             let cwd = std::env::current_dir()?;
             let root = crate::config::find_workspace_root(&cwd).unwrap_or(cwd);
@@ -573,10 +592,9 @@ pub(crate) fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
             bail!("proxy port must be 1-65535; run `porch proxy start --port {DEFAULT_PROXY_PORT}`")
         }
         s.port = p
-    } else if s.tls && (s.port == 80 || s.port == DEFAULT_PROXY_PORT) {
-        // HTTPS opt-in uses the standard port.
-        s.port = 443
-    } else if !s.tls && s.port == 443 {
+    } else if (s.tls && s.port == 80) || (!s.tls && s.port == 443) {
+        // Switching protocol leaves the other protocol's standard port. HTTPS
+        // keeps the no-sudo high port; 443 takes an explicit `--port 443`.
         s.port = DEFAULT_PROXY_PORT
     }
     // Port and privilege mode are one choice: high ports never need sudo or
@@ -715,6 +733,9 @@ pub(crate) fn move_off_busy_port(mut s: ProxySettings, explicit: bool) -> Result
         } else {
             next
         };
+        if s.tls {
+            bail!("proxy port {port} unavailable: it is used by {who}. Use HTTPS on a port that needs no sudo instead: `porch proxy start --https --port {fallback}`")
+        }
         bail!("proxy port {port} unavailable: it is used by {who}. Use plain HTTP without sudo instead: `porch proxy start --no-tls --port {fallback}`")
     }
     s.port = next;
@@ -953,15 +974,20 @@ pub(crate) async fn start_proxy(
     Ok(())
 }
 async fn trust_if_needed(s: &ProxySettings, skip: bool) -> Result<()> {
+    // Per-user trust needs no sudo, so high-port (unprivileged) HTTPS is trusted too.
     if s.tls
         && s.cert.is_none()
-        && !s.unprivileged
         && !skip
         && enabled("SKIP_TRUST") != Some(true)
         && !state::dir().join("trust.json").exists()
     {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() || std::env::var_os("CI").is_some() {
+            if s.unprivileged {
+                // Unattended no-sudo starts (menu bar, scripts) keep working; browsers warn until trusted.
+                eprintln!("Browsers will warn about {} until you run `porch trust` once in a terminal (no sudo).", s.url("<app>"));
+                return Ok(());
+            }
             bail!("local CA is not trusted; run `porch trust` interactively once, or use --skip-trust / PORCH_SKIP_TRUST=1 with a client that loads the generated CA")
         }
         integration("trust", vec![]).await?;
@@ -2031,7 +2057,7 @@ fn requires_elevation(name: &str, args: &[String]) -> bool {
         {
             return false;
         }
-        name == "trust"
+        (name == "trust" && args.iter().any(|a| a == "--system"))
             || (name == "service"
                 && args
                     .first()
@@ -2083,7 +2109,7 @@ fn clean_needs_elevation() -> bool {
             && std::env::var_os("PORCH_HOSTS_FILE").is_none()
             && std::env::var_os("PORCH_SERVICE_FILE").is_none()
             && std::env::var_os("PORCH_TRUST_DIR").is_none()
-            && (state::dir().join("trust.json").exists()
+            && (crate::integrations::trust_scope().as_deref() == Some("system")
                 || state::dir().join("service.json").exists()
                 || crate::integrations::has_managed_hosts())
     }

@@ -601,11 +601,8 @@ fn service_settings(args: &[String]) -> Result<crate::state::ProxySettings> {
         s.tls = false;
     }
     if !explicit_port {
-        s.port = if s.tls {
-            443
-        } else {
-            crate::ports::DEFAULT_PROXY_PORT
-        };
+        // HTTPS and HTTP share the no-sudo default port; 443 takes an explicit `--port 443`.
+        s.port = crate::ports::DEFAULT_PROXY_PORT;
     }
     // High ports never need hosts-file edits or elevation.
     if !explicit_unprivileged && s.port >= crate::ports::FIRST_UNPRIVILEGED_PORT {
@@ -737,6 +734,68 @@ struct TrustRecord {
     installed: Option<PathBuf>,
     update: Option<String>,
     windows: bool,
+    /// `user` (no sudo: login keychain or NSS databases) or `system`. Records
+    /// written before per-user trust existed are system-wide.
+    #[serde(default = "system_scope")]
+    scope: String,
+    /// macOS login keychain holding a per-user CA.
+    #[serde(default)]
+    keychain: Option<PathBuf>,
+    /// Linux NSS databases (Chrome/Chromium, Firefox profiles) holding a per-user CA.
+    #[serde(default)]
+    nss_dbs: Vec<PathBuf>,
+}
+fn system_scope() -> String {
+    "system".into()
+}
+fn trust_record() -> Result<Option<TrustRecord>> {
+    match fs::read(crate::state::dir().join("trust.json")) {
+        Ok(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+/// Scope of the recorded CA trust (`user` or `system`), if any.
+pub fn trust_scope() -> Option<String> {
+    trust_record().ok().flatten().map(|r| r.scope)
+}
+fn user_home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .context("HOME is not set; cannot locate per-user trust stores")
+}
+fn nss_name(fingerprint: &str) -> String {
+    format!("Porch Local CA {}", &fingerprint[..12])
+}
+/// Per-user NSS databases: Chrome/Chromium's shared one plus every Firefox profile.
+fn nss_databases(home: &Path) -> Vec<PathBuf> {
+    let mut dbs = vec![home.join(".pki/nssdb")];
+    for base in [
+        ".mozilla/firefox",
+        "snap/firefox/common/.mozilla/firefox",
+        ".var/app/org.mozilla.firefox/.mozilla/firefox",
+    ] {
+        let Ok(entries) = fs::read_dir(home.join(base)) else {
+            continue;
+        };
+        let mut profiles: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.join("cert9.db").is_file())
+            .collect();
+        profiles.sort();
+        dbs.extend(profiles);
+    }
+    dbs
+}
+fn macos_login_keychain(home: &Path) -> PathBuf {
+    let dir = home.join("Library/Keychains");
+    let legacy = dir.join("login.keychain");
+    if !dir.join("login.keychain-db").exists() && legacy.exists() {
+        legacy
+    } else {
+        dir.join("login.keychain-db")
+    }
 }
 fn find_program(name: &str) -> bool {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
@@ -814,13 +873,22 @@ fn linux_ca_layout(os_release: &str) -> (&'static str, &'static str) {
         ("/etc/pki/ca-trust/source/anchors", "update-ca-trust")
     }
 }
-fn trust() -> Result<()> {
+fn trust(system: bool) -> Result<()> {
     let ca = crate::state::dir().join("ca.pem");
     if !ca.is_file() {
         bail!("local CA missing; start the HTTPS proxy first");
     }
     verify_porch_ca(&ca)?;
     let fingerprint = ca_fingerprint(&ca)?;
+    if let Some(existing) = trust_record()? {
+        if existing.scope == "system" && !system && existing.fingerprint == fingerprint {
+            println!("Porch local CA is already trusted system-wide");
+            return Ok(());
+        }
+        if existing.scope == "user" && system {
+            bail!("the Porch CA is trusted for this user; its per-user trust must be removed first, so run `porch trust --system` from a normal (non-root) shell");
+        }
+    }
     let platform = trust_platform();
     let mut record = TrustRecord {
         platform: platform.clone(),
@@ -828,9 +896,60 @@ fn trust() -> Result<()> {
         installed: None,
         update: None,
         windows: false,
+        // Windows trust always goes to the current user's Root store.
+        scope: if system && platform != "windows" {
+            "system"
+        } else {
+            "user"
+        }
+        .into(),
+        keychain: None,
+        nss_dbs: Vec::new(),
     };
     let ca_arg = ca.to_string_lossy();
     match platform.as_str() {
+        "macos" if !system => {
+            // The login keychain needs no sudo; macOS confirms with a password or Touch ID dialog.
+            let keychain = macos_login_keychain(&user_home()?);
+            exec(
+                "security",
+                &[
+                    "add-trusted-cert",
+                    "-r",
+                    "trustRoot",
+                    "-k",
+                    &keychain.to_string_lossy(),
+                    &ca_arg,
+                ],
+            )?;
+            record.keychain = Some(keychain);
+        }
+        "linux" if !system => {
+            if !find_program("certutil") {
+                bail!("per-user trust needs NSS certutil: install libnss3-tools (Debian/Ubuntu) or nss-tools (Fedora/Arch), or trust system-wide with `porch trust --system` (asks for sudo)");
+            }
+            let name = nss_name(&record.fingerprint);
+            for db in nss_databases(&user_home()?) {
+                if !db.exists() {
+                    fs::create_dir_all(&db)?;
+                }
+                let sql = format!("sql:{}", db.display());
+                if !db.join("cert9.db").exists() {
+                    exec("certutil", &["-N", "-d", &sql, "--empty-password"])?;
+                }
+                exec(
+                    "certutil",
+                    &["-A", "-d", &sql, "-t", "C,,", "-n", &name, "-i", &ca_arg],
+                )?;
+                record.nss_dbs.push(db);
+                // Record as we go so a partial failure can still be cleaned up.
+                write_state(
+                    &crate::state::dir().join("trust.json"),
+                    serde_json::to_vec_pretty(&record)?,
+                )?;
+            }
+            trust_wsl_windows(&ca_arg, &mut record)?;
+        }
         "macos" => {
             exec(
                 "security",
@@ -872,17 +991,7 @@ fn trust() -> Result<()> {
                 serde_json::to_vec_pretty(&record)?,
             )?;
             exec(update, &[])?;
-            let wsl = std::env::var_os("WSL_DISTRO_NAME").is_some()
-                || fs::read_to_string("/proc/version")
-                    .is_ok_and(|s| s.to_lowercase().contains("microsoft"));
-            if wsl && find_program("certutil.exe") {
-                let windows_path = exec("wslpath", &["-w", &ca_arg])?;
-                exec(
-                    "certutil.exe",
-                    &["-user", "-addstore", "Root", windows_path.trim()],
-                )?;
-                record.windows = true;
-            }
+            trust_wsl_windows(&ca_arg, &mut record)?;
         }
         _ => bail!("unsupported trust store platform"),
     }
@@ -890,17 +999,44 @@ fn trust() -> Result<()> {
         &crate::state::dir().join("trust.json"),
         serde_json::to_vec_pretty(&record)?,
     )?;
-    println!("Porch local CA trusted");
+    println!(
+        "Porch local CA trusted {}",
+        if record.scope == "system" {
+            "system-wide"
+        } else {
+            "for this user"
+        }
+    );
+    Ok(())
+}
+/// WSL: browsers run on Windows, so also trust the CA in the Windows user store.
+fn trust_wsl_windows(ca_arg: &str, record: &mut TrustRecord) -> Result<()> {
+    let wsl = std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || fs::read_to_string("/proc/version")
+            .is_ok_and(|s| s.to_lowercase().contains("microsoft"));
+    if wsl && find_program("certutil.exe") {
+        let windows_path = exec("wslpath", &["-w", ca_arg])?;
+        exec(
+            "certutil.exe",
+            &["-user", "-addstore", "Root", windows_path.trim()],
+        )?;
+        record.windows = true;
+    }
+    Ok(())
+}
+/// Remove per-user trust; a system-wide record is left for the elevated `clean`.
+/// Runs as the invoking user so per-user stores keep their ownership.
+pub fn untrust_user_scope() -> Result<()> {
+    if trust_record()?.is_some_and(|r| r.scope == "user") {
+        untrust()?;
+    }
     Ok(())
 }
 fn untrust() -> Result<()> {
     let path = crate::state::dir().join("trust.json");
-    let raw = match fs::read(&path) {
-        Ok(v) => v,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
+    let Some(r) = trust_record()? else {
+        return Ok(());
     };
-    let r: TrustRecord = serde_json::from_slice(&raw)?;
     let ca = crate::state::dir().join("ca.pem");
     verify_porch_ca(&ca)?;
     if r.fingerprint.len() != 40
@@ -937,6 +1073,44 @@ fn untrust() -> Result<()> {
         }
     }
     match r.platform.as_str() {
+        "macos" if r.scope == "user" => {
+            let home = user_home()?;
+            let keychain = r
+                .keychain
+                .clone()
+                .unwrap_or_else(|| macos_login_keychain(&home));
+            if keychain.parent() != Some(home.join("Library/Keychains").as_path()) {
+                bail!("invalid recorded keychain path; refusing removal");
+            }
+            // Drop the user trust setting first; a missing setting is not an error.
+            let _ = exec("security", &["remove-trusted-cert", &ca.to_string_lossy()]);
+            exec(
+                "security",
+                &[
+                    "delete-certificate",
+                    "-Z",
+                    &r.fingerprint,
+                    &keychain.to_string_lossy(),
+                ],
+            )?;
+        }
+        "linux" if r.scope == "user" => {
+            let home = user_home()?;
+            let name = nss_name(&r.fingerprint);
+            for db in &r.nss_dbs {
+                if !db.is_absolute() || !db.starts_with(&home) {
+                    bail!("invalid recorded NSS database path; refusing removal");
+                }
+                if !db.is_dir() {
+                    continue;
+                }
+                let sql = format!("sql:{}", db.display());
+                // Only delete the nickname this fingerprint installed, and only where present.
+                if exec("certutil", &["-L", "-d", &sql, "-n", &name]).is_ok() {
+                    exec("certutil", &["-D", "-d", &sql, "-n", &name])?;
+                }
+            }
+        }
         "macos" => {
             exec(
                 "security",
@@ -2174,7 +2348,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
             rest.first().map(String::as_str).unwrap_or("status"),
             &rest[rest.len().min(1)..],
         ),
-        "trust" => trust(),
+        "trust" => trust(rest.iter().any(|a| a == "--system")),
         "compose" => compose(rest).await,
         "share" => {
             let provider = rest
@@ -2304,10 +2478,10 @@ async fn doctor() -> Result<()> {
     );
     println!(
         "CA trust: {}",
-        if crate::state::dir().join("trust.json").is_file() {
-            "installed by Porch (recorded)"
-        } else {
-            "not recorded; run porch trust"
+        match trust_scope().as_deref() {
+            Some("user") => "installed for this user by Porch (recorded)",
+            Some(_) => "installed system-wide by Porch (recorded)",
+            None => "not recorded; run porch trust",
         }
     );
     for (tool, flag) in [

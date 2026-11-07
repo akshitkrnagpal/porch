@@ -199,6 +199,14 @@ async fn stop_identity(identity: &crate::state::ProcessIdentity) -> Result<()> {
     }
     Ok(())
 }
+/// Stop the running agent, leaving its configuration and login startup alone.
+pub(super) async fn stop_agent() -> Result<()> {
+    let _lock = lock("discovery.start.lock")?;
+    if let Some(i) = process_identity("discovery") {
+        stop_identity(&i).await?;
+    }
+    Ok(())
+}
 pub async fn disable() -> Result<()> {
     let _lock = lock("discovery.start.lock")?;
     // Sharing off also means not starting it again at the next login.

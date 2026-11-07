@@ -132,11 +132,69 @@ struct PairingWindow {
     expires: u64,
     failures: u32,
 }
-#[derive(Clone, Serialize, Deserialize)]
+/// How the last pairing window ended. `paired`/`error` are what agents before
+/// 0.4 wrote and read; `state` and the rest are absent in their records.
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct PairingResult {
     id: String,
+    /// Peer name once the code was accepted.
     paired: Option<String>,
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<PairState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    peer_id: Option<String>,
+    /// Digest of the bearer issued on acceptance. Its first authenticated
+    /// request moves the result from accepted to paired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bearer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires: Option<u64>,
+}
+impl PairingResult {
+    fn closed(id: String, expires: u64, state: PairState, reason: Option<&str>) -> Self {
+        Self {
+            id,
+            error: Some(closed_message(state, reason)),
+            state: Some(state),
+            reason: reason.map(str::to_owned),
+            expires: Some(expires),
+            ..Self::default()
+        }
+    }
+    /// The state, deriving it for records written by older agents.
+    fn state(&self) -> PairState {
+        match (self.state, &self.paired, &self.error) {
+            (Some(state), _, _) => state,
+            (None, Some(_), _) => PairState::Paired,
+            (None, None, Some(e)) if e.contains("too many") => PairState::Cancelled,
+            (None, None, _) => PairState::Expired,
+        }
+    }
+    fn reason(&self) -> Option<String> {
+        match (&self.reason, self.state, &self.error) {
+            (Some(r), _, _) => Some(r.clone()),
+            (None, None, Some(e)) if e.contains("too many") => Some("too_many_failures".into()),
+            _ => None,
+        }
+    }
+}
+/// Terminal-friendly explanation of a closed pairing code.
+pub fn closed_message(state: PairState, reason: Option<&str>) -> String {
+    match (state, reason) {
+        (PairState::Expired, _) => "pairing code expired; run porch pair again".into(),
+        (PairState::Cancelled, Some("too_many_failures")) => {
+            "too many wrong pairing codes; the code was cancelled. Run porch pair again".into()
+        }
+        (PairState::Cancelled, Some("host_full")) => "this machine cannot store another paired machine; remove an unused one with porch unpair, then run porch pair again".into(),
+        (PairState::Cancelled, _) => "pairing cancelled; the code no longer works".into(),
+        (PairState::Replaced, _) => {
+            "another pairing code was started; this one no longer works".into()
+        }
+        _ => "pairing window closed".into(),
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct Invitation {
@@ -375,6 +433,15 @@ fn open_pairing_in(dir: &Path, lifetime: u64) -> Result<PairingCode> {
     let id = random()?;
     let code = six_digits()?;
     let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    if let Some(old) = auth.pairing.take() {
+        // Whoever was showing the old code learns why it stopped working.
+        let state = if old.expires > now() {
+            PairState::Replaced
+        } else {
+            PairState::Expired
+        };
+        auth.pairing_result = Some(PairingResult::closed(old.id, old.expires, state, None));
+    }
     let expires = now() + lifetime;
     auth.pairing = Some(PairingWindow {
         hash: digest(&format!("{id}\0{code}")),
@@ -385,45 +452,78 @@ fn open_pairing_in(dir: &Path, lifetime: u64) -> Result<PairingCode> {
     write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
     Ok(PairingCode { id, code, expires })
 }
-pub enum PairingProgress {
-    Waiting,
-    Paired(String),
-    Closed(String),
+/// Where one pairing code stands, as `porch pair status` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairingProgress {
+    pub state: PairState,
+    pub reason: Option<String>,
+    pub expires: Option<u64>,
+    pub peer: Option<Machine>,
 }
-/// What happened to a pairing window opened by this process.
+impl PairingProgress {
+    pub fn message(&self) -> String {
+        closed_message(self.state, self.reason.as_deref())
+    }
+}
 pub fn pairing_progress(id: &str) -> Result<PairingProgress> {
     pairing_progress_in(&state::dir(), id)
 }
 fn pairing_progress_in(dir: &Path, id: &str) -> Result<PairingProgress> {
     let auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
-    if let Some(result) = auth.pairing_result.filter(|r| r.id == id) {
-        return Ok(match (result.paired, result.error) {
-            (Some(name), _) => PairingProgress::Paired(name),
-            (None, error) => {
-                PairingProgress::Closed(error.unwrap_or_else(|| "pairing window closed".into()))
-            }
-        });
+    Ok(progress_of(&auth, id))
+}
+fn progress_of(auth: &Auth, id: &str) -> PairingProgress {
+    if let Some(result) = auth.pairing_result.as_ref().filter(|r| r.id == id) {
+        return PairingProgress {
+            state: result.state(),
+            reason: result.reason(),
+            expires: result.expires,
+            peer: result.paired.as_ref().map(|name| Machine {
+                id: result.peer_id.clone().unwrap_or_default(),
+                name: name.clone(),
+            }),
+        };
     }
-    match auth.pairing {
-        Some(w) if w.id == id && w.expires > now() => Ok(PairingProgress::Waiting),
-        Some(w) if w.id == id => Ok(PairingProgress::Closed(
-            "pairing code expired; run porch pair again".into(),
-        )),
-        _ => Ok(PairingProgress::Closed(
-            "pairing window was replaced or revoked".into(),
-        )),
+    let progress = |state, reason: Option<&str>, expires| PairingProgress {
+        state,
+        reason: reason.map(str::to_owned),
+        expires,
+        peer: None,
+    };
+    match &auth.pairing {
+        Some(w) if w.id == id && w.failures >= PAIR_CODE_MAX_FAILURES => progress(
+            PairState::Cancelled,
+            Some("too_many_failures"),
+            Some(w.expires),
+        ),
+        Some(w) if w.id == id && w.expires > now() => {
+            progress(PairState::Waiting, None, Some(w.expires))
+        }
+        Some(w) if w.id == id => progress(PairState::Expired, None, Some(w.expires)),
+        // Replaced, revoked, or an ID this machine never issued.
+        _ => progress(PairState::Replaced, None, None),
     }
 }
-/// Close the window (Ctrl-C). Harmless if it already closed.
-pub fn close_pairing(id: &str) -> Result<()> {
-    let dir = state::dir();
-    let _lock = lock(&dir)?;
+/// Cancel a code (Ctrl-C, `porch pair cancel`). Idempotent: a code that already
+/// closed or paired keeps its outcome, which is returned.
+pub fn close_pairing(id: &str) -> Result<PairingProgress> {
+    close_pairing_in(&state::dir(), id)
+}
+fn close_pairing_in(dir: &Path, id: &str) -> Result<PairingProgress> {
+    let _lock = lock(dir)?;
     let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
-    if auth.pairing.as_ref().is_some_and(|w| w.id == id) {
+    if let Some(w) = auth.pairing.as_ref().filter(|w| w.id == id) {
+        let state = if w.expires > now() {
+            PairState::Cancelled
+        } else {
+            PairState::Expired
+        };
+        let reason = (state == PairState::Cancelled).then_some("user");
+        auth.pairing_result = Some(PairingResult::closed(id.into(), w.expires, state, reason));
         auth.pairing = None;
-        write(&dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
+        write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
     }
-    Ok(())
+    Ok(progress_of(&auth, id))
 }
 fn pairing_open(dir: &Path) -> bool {
     read::<Auth>(&dir.join("discovery-auth.json"))
@@ -436,6 +536,8 @@ enum CodeOutcome {
     Accepted(String),
     Wrong,
     Closed,
+    /// The code was right but this machine has no room for another client.
+    Full,
 }
 /// Check a code in constant time. Five wrong guesses or expiry close the window;
 /// success consumes it and enrolls a new bearer labelled with the peer's machine ID.
@@ -445,36 +547,34 @@ fn try_code(dir: &Path, code: &str, peer: &Machine) -> Result<CodeOutcome> {
     let Some(window) = auth.pairing.as_mut() else {
         return Ok(CodeOutcome::Closed);
     };
+    let (id, expires) = (window.id.clone(), window.expires);
     if window.expires <= now() || window.failures >= PAIR_CODE_MAX_FAILURES {
-        let id = window.id.clone();
+        let (state, reason) = if window.failures >= PAIR_CODE_MAX_FAILURES {
+            (PairState::Cancelled, Some("too_many_failures"))
+        } else {
+            (PairState::Expired, None)
+        };
         auth.pairing = None;
-        auth.pairing_result = Some(PairingResult {
-            id,
-            paired: None,
-            error: Some("pairing code expired; run porch pair again".into()),
-        });
+        auth.pairing_result = Some(PairingResult::closed(id, expires, state, reason));
         write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
         return Ok(CodeOutcome::Closed);
     }
-    let candidate = digest(&format!("{}\0{code}", window.id));
+    let candidate = digest(&format!("{id}\0{code}"));
     if !equal(&candidate, &window.hash) {
         window.failures += 1;
         if window.failures >= PAIR_CODE_MAX_FAILURES {
-            let id = window.id.clone();
             auth.pairing = None;
-            auth.pairing_result = Some(PairingResult {
+            auth.pairing_result = Some(PairingResult::closed(
                 id,
-                paired: None,
-                error: Some(
-                    "too many wrong pairing codes; the code was cancelled. Run porch pair again"
-                        .into(),
-                ),
-            });
+                expires,
+                PairState::Cancelled,
+                Some("too_many_failures"),
+            ));
         }
         write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
         return Ok(CodeOutcome::Wrong);
     }
-    let id = window.id.clone();
+    auth.pairing = None;
     // Re-pairing replaces this machine's previous credential.
     let stale: Vec<String> = auth
         .labels
@@ -482,22 +582,56 @@ fn try_code(dir: &Path, code: &str, peer: &Machine) -> Result<CodeOutcome> {
         .filter(|(_, m)| **m == peer.id)
         .map(|(d, _)| d.clone())
         .collect();
-    auth.clients.retain(|c| !stale.contains(c));
-    auth.labels.retain(|d, _| !stale.contains(d));
-    if auth.clients.len() >= MAX_CLIENTS {
-        bail!("client enrollment limit reached; revoke old clients locally")
+    let mut clients = auth.clients.clone();
+    clients.retain(|c| !stale.contains(c));
+    if clients.len() >= MAX_CLIENTS {
+        auth.pairing_result = Some(PairingResult::closed(
+            id,
+            expires,
+            PairState::Cancelled,
+            Some("host_full"),
+        ));
+        write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
+        return Ok(CodeOutcome::Full);
     }
+    auth.clients = clients;
+    auth.labels.retain(|d, _| !stale.contains(d));
     let bearer = random()?;
     auth.clients.push(digest(&bearer));
     auth.labels.insert(digest(&bearer), peer.id.clone());
-    auth.pairing = None;
     auth.pairing_result = Some(PairingResult {
         id,
         paired: Some(peer.name.clone()),
-        error: None,
+        state: Some(PairState::Accepted),
+        peer_id: Some(peer.id.clone()),
+        bearer: Some(digest(&bearer)),
+        expires: Some(expires),
+        ..PairingResult::default()
     });
     write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
     Ok(CodeOutcome::Accepted(bearer))
+}
+/// The host could not store the joiner after accepting its code: take back the
+/// credential and report the code as cancelled for lack of room.
+fn reject_accepted(dir: &Path, bearer: &str) -> Result<()> {
+    let _lock = lock(dir)?;
+    let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    let hash = digest(bearer);
+    auth.clients.retain(|c| *c != hash);
+    auth.labels.remove(&hash);
+    if let Some(r) = auth
+        .pairing_result
+        .as_mut()
+        .filter(|r| r.bearer.as_deref() == Some(hash.as_str()))
+    {
+        *r = PairingResult::closed(
+            r.id.clone(),
+            r.expires.unwrap_or_default(),
+            PairState::Cancelled,
+            Some("host_full"),
+        );
+    }
+    write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)
 }
 /// Joining side: issue a credential the host will use to reach this machine.
 pub fn mint_client(label: &str) -> Result<String> {
@@ -568,6 +702,7 @@ pub fn revoke_clients() -> Result<()> {
         &serde_json::to_vec(&Auth::default())?,
     )
 }
+#[cfg(test)]
 fn paired(dir: &Path, token: &str) -> Result<bool> {
     if token.len() != 64 {
         return Ok(false);
@@ -575,6 +710,35 @@ fn paired(dir: &Path, token: &str) -> Result<bool> {
     let hash = digest(token);
     let auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
     Ok(auth.clients.iter().any(|v| equal(v, &hash)))
+}
+/// Authenticate a bearer. The first request made with the credential a pairing
+/// code just issued proves the joiner stored it, which completes that pairing.
+fn authorize(dir: &Path, token: &str) -> Result<bool> {
+    if token.len() != 64 {
+        return Ok(false);
+    }
+    let hash = digest(token);
+    let auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    if !auth.clients.iter().any(|v| equal(v, &hash)) {
+        return Ok(false);
+    }
+    let confirms = |auth: &Auth| {
+        auth.pairing_result.as_ref().is_some_and(|r| {
+            r.state == Some(PairState::Accepted) && r.bearer.as_deref() == Some(hash.as_str())
+        })
+    };
+    if confirms(&auth) {
+        let _lock = lock(dir)?;
+        let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+        if confirms(&auth) {
+            if let Some(r) = auth.pairing_result.as_mut() {
+                r.state = Some(PairState::Paired);
+                r.bearer = None;
+            }
+            write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
+        }
+    }
+    Ok(true)
 }
 fn enroll(dir: &Path, token: &str) -> Result<Option<String>> {
     if token.len() != 64 {
@@ -801,9 +965,37 @@ fn valid_secret(token: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
 }
+/// `/v1/pair-code` errors: JSON with a stable code. Status codes match the
+/// plain-text bodies of older agents.
+fn pair_error(status: StatusCode, code: &str, message: &str) -> Response<Body> {
+    let body = serde_json::to_vec(&PairCodeError {
+        error: PairCodeErrorBody {
+            code: code.into(),
+            message: message.into(),
+        },
+    })
+    .unwrap_or_default();
+    let mut r = response(status, body);
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    r
+}
+fn host_full() -> Response<Body> {
+    pair_error(
+        StatusCode::CONFLICT,
+        "host_full",
+        "cannot store the pairing machine; remove an unused peer and retry",
+    )
+}
 async fn pair_code(req: Request<Incoming>, context: &ContextState) -> Result<Response<Body>> {
     let Some(input) = small_body::<PairCodeRequest>(req, 4096).await else {
-        return Ok(response(StatusCode::BAD_REQUEST, "invalid pairing request"));
+        return Ok(pair_error(
+            StatusCode::BAD_REQUEST,
+            "protocol",
+            "invalid pairing request",
+        ));
     };
     let code_ok = input.code.len() == 6 && input.code.bytes().all(|b| b.is_ascii_digit());
     let peer_ok = input.version == PROTOCOL_VERSION
@@ -813,7 +1005,11 @@ async fn pair_code(req: Request<Incoming>, context: &ContextState) -> Result<Res
         && super::client::normalize_pin(&input.fingerprint).is_ok()
         && valid_secret(&input.token);
     if !code_ok || !peer_ok {
-        return Ok(response(StatusCode::BAD_REQUEST, "invalid pairing request"));
+        return Ok(pair_error(
+            StatusCode::BAD_REQUEST,
+            "protocol",
+            "invalid pairing request",
+        ));
     }
     // The joiner binds the code to the certificate it pinned. A TLS-terminating
     // interceptor relaying the request presents a different certificate.
@@ -822,17 +1018,24 @@ async fn pair_code(req: Request<Incoming>, context: &ContextState) -> Result<Res
         .map(|p| super::client::hex_pin(&p))
         .unwrap_or_default();
     if !equal(&own, &seen) {
-        return Ok(response(
+        return Ok(pair_error(
             StatusCode::CONFLICT,
+            "certificate_mismatch",
             "certificate mismatch; the pairing connection was intercepted",
         ));
     }
     match try_code(&context.dir, &input.code, &input.machine)? {
-        CodeOutcome::Closed => Ok(response(
+        CodeOutcome::Closed => Ok(pair_error(
             StatusCode::GONE,
+            "not_waiting",
             "this machine is not waiting to pair; run porch pair on it",
         )),
-        CodeOutcome::Wrong => Ok(response(StatusCode::UNAUTHORIZED, "wrong pairing code")),
+        CodeOutcome::Wrong => Ok(pair_error(
+            StatusCode::UNAUTHORIZED,
+            "wrong_code",
+            "wrong pairing code",
+        )),
+        CodeOutcome::Full => Ok(host_full()),
         CodeOutcome::Accepted(token) => {
             let peer = Peer {
                 machine: input.machine,
@@ -846,11 +1049,8 @@ async fn pair_code(req: Request<Incoming>, context: &ContextState) -> Result<Res
                 slug: String::new(),
             };
             if super::client::upsert_peer_in(&context.dir, peer).is_err() {
-                revoke_where(&context.dir, |d, _| d == digest(&token))?;
-                return Ok(response(
-                    StatusCode::CONFLICT,
-                    "cannot store the pairing machine; remove an unused peer and retry",
-                ));
+                reject_accepted(&context.dir, &token)?;
+                return Ok(host_full());
             }
             Ok(json(&PairResponse {
                 version: PROTOCOL_VERSION,
@@ -879,10 +1079,12 @@ async fn request(
     }
     let pairing = matches!(req.uri().path(), "/v1/pair" | "/v1/pair-code");
     if pairing && req.method() == Method::POST && !context.allow_attempt(source) {
-        return Ok(response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many pairing attempts; wait a minute",
-        ));
+        let message = "too many pairing attempts; wait a minute";
+        return Ok(if req.uri().path() == "/v1/pair-code" {
+            pair_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited", message)
+        } else {
+            response(StatusCode::TOO_MANY_REQUESTS, message)
+        });
     }
     if req.uri().path() == "/v1/pair-code" && req.method() == Method::POST {
         return pair_code(req, &context).await;
@@ -919,7 +1121,7 @@ async fn request(
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
-    if !token.is_some_and(|t| paired(&context.dir, t).unwrap_or(false)) {
+    if !token.is_some_and(|t| authorize(&context.dir, t).unwrap_or(false)) {
         return Ok(response(
             StatusCode::UNAUTHORIZED,
             "pair this machine before requesting its catalog",

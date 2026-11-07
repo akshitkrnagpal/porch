@@ -60,7 +60,10 @@ pub enum AutostartAction {
 /// Pair two machines. Run `porch pair` on one to show a code, then
 /// `porch pair CODE` on the other. Both can then open each other's apps.
 #[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct PairArgs {
+    #[command(subcommand)]
+    pub command: Option<PairCommand>,
     /// The 6-digit code shown by `porch pair` on the other machine.
     pub code: Option<String>,
     /// The other machine's name or IP, when it is not discovered automatically.
@@ -78,14 +81,82 @@ pub struct PairArgs {
     #[arg(long)]
     pub json: bool,
 }
+#[derive(Subcommand, Debug)]
+pub enum PairCommand {
+    /// Report a code shown with `porch pair --no-wait`: waiting, accepted, paired,
+    /// expired, cancelled or replaced.
+    Status {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a code from working. Harmless if it already closed.
+    Cancel {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+fn print_report(report: &PairStatusReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(report)?);
+        return Ok(());
+    }
+    let peer = report.peer.as_ref().map(|p| p.name.as_str()).unwrap_or("");
+    match report.state {
+        PairState::Waiting => println!(
+            "waiting (expires in {}s)",
+            report.expires_in.unwrap_or_default()
+        ),
+        PairState::Accepted => println!("accepted by {peer}; waiting for it to connect"),
+        PairState::Paired => println!("paired with {peer}"),
+        state => println!(
+            "{}",
+            super::server::closed_message(state, report.reason.as_deref())
+        ),
+    }
+    Ok(())
+}
 pub async fn pair(args: PairArgs) -> Result<()> {
+    match args.command {
+        Some(PairCommand::Status { id, json }) => {
+            return print_report(&super::pairing::status(&id)?, json)
+        }
+        Some(PairCommand::Cancel { id, json }) => {
+            return print_report(&super::pairing::cancel(&id)?, json)
+        }
+        None => {}
+    }
     if let Some(code) = args.code {
         if args.no_wait {
             bail!("--no-wait applies when showing a code")
         }
-        let peer =
-            super::pairing::join(&code, args.host.as_deref(), args.bind.as_deref(), args.port)
-                .await?;
+        let peer = match super::pairing::join(
+            &code,
+            args.host.as_deref(),
+            args.bind.as_deref(),
+            args.port,
+        )
+        .await
+        {
+            Ok(peer) => peer,
+            Err(error) => {
+                if args.json {
+                    let failure = match error.downcast_ref::<JoinFailure>() {
+                        Some(f) => f.clone(),
+                        None => JoinFailure {
+                            detail: Some(format!("{error:#}")),
+                            ..super::pairing::failure("local")
+                        },
+                    };
+                    println!(
+                        "{}",
+                        serde_json::json!({"version":PROTOCOL_VERSION,"error":failure})
+                    );
+                }
+                return Err(error);
+            }
+        };
         if args.json {
             println!(
                 "{}",
@@ -108,7 +179,15 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     if args.json {
         println!(
             "{}",
-            serde_json::json!({"version":PROTOCOL_VERSION,"code":shown.code,"expires":shown.expires,"machine":shown.machine,"endpoint":shown.endpoint})
+            serde_json::to_string(&PairShown {
+                version: PROTOCOL_VERSION,
+                id: shown.id.clone(),
+                code: shown.code.clone(),
+                expires: shown.expires,
+                expires_in: shown.expires.saturating_sub(super::server::now()),
+                machine: shown.machine.clone(),
+                endpoint: shown.endpoint.clone(),
+            })?
         );
     } else {
         println!("Pairing code: {}", shown.code);
@@ -125,8 +204,15 @@ pub async fn pair(args: PairArgs) -> Result<()> {
     if !args.json {
         eprintln!("Waiting for the other machine… (Ctrl-C to cancel)");
     }
-    let name = super::pairing::wait(&shown.id).await?;
-    println!("Paired with {name}");
+    match super::pairing::wait(&shown.id).await? {
+        super::pairing::Waited::Paired(name) => println!("Paired with {name}"),
+        super::pairing::Waited::Unconfirmed(name) => {
+            println!("Paired with {name}");
+            eprintln!(
+                "{name} accepted the code but hasn't connected yet. If it doesn't list this machine, run `porch unpair {name}` and pair again."
+            );
+        }
+    }
     autostart_hint();
     Ok(())
 }
@@ -136,8 +222,15 @@ fn autostart_hint() {
         eprintln!("To keep sharing after a restart: porch discovery autostart enable");
     }
 }
-pub async fn unpair(machine: &str) -> Result<()> {
+pub async fn unpair(machine: &str, json: bool) -> Result<()> {
     let (peer, reached) = super::pairing::unpair(machine).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"version":PROTOCOL_VERSION,"machine":peer.machine,"reached":reached})
+        );
+        return Ok(());
+    }
     println!("Unpaired {}", peer.machine.name);
     if !reached {
         eprintln!(

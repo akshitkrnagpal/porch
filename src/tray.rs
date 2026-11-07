@@ -64,6 +64,9 @@ pub struct Entry {
     pub action: Option<Action>,
     pub children: Vec<Entry>,
     pub separator: bool,
+    /// Draw this entry as an on/off switch in the given state. macOS shows a
+    /// native switch beside the label; Linux shows a check item.
+    pub toggle: Option<bool>,
 }
 impl Entry {
     fn text(label: impl Into<String>) -> Self {
@@ -73,6 +76,7 @@ impl Entry {
             action: None,
             children: vec![],
             separator: false,
+            toggle: None,
         }
     }
     fn action(label: impl Into<String>, action: Action, enabled: bool) -> Self {
@@ -82,6 +86,7 @@ impl Entry {
             action: Some(action),
             children: vec![],
             separator: false,
+            toggle: None,
         }
     }
     fn group(label: impl Into<String>, children: Vec<Entry>) -> Self {
@@ -91,6 +96,7 @@ impl Entry {
             action: None,
             children,
             separator: false,
+            toggle: None,
         }
     }
     fn separator() -> Self {
@@ -100,6 +106,25 @@ impl Entry {
             action: None,
             children: vec![],
             separator: true,
+            toggle: None,
+        }
+    }
+    /// The header row: "Porch" with a switch that starts or stops the proxy.
+    /// Until the first refresh the state is unknown, so the switch is off and
+    /// disabled rather than guessing.
+    fn proxy_toggle(running: Option<bool>) -> Self {
+        let on = running == Some(true);
+        Self {
+            label: "Porch".into(),
+            enabled: running.is_some(),
+            action: Some(if on {
+                Action::StopProxy
+            } else {
+                Action::StartProxy
+            }),
+            children: vec![],
+            separator: false,
+            toggle: Some(on),
         }
     }
 }
@@ -281,7 +306,9 @@ pub fn menu_model(
     error: Option<&str>,
     notice: Option<&str>,
 ) -> Vec<Entry> {
-    let mut entries = vec![Entry::text("Porch")];
+    let mut entries = vec![Entry::proxy_toggle(
+        snapshot.map(|snapshot| snapshot.local.proxy_running),
+    )];
     if let Some(notice) = notice {
         entries.push(Entry::text(notice));
     }
@@ -361,11 +388,6 @@ pub fn menu_model(
             entries.push(Entry::text(warning));
         }
         entries.push(Entry::separator());
-        entries.push(if snapshot.local.proxy_running {
-            Entry::action("Stop proxy", Action::StopProxy, true)
-        } else {
-            Entry::action("Start proxy", Action::StartProxy, true)
-        });
     } else {
         entries.push(Entry::text(if error.is_some() {
             "Check the porch CLI and state directory"
@@ -478,6 +500,12 @@ fn pairing_notice(out: &[u8]) -> String {
 enum Update {
     Snapshot(Result<Snapshot, String>),
     Notice(String),
+    /// The proxy reached (or failed to reach) the state the switch asked for,
+    /// settling `flips` clicks at once.
+    ProxyDone {
+        flips: usize,
+        error: Option<String>,
+    },
 }
 fn worker(cli: PathBuf) -> (Sender<Action>, Receiver<Update>) {
     worker_with_intervals(cli, Duration::from_secs(15), Duration::from_secs(60))
@@ -501,8 +529,8 @@ fn worker_with_intervals(
                 return;
             }
         };
-        let refresh = |updates: &Sender<Update>, discover: bool| {
-            let result = runtime
+        let fetch = |discover: bool| {
+            runtime
                 .block_on(async {
                     let args = if discover {
                         vec!["peers".into(), "refresh".into(), "--json".into()]
@@ -513,24 +541,86 @@ fn worker_with_intervals(
                     serde_json::from_slice::<Snapshot>(&bytes)
                         .context("Porch returned an incompatible catalog")
                 })
-                .map_err(|error| format!("{error:#}"));
-            let _ = updates.send(Update::Snapshot(result));
+                .map_err(|error| format!("{error:#}"))
+        };
+        let refresh = |updates: &Sender<Update>, discover: bool| {
+            let _ = updates.send(Update::Snapshot(fetch(discover)));
+        };
+        // Commands read while gathering queued switch flips wait here.
+        let mut backlog = std::collections::VecDeque::new();
+        // Take every queued flip, keeping the last wanted state and how many
+        // flips it settles; anything else waits its turn in the backlog.
+        let gather = |backlog: &mut std::collections::VecDeque<Action>| {
+            let mut latest = None;
+            let mut flips = 0;
+            for queued in command_rx.try_iter() {
+                match queued {
+                    Action::StartProxy => (latest, flips) = (Some(true), flips + 1),
+                    Action::StopProxy => (latest, flips) = (Some(false), flips + 1),
+                    other => backlog.push_back(other),
+                }
+            }
+            (latest, flips)
         };
         refresh(&updates, true);
         let mut last_discovery = std::time::Instant::now();
         loop {
-            match command_rx.recv_timeout(poll) {
+            let next = match backlog.pop_front() {
+                Some(action) => Ok(action),
+                None => command_rx.recv_timeout(poll),
+            };
+            match next {
                 Ok(Action::Quit) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Ok(action @ (Action::StartProxy | Action::StopProxy)) => {
+                    // The switch says what state the user wants, not a list of
+                    // commands. Fold rapid flips into the last one, skip work
+                    // when the proxy is already there, and pick up flips that
+                    // arrive while a start or stop runs.
+                    let mut want = action == Action::StartProxy;
+                    let mut flips = 1;
+                    let mut error;
+                    loop {
+                        let (latest, more) = gather(&mut backlog);
+                        if let Some(latest) = latest {
+                            want = latest;
+                        }
+                        flips += more;
+                        let running = fetch(false).ok().map(|s| s.local.proxy_running);
+                        error = if running == Some(want) {
+                            None
+                        } else {
+                            let action = if want {
+                                Action::StartProxy
+                            } else {
+                                Action::StopProxy
+                            };
+                            let args = action.cli_args().expect("proxy actions run the CLI");
+                            runtime
+                                .block_on(invoke(&cli, &args))
+                                .err()
+                                .map(|error| format!("{error:#}"))
+                        };
+                        let (latest, more) = gather(&mut backlog);
+                        if more == 0 {
+                            break;
+                        }
+                        want = latest.unwrap_or(want);
+                        flips += more;
+                    }
+                    // Send the fresh state first, then settle the switch, so it
+                    // never redraws from a catalog taken before the change.
+                    refresh(&updates, false);
+                    let _ = updates.send(Update::ProxyDone { flips, error });
+                }
                 Ok(action) => {
                     let reconnect = action == Action::Reconnect;
                     if let Some(args) = action.cli_args() {
-                        let message = match runtime.block_on(invoke(&cli, &args)) {
+                        let result = runtime.block_on(invoke(&cli, &args));
+                        let message = match result {
                             Ok(out) if action == Action::Pair => pairing_notice(&out),
                             Ok(_) => match action {
                                 Action::Copy { .. } => "URL copied".to_owned(),
                                 Action::Open { .. } => "Opened in browser".to_owned(),
-                                Action::StartProxy => "Proxy started".to_owned(),
-                                Action::StopProxy => "Proxy stopped; apps keep running".to_owned(),
                                 Action::Reconnect => "Discovery refreshed".to_owned(),
                                 _ => "Updated".to_owned(),
                             },
@@ -560,30 +650,104 @@ fn worker_with_intervals(
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 mod native {
     use super::*;
+    #[cfg(not(target_os = "macos"))]
+    use tray_icon::menu::CheckMenuItem;
     use tray_icon::{
         menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
         Icon, TrayIcon, TrayIconBuilder,
     };
+
+    /// The live control behind a toggle row, kept so its state can be read at
+    /// click time and updated in place without rebuilding the menu.
+    #[cfg(target_os = "macos")]
+    type Toggle = mac::SwitchRow;
+    #[cfg(not(target_os = "macos"))]
+    type Toggle = CheckMenuItem;
+
+    fn toggle_is_on(toggle: &Toggle) -> bool {
+        #[cfg(target_os = "macos")]
+        return toggle.is_on();
+        #[cfg(not(target_os = "macos"))]
+        return toggle.is_checked();
+    }
+    fn set_toggle(toggle: &Toggle, on: bool, enabled: bool) {
+        #[cfg(target_os = "macos")]
+        toggle.set(on, enabled);
+        #[cfg(not(target_os = "macos"))]
+        {
+            if toggle.is_checked() != on {
+                toggle.set_checked(on);
+            }
+            if toggle.is_enabled() != enabled {
+                toggle.set_enabled(enabled);
+            }
+        }
+    }
+    /// Show that a start or stop is in flight. macOS spins beside the switch;
+    /// the Linux check item has no room for it.
+    fn set_busy(toggle: &Toggle, busy: bool) {
+        #[cfg(target_os = "macos")]
+        toggle.set_busy(busy);
+        #[cfg(not(target_os = "macos"))]
+        let _ = (toggle, busy);
+    }
+    /// True while a menu is open: AppKit runs the main loop in event-tracking
+    /// mode then. Rebuilding rows under the pointer at that moment makes the
+    /// menu jump, so wait for it to close.
+    fn menu_is_open() -> bool {
+        #[cfg(target_os = "macos")]
+        return mac::menu_is_open();
+        #[cfg(not(target_os = "macos"))]
+        return false;
+    }
+
+    /// True when two models draw the same menu apart from toggle state, so the
+    /// switch can be updated in place instead of tearing the menu down.
+    pub(super) fn same_layout(a: &[Entry], b: &[Entry]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(a, b)| match (a.toggle, b.toggle) {
+                (Some(_), Some(_)) => a.label == b.label,
+                _ => a == b,
+            })
+    }
+
+    struct Built {
+        actions: HashMap<String, Action>,
+        toggles: HashMap<String, Toggle>,
+        /// macOS: ids of toggle rows in menu order, given switches afterwards.
+        #[cfg(target_os = "macos")]
+        toggle_ids: Vec<String>,
+    }
 
     pub struct Ui {
         tray: TrayIcon,
         icon_state: IconState,
         menu: Menu,
         actions: HashMap<String, Action>,
+        toggles: HashMap<String, Toggle>,
         model: Vec<Entry>,
         snapshot: Option<Snapshot>,
         error: Option<String>,
         notice: Option<String>,
+        /// Proxy starts/stops sent but not yet finished, and the state the user
+        /// last asked for. While any are in flight the switch keeps showing
+        /// that state instead of whatever an older catalog says.
+        pending: usize,
+        wanted: bool,
+        /// Rows below the header changed while the menu was open; redraw them
+        /// once it closes.
+        stale: bool,
     }
     fn icon(state: IconState) -> Result<Icon> {
         let (pixels, size) = state.artwork();
         Ok(Icon::from_rgba(pixels.to_vec(), size, size)?)
     }
-    fn fill_menu(menu: &Menu, entries: &[Entry]) -> Result<HashMap<String, Action>> {
-        fn append(
+    /// Append `entries` to `menu`, whose first `offset` items are already there.
+    fn fill_menu(menu: &Menu, entries: &[Entry], offset: usize) -> Result<Built> {
+        fn append_entries(
             entries: &[Entry],
             append: &dyn Fn(&dyn tray_icon::menu::IsMenuItem) -> tray_icon::menu::Result<()>,
-            actions: &mut HashMap<String, Action>,
+            built: &mut Built,
         ) -> Result<()> {
             for entry in entries {
                 if entry.separator {
@@ -591,33 +755,256 @@ mod native {
                 } else if !entry.children.is_empty() {
                     let submenu = Submenu::new(&entry.label, entry.enabled);
                     append(&submenu)?;
-                    append_children(&submenu, &entry.children, actions)?;
+                    append_entries(&entry.children, &|item| submenu.append(item), built)?;
+                } else if entry.toggle.is_some() {
+                    // macOS replaces this row with a switch (see `attach_switches`).
+                    // Use a plain item there: a checked item makes NSMenu indent
+                    // every row for a checkmark column. It stays enabled so the
+                    // switch can fire its action.
+                    #[cfg(target_os = "macos")]
+                    let item = MenuItem::new(&entry.label, true, None);
+                    #[cfg(not(target_os = "macos"))]
+                    let item = CheckMenuItem::new(
+                        format!("{} proxy", entry.label),
+                        entry.enabled,
+                        entry.toggle == Some(true),
+                        None,
+                    );
+                    if let Some(action) = &entry.action {
+                        built.actions.insert(item.id().0.clone(), action.clone());
+                    }
+                    #[cfg(target_os = "macos")]
+                    built.toggle_ids.push(item.id().0.clone());
+                    #[cfg(not(target_os = "macos"))]
+                    built.toggles.insert(item.id().0.clone(), item.clone());
+                    append(&item)?;
                 } else {
                     let item = MenuItem::new(&entry.label, entry.enabled, None);
                     if let Some(action) = &entry.action {
-                        actions.insert(item.id().0.clone(), action.clone());
+                        built.actions.insert(item.id().0.clone(), action.clone());
                     }
                     append(&item)?;
                 }
             }
             Ok(())
         }
-        fn append_children(
-            menu: &Submenu,
-            entries: &[Entry],
-            actions: &mut HashMap<String, Action>,
-        ) -> Result<()> {
-            append(entries, &|item| menu.append(item), actions)
+        let mut built = Built {
+            actions: HashMap::new(),
+            toggles: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            toggle_ids: Vec::new(),
+        };
+        append_entries(entries, &|item| menu.append(item), &mut built)?;
+        #[cfg(target_os = "macos")]
+        mac::attach_switches(menu, entries, offset, &mut built);
+        #[cfg(not(target_os = "macos"))]
+        let _ = offset;
+        Ok(built)
+    }
+
+    #[cfg(target_os = "macos")]
+    mod mac {
+        use super::{Built, Entry, Menu};
+        use objc2::{
+            define_class, msg_send, rc::Retained, DefinedClass as _, MainThreadMarker,
+            MainThreadOnly,
+        };
+        use objc2_app_kit::{
+            NSAutoresizingMaskOptions, NSControlSize, NSControlStateValueOff,
+            NSControlStateValueOn, NSEvent, NSFont, NSMenu, NSProgressIndicator,
+            NSProgressIndicatorStyle, NSResponder, NSSwitch, NSTextField, NSView,
+        };
+        use objc2_foundation::{
+            NSDefaultRunLoopMode, NSObject, NSPoint, NSRect, NSRunLoop, NSSize, NSString,
+        };
+        use std::cell::OnceCell;
+        use tray_icon::menu::ContextMenu;
+
+        const WIDTH: f64 = 240.0;
+        const HEIGHT: f64 = 32.0;
+        const INSET: f64 = 14.0;
+        const GAP: f64 = 8.0;
+
+        define_class!(
+            /// A menu row that owns its clicks. Left to itself, NSSwitch runs
+            /// its own drag-tracking loop inside the menu's, and when the
+            /// menu redraws mid-click it can be left stuck half pressed. The
+            /// row swallows the mouse instead and flips the switch with
+            /// `performClick:`, which animates and fires its action. The whole
+            /// row is clickable, as in Control Center.
+            #[unsafe(super(NSView, NSResponder, NSObject))]
+            #[thread_kind = MainThreadOnly]
+            #[name = "PorchSwitchRowView"]
+            #[ivars = OnceCell<Retained<NSSwitch>>]
+            struct RowView;
+
+            impl RowView {
+                #[unsafe(method(hitTest:))]
+                fn hit_test(&self, point: NSPoint) -> *mut NSView {
+                    let hit: *mut NSView = unsafe { msg_send![super(self), hitTest: point] };
+                    if hit.is_null() {
+                        hit
+                    } else {
+                        self as *const Self as *mut NSView
+                    }
+                }
+                #[unsafe(method(mouseDown:))]
+                fn mouse_down(&self, _event: &NSEvent) {}
+                #[unsafe(method(mouseUp:))]
+                fn mouse_up(&self, event: &NSEvent) {
+                    let point = self.convertPoint_fromView(event.locationInWindow(), None);
+                    let bounds = self.bounds();
+                    let inside = point.x >= 0.0
+                        && point.y >= 0.0
+                        && point.x <= bounds.size.width
+                        && point.y <= bounds.size.height;
+                    if let Some(switch) = self.ivars().get() {
+                        if inside && switch.isEnabled() {
+                            unsafe { switch.performClick(None) };
+                        }
+                    }
+                }
+            }
+        );
+
+        /// The switch and spinner of one toggle row.
+        pub struct SwitchRow {
+            switch: Retained<NSSwitch>,
+            spinner: Retained<NSProgressIndicator>,
+            busy: std::cell::Cell<bool>,
         }
-        let mut actions = HashMap::new();
-        append(entries, &|item| menu.append(item), &mut actions)?;
-        Ok(actions)
+        impl SwitchRow {
+            pub fn is_on(&self) -> bool {
+                self.switch.state() == NSControlStateValueOn
+            }
+            pub fn set(&self, on: bool, enabled: bool) {
+                let state = if on {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                };
+                if self.switch.state() != state {
+                    self.switch.setState(state);
+                }
+                if self.switch.isEnabled() != enabled {
+                    self.switch.setEnabled(enabled);
+                }
+            }
+            pub fn set_busy(&self, busy: bool) {
+                if self.busy.replace(busy) == busy {
+                    return;
+                }
+                unsafe {
+                    if busy {
+                        self.spinner.startAnimation(None);
+                    } else {
+                        self.spinner.stopAnimation(None);
+                    }
+                }
+            }
+        }
+
+        pub fn menu_is_open() -> bool {
+            let run_loop = NSRunLoop::currentRunLoop();
+            run_loop
+                .currentMode()
+                .is_some_and(|mode| &*mode != unsafe { NSDefaultRunLoopMode })
+        }
+
+        /// Give each top-level toggle row a custom view: its label on the left
+        /// and a native switch on the right, with a spinner beside the switch
+        /// while a change is in flight. The switch borrows the menu item's own
+        /// target and action, so flipping it raises the same `MenuEvent` a
+        /// click on the item would, and the menu stays open. Only top-level
+        /// toggle rows are supported; the model puts the one switch in the
+        /// header.
+        pub fn attach_switches(menu: &Menu, entries: &[Entry], offset: usize, built: &mut Built) {
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            // SAFETY: muda owns this NSMenu for the lifetime of `menu`, and we
+            // are on the main thread.
+            let ns_menu = unsafe { &*(menu.ns_menu() as *const NSMenu) };
+            let mut ids = std::mem::take(&mut built.toggle_ids).into_iter();
+            for (index, entry) in entries.iter().enumerate() {
+                let Some(on) = entry.toggle else { continue };
+                let Some(id) = ids.next() else { return };
+                let Some(item) = ns_menu.itemAtIndex((offset + index) as isize) else {
+                    continue;
+                };
+                let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, HEIGHT));
+                let view = RowView::alloc(mtm).set_ivars(OnceCell::new());
+                let view: Retained<RowView> =
+                    unsafe { msg_send![super(view), initWithFrame: frame] };
+                view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+
+                let label = NSTextField::labelWithString(
+                    &NSString::from_str(&entry.label.replace("&&", "&")),
+                    mtm,
+                );
+                label.setFont(Some(&NSFont::boldSystemFontOfSize(14.0)));
+                label.sizeToFit();
+                let size = label.frame().size;
+                label.setFrameOrigin(NSPoint::new(INSET, ((HEIGHT - size.height) / 2.0).round()));
+                view.addSubview(&label);
+
+                let switch = NSSwitch::new(mtm);
+                switch.setControlSize(NSControlSize::Small);
+                switch.sizeToFit();
+                let size = switch.frame().size;
+                let switch_x = WIDTH - INSET - size.width;
+                switch.setFrameOrigin(NSPoint::new(
+                    switch_x,
+                    ((HEIGHT - size.height) / 2.0).round(),
+                ));
+                switch.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+                switch.setState(if on {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+                switch.setEnabled(entry.enabled);
+                // SAFETY: the target is the retained menu item, which outlives
+                // the switch it hosts; the selector is the one muda installed.
+                unsafe {
+                    switch.setTarget(item.target().as_deref());
+                    switch.setAction(item.action());
+                }
+                view.addSubview(&switch);
+
+                let spinner = NSProgressIndicator::new(mtm);
+                spinner.setStyle(NSProgressIndicatorStyle::Spinning);
+                spinner.setControlSize(NSControlSize::Small);
+                spinner.setDisplayedWhenStopped(false);
+                spinner.sizeToFit();
+                let size = spinner.frame().size;
+                spinner.setFrameOrigin(NSPoint::new(
+                    (switch_x - GAP - size.width).round(),
+                    ((HEIGHT - size.height) / 2.0).round(),
+                ));
+                spinner.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+                view.addSubview(&spinner);
+
+                let _ = view.ivars().set(switch.clone());
+                item.setView(Some(&view));
+                built.toggles.insert(
+                    id,
+                    SwitchRow {
+                        switch,
+                        spinner,
+                        busy: std::cell::Cell::new(false),
+                    },
+                );
+            }
+        }
     }
     impl Ui {
         pub fn new() -> Result<Self> {
             let model = menu_model(None, None, None);
             let menu = Menu::new();
-            let actions = fill_menu(&menu, &model)?;
+            let Built {
+                actions, toggles, ..
+            } = fill_menu(&menu, &model, 0)?;
             let builder = TrayIconBuilder::new()
                 .with_tooltip("Porch — your dev apps")
                 .with_menu(Box::new(menu.clone()));
@@ -632,10 +1019,14 @@ mod native {
                 icon_state,
                 menu,
                 actions,
+                toggles,
                 model,
                 snapshot: None,
                 error: None,
                 notice: None,
+                pending: 0,
+                wanted: false,
+                stale: false,
             })
         }
         pub fn tick(&mut self, updates: &Receiver<Update>, commands: &Sender<Action>) -> bool {
@@ -648,7 +1039,16 @@ mod native {
                     }
                     Update::Snapshot(Err(error)) => self.error = Some(error),
                     Update::Notice(notice) => self.notice = Some(notice),
+                    Update::ProxyDone { flips, error } => {
+                        self.pending = self.pending.saturating_sub(flips);
+                        // Success needs no message: the switch is the message.
+                        self.notice = error;
+                    }
                 }
+                changed = true;
+            }
+            let open = menu_is_open();
+            if self.stale && !open {
                 changed = true;
             }
             if changed {
@@ -665,32 +1065,78 @@ mod native {
                         Err(error) => eprintln!("Porch: update icon: {error:#}"),
                     }
                 }
-                let model = menu_model(
+                let mut model = menu_model(
                     self.snapshot.as_ref(),
                     self.error.as_deref(),
                     self.notice.as_deref(),
                 );
-                if model != self.model {
+                if self.pending > 0 {
+                    for entry in model.iter_mut().filter(|entry| entry.toggle.is_some()) {
+                        entry.toggle = Some(self.wanted);
+                    }
+                }
+                // Leading toggle rows (the header) survive every redraw: update
+                // their switches in place so a flip animates once and is never
+                // replaced mid-animation by a fresh control.
+                let keep = model
+                    .iter()
+                    .zip(&self.model)
+                    .take_while(|(new, old)| {
+                        new.toggle.is_some() && old.toggle.is_some() && new.label == old.label
+                    })
+                    .count();
+                for entry in model[..keep].iter() {
+                    for toggle in self.toggles.values() {
+                        set_toggle(toggle, entry.toggle == Some(true), entry.enabled);
+                    }
+                }
+                if same_layout(&model[keep..], &self.model[keep.min(self.model.len())..]) {
+                    self.model = model;
+                    self.stale = false;
+                } else if open && keep > 0 {
+                    self.stale = true;
+                } else {
                     // AppIndicator keeps the initial menu object. Mutate its contents
                     // instead of replacing it so refresh works on Linux as on macOS.
-                    while self.menu.remove_at(0).is_some() {}
-                    match fill_menu(&self.menu, &model) {
-                        Ok(actions) => {
-                            self.actions = actions;
+                    while self.menu.remove_at(keep).is_some() {}
+                    match fill_menu(&self.menu, &model[keep..], keep) {
+                        Ok(built) => {
+                            self.actions = built.actions;
+                            if keep == 0 {
+                                self.toggles = built.toggles;
+                            } else {
+                                self.toggles.extend(built.toggles);
+                            }
                             self.model = model;
+                            self.stale = false;
                         }
                         Err(error) => eprintln!("Porch: update menu: {error:#}"),
                     }
                 }
             }
             while let Ok(event) = MenuEvent::receiver().try_recv() {
-                if let Some(action) = self.actions.get(&event.id.0) {
+                if let Some(toggle) = self.toggles.get(&event.id.0) {
+                    // The control has already flipped itself. Ask for the state it
+                    // now shows, not the action captured when the menu was drawn,
+                    // so quick on-off-on flips each send the right command.
+                    let on = toggle_is_on(toggle);
+                    self.wanted = on;
+                    self.pending += 1;
+                    let _ = commands.send(if on {
+                        Action::StartProxy
+                    } else {
+                        Action::StopProxy
+                    });
+                } else if let Some(action) = self.actions.get(&event.id.0) {
                     if *action == Action::Quit {
                         let _ = commands.send(Action::Quit);
                         return false;
                     }
                     let _ = commands.send(action.clone());
                 }
+            }
+            for toggle in self.toggles.values() {
+                set_busy(toggle, self.pending > 0);
             }
             true
         }
@@ -1062,6 +1508,166 @@ mod tests {
         assert!(!pairing_notice(b"{}").contains("porch pair "));
         let shown = menu_model(Some(&snapshot()), None, Some(&notice));
         assert!(shown.iter().any(|e| e.label.contains("482913")));
+    }
+    #[test]
+    fn header_switch_tracks_and_flips_the_proxy() {
+        let loading = &menu_model(None, None, None)[0];
+        assert_eq!(loading.label, "Porch");
+        assert_eq!(loading.toggle, Some(false));
+        assert!(!loading.enabled, "unknown state cannot be toggled");
+
+        let mut state = snapshot();
+        let on = &menu_model(Some(&state), None, None)[0];
+        assert_eq!((on.toggle, on.enabled), (Some(true), true));
+        assert_eq!(on.action, Some(Action::StopProxy));
+
+        state.local.proxy_running = false;
+        let entries = menu_model(Some(&state), None, None);
+        assert_eq!(entries[0].toggle, Some(false));
+        assert_eq!(entries[0].action, Some(Action::StartProxy));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| matches!(e.action, Some(Action::StartProxy | Action::StopProxy)))
+                .count(),
+            1,
+            "the switch replaces the old Start/Stop proxy item"
+        );
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn flipping_the_switch_updates_in_place_but_other_changes_rebuild() {
+        let mut state = snapshot();
+        let on = menu_model(Some(&state), None, None);
+        state.local.proxy_running = false;
+        let off = menu_model(Some(&state), None, None);
+        // Only the header differs at the top level, but app rows inside
+        // "This machine" also change when the proxy stops, so that rebuilds.
+        assert!(!native::same_layout(&on, &off));
+        let mut flipped = on.clone();
+        flipped[0].toggle = Some(false);
+        flipped[0].action = Some(Action::StartProxy);
+        assert!(native::same_layout(&on, &flipped));
+        let noticed = menu_model(Some(&snapshot()), None, Some("URL copied"));
+        assert!(!native::same_layout(&on, &noticed));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn proxy_switch_gets_fresh_state_before_it_settles() {
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "porch-tray-toggle-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let cli = directory.join("porch");
+        let json = serde_json::to_string(&snapshot()).unwrap();
+        fs::write(
+            &cli,
+            format!("#!/bin/sh\ncase \"$1\" in proxy) exit 0;; esac\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+        let (commands, updates) =
+            worker_with_intervals(cli, Duration::from_secs(60), Duration::from_secs(60));
+        assert!(matches!(
+            updates.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Update::Snapshot(Ok(_))
+        ));
+        commands.send(Action::StartProxy).unwrap();
+        assert!(matches!(
+            updates.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Update::Snapshot(Ok(_))
+        ));
+        assert!(matches!(
+            updates.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Update::ProxyDone {
+                flips: 1,
+                error: None
+            }
+        ));
+        commands.send(Action::Quit).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+    /// Flip the switch `flips` times while the worker is busy, starting from a
+    /// running proxy, and return the CLI calls and the settled update.
+    #[cfg(unix)]
+    fn rapid_flips(flips: usize) -> (String, Update) {
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "porch-tray-flips-{flips}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let cli = directory.join("porch");
+        let log = directory.join("calls");
+        let quoted_log = format!("'{}'", log.display());
+        let json = serde_json::to_string(&snapshot()).unwrap();
+        // The first discovery is slow, so every flip queues up behind it.
+        fs::write(
+            &cli,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncase \"$1\" in peers) sleep 0.5;; proxy) exit 0;; esac\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+        let (commands, updates) =
+            worker_with_intervals(cli, Duration::from_secs(60), Duration::from_secs(60));
+        for flip in 0..flips {
+            commands
+                .send(if flip % 2 == 0 {
+                    Action::StopProxy
+                } else {
+                    Action::StartProxy
+                })
+                .unwrap();
+        }
+        let settled = loop {
+            match updates.recv_timeout(Duration::from_secs(5)).unwrap() {
+                done @ Update::ProxyDone { .. } => break done,
+                _ => continue,
+            }
+        };
+        commands.send(Action::Quit).unwrap();
+        let calls = fs::read_to_string(&log).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+        (calls, settled)
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ten_quick_flips_back_to_on_run_nothing() {
+        let (calls, settled) = rapid_flips(10);
+        assert!(!calls.contains("proxy"), "no start or stop: {calls}");
+        assert!(matches!(
+            settled,
+            Update::ProxyDone {
+                flips: 10,
+                error: None
+            }
+        ));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn nine_quick_flips_ending_off_stop_once() {
+        let (calls, settled) = rapid_flips(9);
+        assert_eq!(calls.matches("proxy stop").count(), 1, "{calls}");
+        assert!(!calls.contains("proxy start"), "{calls}");
+        assert!(matches!(settled, Update::ProxyDone { flips: 9, .. }));
     }
     #[test]
     fn labels_do_not_inject_shortcuts_or_control_characters() {
