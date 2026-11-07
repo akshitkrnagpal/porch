@@ -1972,6 +1972,8 @@ async fn launch_extra(
             .kill_on_drop(true);
         crate::process::configure(&mut process);
         let mut child = process.spawn()?;
+        // Right after spawn: on Windows the child stays suspended until then.
+        let tree = crate::process::TreeGuard::new(&child)?;
         let pid = child.id().context("Turbo process exited")?;
         state::mutate(|st| {
             for p in &prepared {
@@ -1982,7 +1984,6 @@ async fn launch_extra(
             }
         })?;
         let mut r = rx.clone();
-        let tree = crate::process::TreeGuard::new(&child)?;
         tasks.spawn(async move{
             // Reap last (see `process::wait_exit`): the guard disposes of the
             // group while the child's pid still names it.
