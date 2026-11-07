@@ -130,7 +130,7 @@ To keep sharing on after a reboot, run `porch discovery autostart enable` on the
 
 On macOS, open `Porch.app`. On Linux, run `porch tray` (needs GTK 3 and an AppIndicator host). On Windows, run `porch tray` or `porch-tray.exe` to add Porch to the notification area.
 
-The menu lists local apps and paired machines with their status. From it you can open an app, copy its URL, refresh, pair a new device, and start or stop the proxy. The icon's dots are solid while the proxy runs and dimmed when it stops, and a badge appears when a paired machine is reachable. On macOS and Linux, `porch-login enable` starts the app at login.
+The menu lists every app's URL at the top level: this machine's apps first, then each paired machine's (such as `web.mac-mini.localhost`), split by separators. Click a URL to open it; on macOS, hold Option to copy it instead (Linux and Windows show Open and Copy in a small submenu). The switch beside Porch starts or stops the proxy, and the menu also refreshes apps and pairs a new device. The icon's dots are solid while the proxy runs and dimmed when it stops, and a badge appears when a paired machine is reachable. On macOS and Linux, `porch-login enable` starts the app at login.
 
 ## More features
 
