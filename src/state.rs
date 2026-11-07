@@ -340,6 +340,12 @@ fn invoking_home() -> PathBuf {
             }
         }
     }
+    // Windows does not set HOME; without this the state directory would be a
+    // relative `.porch` in whatever directory Porch was started from.
+    #[cfg(windows)]
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|p| !p.is_empty()) {
+        return PathBuf::from(profile);
+    }
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
 }
 #[cfg(unix)]

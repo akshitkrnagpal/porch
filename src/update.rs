@@ -410,6 +410,7 @@ impl TempDir {
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         let path = parent.join(format!(".porch-{label}-{}-{nanos}", std::process::id()));
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {

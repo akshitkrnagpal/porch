@@ -3,10 +3,11 @@
 //! Ownership lookups are best effort: they use `lsof` on macOS and `ss` (then
 //! `lsof`) on Linux. Listeners owned by other users may be invisible without
 //! administrator rights, so callers must cope with an unknown owner.
+#[cfg(unix)]
+use std::process::Command;
 use std::{
     fmt,
     net::{SocketAddr, TcpStream},
-    process::Command,
     time::Duration,
 };
 

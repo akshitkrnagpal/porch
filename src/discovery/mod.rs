@@ -98,6 +98,13 @@ fn detach(command: &mut tokio::process::Command) {
         use std::os::unix::process::CommandExt;
         command.as_std_mut().process_group(0);
     }
+    // Outlive the launching console: no console of its own, and Ctrl+C in the
+    // terminal that ran `porch pair` must not reach it.
+    #[cfg(windows)]
+    command.creation_flags(
+        windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
+            | windows_sys::Win32::System::Threading::DETACHED_PROCESS,
+    );
 }
 struct AgentGuard;
 impl Drop for AgentGuard {
@@ -144,8 +151,14 @@ async fn stop_identity(identity: &crate::state::ProcessIdentity) -> Result<()> {
     unsafe {
         libc::kill(identity.pid as i32, libc::SIGTERM);
     }
-    #[cfg(not(unix))]
-    bail!("discovery supports macOS and Linux");
+    // A windowless console process ignores taskkill's close request, so stop
+    // it outright. Its guard does not run; the records it leaves fail the
+    // identity check and are overwritten by the next agent.
+    #[cfg(windows)]
+    {
+        let _ =
+            crate::integrations::exec("taskkill", &["/PID", &identity.pid.to_string(), "/T", "/F"]);
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
     while crate::state::matches(identity) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -379,23 +392,23 @@ async fn disconnect_matching(peer: Option<&str>) -> Result<()> {
     Ok(())
 }
 pub fn open_url(url: &str) -> Result<()> {
-    let mut command;
     #[cfg(target_os = "macos")]
-    {
-        command = std::process::Command::new("open");
-        command.arg(url);
-    }
+    let mut command = std::process::Command::new("open");
     #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("xdg-open");
+    // `cmd /c start` would reinterpret `&` and `^` in the URL; the URL protocol
+    // handler takes it as a single argument.
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    bail!("opening apps supports macOS, Linux and Windows");
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
-        command = std::process::Command::new("xdg-open");
         command.arg(url);
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        bail!("opening apps supports macOS and Linux")
-    }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
         if !command
             .status()
             .context("opening browser; use --url-only in a headless session")?
@@ -415,7 +428,9 @@ pub fn copy_url(url: &str) -> Result<()> {
         ("xclip", vec!["-selection", "clipboard"]),
         ("xsel", vec!["--clipboard", "--input"]),
     ];
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    let candidates: Vec<(&str, Vec<&str>)> = vec![("clip", vec![])];
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let candidates: Vec<(&str, Vec<&str>)> = vec![];
     for (bin, args) in candidates {
         if let Ok(mut child) = std::process::Command::new(bin)
