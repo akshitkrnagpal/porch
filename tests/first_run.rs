@@ -205,20 +205,52 @@ fn explicit_busy_port_fails_with_owner_and_command() {
 
 #[test]
 fn app_that_ignores_port_produces_listen_warning() {
+    use std::io::BufRead;
     let s = Sandbox::new();
     s.save_port(quiet_port(), serde_json::json!({}));
     let other = quiet_port();
+    // The app stays up until the warning is observed; its lifetime must not
+    // race the diagnosis, which inspects the app's listeners after the timeout.
     std::fs::write(
         s.root.join("wrong.py"),
-        format!("import socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',{other}))\ns.listen()\ntime.sleep(4)\n"),
+        format!("import socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',{other}))\ns.listen()\ntime.sleep(60)\n"),
     )
     .unwrap();
-    let o = s
+    let mut porch = s
         .command(&["wrong", "python3", "wrong.py"])
         .env("PORCH_LISTEN_TIMEOUT", "1.5")
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    let err = String::from_utf8_lossy(&o.stderr);
+    let (lines, received) = std::sync::mpsc::channel();
+    let stderr = porch.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut err = String::new();
+    while !err.contains("`porch run --app-port") {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match received.recv_timeout(left) {
+            Ok(line) => {
+                err.push_str(&line);
+                err.push('\n');
+            }
+            Err(_) => break,
+        }
+    }
+    unsafe {
+        libc::kill(porch.id() as i32, libc::SIGTERM);
+    }
+    let _ = porch.wait();
     assert!(err.contains("nothing is listening on port"), "{err}");
     assert!(
         err.contains(&format!("listening on {other} instead")),

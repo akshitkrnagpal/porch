@@ -1,3 +1,4 @@
+mod common;
 use porch::config::*;
 use serde_json::json;
 use std::{
@@ -453,9 +454,7 @@ fn turbo_workspace_flow(wrapper: bool) {
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let port = common::free_port();
     let output = std::process::Command::new(binary)
         .args(["--", "--filter=@org/web"])
         .current_dir(&f.0)
@@ -720,12 +719,8 @@ fn simultaneous_leaf_launches_keep_distinct_workspace_routes_and_ports() {
         }
     }
     let f = Fixture::new();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let proxy_port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let root_app_port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let proxy_port = common::free_port();
+    let root_app_port = common::free_port();
     f.write("package.json", json!({"workspaces":["apps/*"],"porch":{"name":"shop","appPort":root_app_port,"script":"wrong"}}));
     let mut running = Running {
         children: Vec::new(),

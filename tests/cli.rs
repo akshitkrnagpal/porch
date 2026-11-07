@@ -1,3 +1,4 @@
+mod common;
 use std::{
     path::PathBuf,
     process::{Command, Output, Stdio},
@@ -23,10 +24,9 @@ impl Sandbox {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         Self {
             root,
-            port: l.local_addr().unwrap().port(),
+            port: common::free_port(),
         }
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -43,6 +43,19 @@ impl Sandbox {
     }
     fn run(&self, args: &[&str]) -> Output {
         self.command(args).output().unwrap()
+    }
+    /// Asserts the exit code and reports porch's own output on mismatch, so a
+    /// startup failure is distinguishable from lost child exit status.
+    fn exits(&self, args: &[&str], code: i32) {
+        let o = self.run(args);
+        assert_eq!(
+            o.status.code(),
+            Some(code),
+            "{args:?} in {}\nstdout: {}\nstderr: {}",
+            self.root.display(),
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
     }
     fn ok(&self, args: &[&str]) -> String {
         let o = self.run(args);
@@ -153,9 +166,7 @@ fn concurrent_writers_preserve_every_route() {
 fn real_autostart_launch_forward_env_signal_and_readiness() {
     let s = Sandbox::new();
     s.write_server();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let app_port = listener.local_addr().unwrap().port().to_string();
-    drop(listener);
+    let app_port = common::free_port().to_string();
     let mut child = s
         .command(&[
             "demo",
@@ -218,27 +229,20 @@ fn real_autostart_launch_forward_env_signal_and_readiness() {
 fn bare_script_named_run_reserved_name_and_exit_code() {
     let s = Sandbox::new();
     std::fs::write(s.root.join("package.json"),r#"{"name":"fixture","scripts":{"dev":"node -e \"process.exit(23)\"","start":"node -e \"process.exit(17)\""},"portless":{"name":"configured"}}"#).unwrap();
-    assert_eq!(s.run(&[]).status.code(), Some(23));
-    assert_eq!(s.run(&["--script", "start"]).status.code(), Some(17));
-    assert_eq!(
-        s.run(&[
+    s.exits(&[], 23);
+    s.exits(&["--script", "start"], 17);
+    s.exits(
+        &[
             "run",
             "--name",
             "explicit",
             "node",
             "-e",
-            "process.exit(31)"
-        ])
-        .status
-        .code(),
-        Some(31)
+            "process.exit(31)",
+        ],
+        31,
     );
-    assert_eq!(
-        s.run(&["--name", "proxy", "node", "-e", "process.exit(19)"])
-            .status
-            .code(),
-        Some(19)
-    );
+    s.exits(&["--name", "proxy", "node", "-e", "process.exit(19)"], 19);
     assert!(s.state()["routes"].as_array().unwrap().is_empty());
 }
 #[test]
@@ -346,7 +350,8 @@ fn https_opt_in_ca_environment_allows_node_to_call_another_app() {
         String::from_utf8(output.stdout).unwrap().trim(),
         "from-secure"
     );
-    assert!(s.state()["routes"].as_array().unwrap().is_empty());
+    let state = s.state();
+    assert!(state["routes"].as_array().unwrap().is_empty(), "{state:#}");
 }
 
 #[cfg(unix)]

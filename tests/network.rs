@@ -1,3 +1,4 @@
+mod common;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
@@ -10,13 +11,7 @@ use std::{
 };
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, protocol::Role, Message};
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+use common::free_port;
 async fn ready(port: u16) {
     for _ in 0..200 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))

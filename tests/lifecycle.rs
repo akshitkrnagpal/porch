@@ -1,6 +1,7 @@
 //! Regression acceptance for takeover, orphan recovery, reservations and TLD removal.
 //! Every daemon, child, hosts setting and state file is isolated from the machine configuration.
 #![cfg(unix)]
+mod common;
 use std::{
     cell::RefCell,
     collections::BTreeSet,
@@ -207,13 +208,7 @@ impl Drop for Sandbox {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+use common::free_port;
 fn alive(pid: u32) -> bool {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "stat="])
