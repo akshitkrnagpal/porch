@@ -64,7 +64,7 @@ porch list                               # routes with health and sharing URLs
 porch list --json                        # routes with health, proxy settings and version
 ```
 
-Aliases can also point at an HTTP or HTTPS URL. `remove`/`rm` and `routes` are shorthands for removing and listing.
+Aliases can also point at an HTTP or HTTPS URL. For a target that isn't on this machine (`porch alias api https://staging.example.com`), Porch sends the target's own name in `Host` and TLS SNI, verifies its certificate against the system trust store, and rewrites the target's redirects to itself so they stay on the Porch URL. Targets can't carry a query string or fragment. `remove`/`rm` and `routes` are shorthands for removing and listing.
 
 `porch list` health values:
 

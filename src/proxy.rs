@@ -657,9 +657,34 @@ async fn forward(
             req.headers_mut().insert(name, value.parse().unwrap());
         }
     }
-    if let Ok(v) = host.parse() {
+    // A remote alias (https://api.example.com) is a real site: it needs its own
+    // name in Host (TLS SNI already uses it), and its redirects to itself are
+    // rewritten to stay on the Porch URL. Local apps keep the browser's Host.
+    let remote_origin = target
+        .host()
+        .map(|h| h.trim_matches(['[', ']']))
+        .filter(|h| {
+            !h.eq_ignore_ascii_case("localhost")
+                && !h
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+        .map(|_| {
+            format!(
+                "{}://{}",
+                target.scheme_str().unwrap_or("http"),
+                target.authority().unwrap()
+            )
+        });
+    let host_header = if remote_origin.is_some() {
+        target.authority().unwrap().to_string()
+    } else {
+        host.clone()
+    };
+    if let Ok(v) = host_header.parse() {
         req.headers_mut().insert(header::HOST, v);
     }
+    let public_origin = format!("{}://{host}", if secure { "https" } else { "http" });
     *req.uri_mut() = uri;
     *req.version_mut() = Version::HTTP_11;
     let (parts, body) = req.into_parts();
@@ -714,6 +739,24 @@ async fn forward(
                 }
             } else {
                 strip(response.headers_mut());
+                if let Some(origin) = &remote_origin {
+                    let rewritten = response
+                        .headers()
+                        .get(header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|l| {
+                            let rest = l
+                                .get(..origin.len())
+                                .filter(|p| p.eq_ignore_ascii_case(origin))
+                                .map(|_| &l[origin.len()..])?;
+                            (rest.is_empty() || rest.starts_with(['/', '?', '#']))
+                                .then(|| format!("{public_origin}{rest}"))
+                        })
+                        .and_then(|l| header::HeaderValue::from_str(&l).ok());
+                    if let Some(v) = rewritten {
+                        response.headers_mut().insert(header::LOCATION, v);
+                    }
+                }
             }
             let mut r = response.map(|b| b.boxed_unsync());
             marker(&mut r);
