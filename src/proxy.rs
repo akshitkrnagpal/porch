@@ -117,7 +117,7 @@ const DASHBOARD_SCRIPT: &str = r#"<script>
 const row=(url,label,up,detail)=>`<li><a href="${esc(url)}"><span class="name"><span class="dot ${up?'up':'down'}"></span>${esc(label)}</span><span class="target">${esc(detail)}</span></a></li>`;
 async function local(){try{const r=await fetch('/_porch/apps.json',{cache:'no-store'});const d=await r.json();const q=document.querySelector('input[type=search]');const f=q?q.value.toLowerCase():'';
 const el=document.getElementById('local');if(!d.apps.length){el.innerHTML='<p class="muted">No apps are running. Start one with <code>porch run pnpm dev</code>.</p>';return}
-const ul=el.querySelector('ul.apps');const html=d.apps.map(a=>row(a.url,a.host,a.health==='ok',a.health==='ok'?a.target:a.target+' · not listening')).join('');
+const ul=el.querySelector('ul.apps');d.apps.sort((a,b)=>a.host.localeCompare(b.host));const html=d.apps.map(a=>row(a.url,a.host,a.health==='ok',a.health==='ok'?a.target:a.target+' · not listening')).join('');
 if(ul){ul.innerHTML=html;if(f)for(const li of ul.children)li.hidden=!li.textContent.toLowerCase().includes(f)}else el.innerHTML='<ul class="apps">'+html+'</ul>'}catch(e){}}
 async function peers(){try{const r=await fetch('/_porch/apps.json?peers=1',{cache:'no-store'});const d=await r.json();const el=document.getElementById('peers');
 el.innerHTML=(d.machines||[]).map(m=>`<h2>${esc(m.machine)}${m.error?' · unreachable':''}</h2>`+(m.apps.length?'<ul class="apps">'+m.apps.map(a=>a.url?row(a.url,a.name,a.health==='healthy',''):`<li><a><span class="name"><span class="dot down"></span>${esc(a.name)}</span><span class="target">${esc(a.note||'not shared')}</span></a></li>`).join('')+'</ul>':'<p class="muted">No apps.</p>')).join('')}catch(e){}}
@@ -636,10 +636,11 @@ async fn forward(
             })
             .await
             .unwrap_or_default();
-            let links = state
-                .routes
-                .iter()
-                .enumerate()
+            let mut order: Vec<usize> = (0..state.routes.len()).collect();
+            order.sort_by_key(|&i| settings.hostname(&state.routes[i].name));
+            let links = order
+                .into_iter()
+                .map(|i| (i, &state.routes[i]))
                 .map(|(i, r)| {
                     let up = health.get(i).copied().unwrap_or(true);
                     format!(
@@ -660,7 +661,7 @@ async fn forward(
                 "<p class=\"muted\">No apps are running. Start one with <code>porch run pnpm dev</code> or <code>porch NAME COMMAND</code>.</p>".to_owned()
             } else {
                 let filter = if links.len() > 5 {
-                    "<input type=\"search\" placeholder=\"Filter apps\" aria-label=\"Filter apps\" oninput=\"for(const li of document.querySelectorAll('ul.apps li'))li.hidden=!li.textContent.toLowerCase().includes(this.value.toLowerCase())\" autofocus>"
+                    "<input type=\"search\" placeholder=\"Filter apps\" aria-label=\"Filter apps\" oninput=\"let n=0;for(const li of document.querySelectorAll('#local ul.apps li, ul.apps li')){li.hidden=!li.textContent.toLowerCase().includes(this.value.toLowerCase());n+=!li.hidden}document.getElementById('nomatch').hidden=n>0\" autofocus><p id=\"nomatch\" class=\"muted\" role=\"status\" hidden>No apps match.</p>"
                 } else {
                     ""
                 };
