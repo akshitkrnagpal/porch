@@ -30,7 +30,10 @@ fn slots() -> impl Iterator<Item = u16> {
 /// several `cargo test` runs).
 pub fn free_port() -> u16 {
     use fs2::FileExt;
-    static CLAIMS: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
+    // Ports returned by this process, with the lock files that claim them for
+    // other processes. Tracked by number too: whether two open files of one
+    // process conflict under flock is not something to rely on everywhere.
+    static CLAIMS: Mutex<Vec<(u16, std::fs::File)>> = Mutex::new(Vec::new());
     let claims = std::env::temp_dir().join("porch-test-port-slots");
     std::fs::create_dir_all(&claims).unwrap();
     let all: Vec<u16> = slots().collect();
@@ -39,6 +42,9 @@ pub fn free_port() -> u16 {
     let start = std::process::id() as usize % all.len();
     let mut claimed = CLAIMS.lock().unwrap_or_else(|e| e.into_inner());
     for port in all[start..].iter().chain(&all[..start]).copied() {
+        if claimed.iter().any(|(p, _)| *p == port) {
+            continue;
+        }
         let Ok(claim) = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -47,13 +53,12 @@ pub fn free_port() -> u16 {
         else {
             continue;
         };
-        // flock conflicts between open files even within one process.
         if claim.try_lock_exclusive().is_err() {
             continue;
         }
         // Exclusive wildcard IPv4 and IPv6 binds, like Porch's own reservations.
         if porch::sockets::reserve(port).is_ok() {
-            claimed.push(claim);
+            claimed.push((port, claim));
             return port;
         }
     }

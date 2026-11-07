@@ -1406,7 +1406,7 @@ mod tests {
             })
             .unwrap();
         // Wait for the observable outcome, not a number of updates: a catalog
-        // refresh and a second (periodic) discovery, both after the open.
+        // refresh and a periodic discovery, both after the open.
         let (mut found_catalog, mut found_scan) = (false, false);
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while !(found_catalog && found_scan) && std::time::Instant::now() < deadline {
@@ -1416,11 +1416,9 @@ mod tests {
                 .split_once("open app-stable-id --peer peer-stable-id\n")
                 .map_or("", |(_, after)| after);
             found_catalog = after_open.lines().any(|line| line == "list --all --json");
-            found_scan = calls
+            found_scan = after_open
                 .lines()
-                .filter(|line| *line == "peers refresh --json")
-                .count()
-                >= 2;
+                .any(|line| line == "peers refresh --json");
         }
         commands.send(Action::Quit).unwrap();
         while updates.recv_timeout(Duration::from_secs(5)).is_ok() {}
