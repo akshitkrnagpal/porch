@@ -173,6 +173,8 @@ macOS builds aren't notarized yet. On Linux distributions older than glibc 2.39,
 
 ## Documentation
 
+The docs are also a searchable site: run `mdbook serve` in this repository, or read the copy the [docs workflow](.github/workflows/docs.yml) publishes to GitHub Pages from `main`. Start with [Getting started](docs/introduction.md).
+
 - [Command and configuration reference](docs/reference.md)
 - [Recipes](docs/recipes.md): Next.js, Vite, Django, Rails, Docker Compose, monorepos, OAuth, phones
 - [Troubleshooting](docs/troubleshooting.md)

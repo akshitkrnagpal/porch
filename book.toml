@@ -1,0 +1,23 @@
+# The docs site: `mdbook build` (or `mdbook serve`) from the repository root.
+# .github/workflows/docs.yml publishes it to GitHub Pages.
+[book]
+title = "Porch"
+description = "Stable named URLs for your dev servers, on this machine and on every machine you pair with."
+authors = ["Porch contributors"]
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "target/book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/akshitkrnagpal/porch"
+edit-url-template = "https://github.com/akshitkrnagpal/porch/edit/main/{path}"
+default-theme = "light"
+preferred-dark-theme = "ayu"
+no-section-label = true
+
+[output.html.search]
+enable = true
+limit-results = 20

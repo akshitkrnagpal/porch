@@ -1,0 +1,36 @@
+name: Docs
+# Builds the mdBook docs site (book.toml, docs/) and publishes it to GitHub
+# Pages on every push to main that touches the docs.
+on:
+  push:
+    branches: [main]
+    paths: ['docs/**', 'book.toml', 'README.md', 'SECURITY.md', 'CHANGELOG.md', '.github/workflows/docs.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install mdBook
+        run: |
+          curl -fsSL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+          ./mdbook build
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: target/book
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

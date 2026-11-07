@@ -94,7 +94,7 @@ If it says "The app listens on [::1]:4480 only", the app bound IPv6 loopback onl
 server: { proxy: { "/api": { target: "http://api.localhost:7462", changeOrigin: true } } }
 ```
 
-### "the running proxy uses different settings (http://<name>.localhost:7462); run `porch proxy stop` and retry"
+### "the running proxy uses different settings (`http://<name>.localhost:7462`); run `porch proxy stop` and retry"
 
 **Cause.** You asked for HTTPS, a TLD or a port that differs from the running proxy's.
 
