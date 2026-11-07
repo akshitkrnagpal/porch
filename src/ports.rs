@@ -85,11 +85,14 @@ fn all_listeners(port: Option<u16>, pids: Option<&[u32]>) -> Vec<Listener> {
     {
         crate::win_net::tcp_listeners()
             .into_iter()
+            .map(|(_, port, pid)| (port, pid))
             .filter(|(p, pid)| {
                 *pid != 0
                     && port.is_none_or(|want| want == *p)
                     && pids.is_none_or(|ps| ps.contains(pid))
             })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .map(|(port, pid)| Listener {
                 pid,
                 // Unnamed when the process belongs to another user or a service.

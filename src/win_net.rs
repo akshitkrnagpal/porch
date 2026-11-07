@@ -1,7 +1,7 @@
 //! Windows network facts that Unix gets from getifaddrs and lsof/ss.
 #![cfg(windows)]
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_BUFFER_OVERFLOW, ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
     NetworkManagement::{
@@ -72,8 +72,8 @@ pub fn interface_addresses() -> Vec<Ipv4Addr> {
     out
 }
 
-/// `(port, pid)` for every listening TCP socket, IPv4 and IPv6.
-pub fn tcp_listeners() -> Vec<(u16, u32)> {
+/// `(address, port, pid)` for every listening TCP socket, IPv4 and IPv6.
+pub fn tcp_listeners() -> Vec<(IpAddr, u16, u32)> {
     let mut out = Vec::new();
     for family in [AF_INET, AF_INET6] {
         let Some(buf) = sized_buffer(|ptr, size| unsafe {
@@ -94,10 +94,16 @@ pub fn tcp_listeners() -> Vec<(u16, u32)> {
             let count = *buf.as_ptr().cast::<u32>() as usize;
             if family == AF_INET {
                 let rows = rows::<MIB_TCPROW_OWNER_PID>(&buf, count);
-                out.extend(rows.iter().map(|r| (port(r.dwLocalPort), r.dwOwningPid)));
+                out.extend(rows.iter().map(|r| {
+                    let ip = Ipv4Addr::from(u32::from_be(r.dwLocalAddr));
+                    (IpAddr::V4(ip), port(r.dwLocalPort), r.dwOwningPid)
+                }));
             } else {
                 let rows = rows::<MIB_TCP6ROW_OWNER_PID>(&buf, count);
-                out.extend(rows.iter().map(|r| (port(r.dwLocalPort), r.dwOwningPid)));
+                out.extend(rows.iter().map(|r| {
+                    let ip = Ipv6Addr::from(r.ucLocalAddr);
+                    (IpAddr::V6(ip), port(r.dwLocalPort), r.dwOwningPid)
+                }));
             }
         }
     }

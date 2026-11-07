@@ -29,9 +29,23 @@ pub fn bind(addr: SocketAddr, v6_only: bool) -> io::Result<TcpListener> {
     }
     #[cfg(windows)]
     {
-        wildcard_free(addr)?;
+        listener_overlaps(addr)?;
         exclusive(&socket)?;
     }
+    // Windows has no privileged ports: access denied there means the port is
+    // held exclusively or reserved by the system, never that elevation helps.
+    #[cfg(windows)]
+    socket.bind(&addr.into()).map_err(|e| {
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("port {} is unavailable: {e}", addr.port()),
+            )
+        } else {
+            e
+        }
+    })?;
+    #[cfg(not(windows))]
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     Ok(socket.into())
@@ -60,49 +74,37 @@ fn exclusive(socket: &socket2::Socket) -> io::Result<()> {
     Ok(())
 }
 
-/// Windows lets a specific address bind succeed while another process holds
-/// the wildcard on that port, and then routes that address to us: we would
-/// take its traffic. Unix refuses such a bind. Probe the wildcards first;
-/// plain (non-exclusive) probes still allow other specific addresses on the
-/// port, as Unix does.
+/// Another process already listening where `addr` would overlap it.
 ///
-/// A dual-stack `[::]` listener also receives IPv4 there without holding
-/// `0.0.0.0`, so IPv4 addresses probe `[::]` too. A probe cannot tell that
-/// listener from an IPv6-only one, so the latter is refused as well: the
-/// safe side, since guessing wrong the other way steals traffic.
+/// Windows decides bind conflicts by a mix of SO_REUSEADDR,
+/// SO_EXCLUSIVEADDRUSE and dual-stack mode on both sockets, and in several
+/// combinations lets a second listener share the port: a loopback bind
+/// under another app's wildcard then takes that app's traffic. Unix refuses
+/// all of these, so ask the TCP table instead of the bind rules. Overlap
+/// follows Unix: a wildcard covers its family (an IPv6 wildcard may be dual
+/// stack, so it covers IPv4 too); distinct specific addresses do not overlap.
 #[cfg(windows)]
-fn wildcard_free(addr: SocketAddr) -> io::Result<()> {
-    if addr.ip().is_unspecified() || addr.port() == 0 {
+fn listener_overlaps(addr: SocketAddr) -> io::Result<()> {
+    let me = std::process::id();
+    let overlaps = |ip: IpAddr| {
+        if addr.ip().is_unspecified() {
+            ip.is_ipv4() == addr.is_ipv4() || (ip.is_ipv6() && ip.is_unspecified())
+        } else {
+            ip == addr.ip()
+                || (ip.is_unspecified() && (ip.is_ipv4() == addr.is_ipv4() || ip.is_ipv6()))
+        }
+    };
+    if addr.port() == 0 {
         return Ok(());
     }
-    let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), addr.port());
-    let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), addr.port());
-    let wildcards: &[SocketAddr] = if addr.is_ipv6() { &[v6] } else { &[v4, v6] };
-    for wildcard in wildcards {
-        let domain = if wildcard.is_ipv6() {
-            socket2::Domain::IPV6
-        } else {
-            socket2::Domain::IPV4
-        };
-        let probe =
-            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-        if wildcard.is_ipv6() {
-            probe.set_only_v6(true)?;
-        }
-        match probe.bind(&(*wildcard).into()) {
-            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!(
-                        "port {} is held on all interfaces by another process",
-                        addr.port()
-                    ),
-                ))
-            }
-            // Bound, or failed for another reason (no IPv6, say) that the
-            // real bind will report if it matters.
-            _ => {}
-        }
+    if let Some((_, _, pid)) = crate::win_net::tcp_listeners()
+        .into_iter()
+        .find(|(ip, port, pid)| *port == addr.port() && *pid != me && overlaps(*ip))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("port {} is in use by process {pid}", addr.port()),
+        ));
     }
     Ok(())
 }
