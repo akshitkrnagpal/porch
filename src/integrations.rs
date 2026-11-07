@@ -450,7 +450,7 @@ pub(crate) fn systemd_quote(s: &str) -> Result<String> {
             .replace('$', "$$")
     ))
 }
-fn windows_quote(s: &str) -> String {
+pub(crate) fn windows_quote(s: &str) -> String {
     let mut out = String::from("\"");
     let mut slashes = 0;
     for c in s.chars() {

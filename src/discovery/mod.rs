@@ -118,6 +118,8 @@ impl Drop for AgentGuard {
 }
 pub async fn serve(autostart: bool) -> Result<()> {
     if autostart {
+        #[cfg(windows)]
+        log_without_console()?;
         // Login startup must not fail-loop: an agent that is already running, or
         // sharing that was turned off, is a clean exit for launchd/systemd.
         if running() {
@@ -147,6 +149,25 @@ pub async fn serve(autostart: bool) -> Result<()> {
             _=crate::shutdown::requested()=>Ok(()),
         }
     }
+}
+/// Task Scheduler starts the agent with a console window and no output
+/// redirection: send output to discovery.log, then let the window close.
+#[cfg(windows)]
+fn log_without_console() -> Result<()> {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{
+        FreeConsole, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    let log = private_file(crate::state::dir().join("discovery.log"))?;
+    let out = log.try_clone()?.into_raw_handle();
+    let err = log.into_raw_handle();
+    // Rust's stdout/stderr look the standard handles up on every write.
+    unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, out);
+        SetStdHandle(STD_ERROR_HANDLE, err);
+        FreeConsole();
+    }
+    Ok(())
 }
 async fn stop_identity(identity: &crate::state::ProcessIdentity) -> Result<()> {
     if !crate::state::matches(identity) {
