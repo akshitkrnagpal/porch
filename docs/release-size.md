@@ -158,9 +158,10 @@ python3 scripts/proxy_cpu.py path/to/old/porch path/to/new/porch --rounds 5 \
 
 - Speed was measured on one Apple Silicon Mac only; the x86_64 macOS, Linux and
   Windows builds were measured for size, not speed.
-- CI ran the shipped Linux and Apple Silicon binaries' test suites and `--version`
-  smoke checks, and the Windows `--version` check; the x86_64 macOS build is
-  cross-compiled and was not executed.
+- In the Release workflow, the Linux and Apple Silicon jobs run the test suite
+  (release opt-level without fat LTO) and a `--version` check of the shipped
+  binary; Windows runs only the `--version` check; the cross-compiled x86_64
+  macOS build is not executed.
 - The tray UI was not exercised interactively on any platform; tray unit tests
   and packaging tests passed.
 - Release builds now take roughly twice as long to compile.
