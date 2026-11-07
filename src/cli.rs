@@ -246,6 +246,9 @@ enum Commands {
     Stop {
         /// App name
         name: String,
+        /// Also stop the other apps started by the same `porch` run (a workspace)
+        #[arg(long)]
+        all: bool,
     },
     /// Show the output of an app started with `porch run --detach`
     Logs {
@@ -569,7 +572,7 @@ pub async fn run() -> Result<i32> {
             }
             sync_hosts().await;
         }
-        Some(Commands::Stop { name }) => return stop_app(&name).await,
+        Some(Commands::Stop { name, all }) => return stop_app(&name, all).await,
         Some(Commands::Logs {
             name,
             follow,
@@ -1526,7 +1529,8 @@ impl TerminationSignals {
     }
 }
 fn list(json: bool) -> Result<()> {
-    let (_, rows) = crate::health::reconcile()?;
+    // PORCH_READ_ONLY (set by MCP's read-only tools): report, never prune.
+    let (_, rows) = crate::health::reconcile_with(enabled("READ_ONLY") != Some(true))?;
     let s = state::load()?;
     let p = state::proxy_settings()?;
     let routes: Vec<_> = rows
@@ -2387,6 +2391,9 @@ async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
         .collect();
     let log_name = names.first().cloned().unwrap_or_else(|| "workspace".into());
     let log = log_path(&log_name);
+    // Every app of a workspace launch shares one output stream; the other
+    // names point at it, so `porch logs NAME` works for each of them.
+    let shared_with: Vec<String> = names.iter().skip(1).cloned().collect();
     // Refuse a second copy up front, before touching the running one's log.
     if !options.force {
         let s = state::load()?;
@@ -2404,6 +2411,13 @@ async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
     }
     fs::create_dir_all(log.parent().unwrap())?;
     let out = fs::File::create(&log)?;
+    for other in &shared_with {
+        let _ = fs::remove_file(log_path(other));
+        fs::write(
+            log.parent().unwrap().join(format!("{other}.logref")),
+            format!("{log_name}\n"),
+        )?;
+    }
     let mut child = Command::new(std::env::current_exe()?);
     child
         .args(std::env::args_os().skip(1))
@@ -2482,7 +2496,7 @@ async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
     Ok(0)
 }
 /// `porch stop NAME`: stop the launcher and app behind a route.
-async fn stop_app(name: &str) -> Result<i32> {
+async fn stop_app(name: &str, all: bool) -> Result<i32> {
     let n = normalize(name)?;
     let s = state::load()?;
     let p = state::proxy_settings()?;
@@ -2497,6 +2511,26 @@ async fn stop_app(name: &str) -> Result<i32> {
         }
         bail!("no running app named {n}; see `porch list`")
     }
+    // Apps one `porch` run started together (a workspace) share a launcher;
+    // stopping it stops all of them, so say so instead of surprising anyone.
+    let launchers: Vec<u32> = launched
+        .iter()
+        .filter_map(|m| s.owners.get(m).map(|o| o.pid))
+        .collect();
+    let siblings: Vec<String> = s
+        .owners
+        .iter()
+        .filter(|(m, o)| launchers.contains(&o.pid) && !launched.contains(m))
+        .map(|(m, _)| m.clone())
+        .collect();
+    if !siblings.is_empty() && !all {
+        bail!(
+            "{n} was started together with {} by one `porch` run, and they stop together; run `porch stop {n} --all`",
+            siblings.join(", ")
+        )
+    }
+    let mut launched = launched;
+    launched.extend(siblings);
     evict_conflicts(&launched, &p, true).await?;
     crate::health::reconcile_quietly();
     for m in &launched {
@@ -2507,7 +2541,21 @@ async fn stop_app(name: &str) -> Result<i32> {
 /// `porch logs NAME`: print (and with --follow, keep printing) a background app's output.
 async fn show_logs(name: &str, follow: bool, lines: Option<usize>) -> Result<i32> {
     let n = normalize(name)?;
-    let path = log_path(&n);
+    let mut path = log_path(&n);
+    if !path.exists() {
+        // A workspace member: its output is in the launch's shared log.
+        if let Ok(owner) = fs::read_to_string(path.with_extension("logref")) {
+            let owner = owner.trim().to_owned();
+            eprintln!(
+                "{}",
+                crate::style::dim(
+                    crate::style::Stream::Stderr,
+                    &format!("{n} shares its output with {owner} (they were started together)")
+                )
+            );
+            path = log_path(&owner);
+        }
+    }
     let text = fs::read_to_string(&path).with_context(|| {
         format!("no log for {n}; logs exist for apps started with `porch run --detach`")
     })?;

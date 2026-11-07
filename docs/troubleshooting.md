@@ -175,9 +175,9 @@ porch trust --system                              # macOS System keychain or the
 
 ### HTTPS on port 443 fails without a terminal
 
-**Cause.** Ports below 1024 need sudo. An unattended start uses cached sudo credentials or fails.
+**Cause.** On this OS, ports below 1024 are reserved for root (Linux by default; macOS and Windows let Porch use 443 without sudo). An unattended start uses cached sudo credentials or fails.
 
-**Fix.** Keep the default port (`porch proxy start --https` serves `https://web.localhost:7462` with no sudo), or run `porch proxy start --https --port 443` once in a terminal.
+**Fix.** Let Porch pick the port: `porch proxy start --https` uses 443 where that needs no sudo and 7462 otherwise (`https://web.localhost:7462`). On Linux, allow low ports once with `echo 'net.ipv4.ip_unprivileged_port_start=80' | sudo tee /etc/sysctl.d/50-porch.conf && sudo sysctl --system`, or run `porch proxy start --https --port 443` in a terminal.
 
 ## Frameworks
 

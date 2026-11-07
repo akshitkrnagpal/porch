@@ -904,8 +904,20 @@ async fn forward(
                     }
                 }
                 if let Some(downstream) = downstream {
+                    // Upgraded sockets outlive their connection task, so they
+                    // count against their own cap for their whole lifetime.
+                    let Ok(permit) = upgrade_slots().clone().try_acquire_owned() else {
+                        return Ok(error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "too_many_websockets",
+                            "Too many open WebSocket connections through Porch",
+                            &host,
+                            html,
+                        ));
+                    };
                     let upstream = hyper::upgrade::on(&mut response);
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Ok((a, b)) = tokio::try_join!(downstream, upstream) {
                             let mut a = TokioIo::new(a);
                             let mut b = TokioIo::new(b);
@@ -963,11 +975,34 @@ async fn forward(
                         }
                     }
                 }
+                // An alias to `http://host/base` serves the backend's `/base` at
+                // the Porch URL's root: drop that prefix from its redirects.
+                let base = target.path().trim_end_matches('/').to_owned();
                 let rewritten = response
                     .headers()
                     .get(header::LOCATION)
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|l| crate::upstream::rewrite_location(l, &origins, &public_origin))
+                    .and_then(|l| {
+                        let absolute = crate::upstream::rewrite_location(l, &origins, &public_origin);
+                        let loc = absolute.clone().unwrap_or_else(|| l.to_owned());
+                        let (prefix, path) = if let Some(p) = loc.strip_prefix(&public_origin) {
+                            (public_origin.as_str(), p)
+                        } else if loc.starts_with('/') && !loc.starts_with("//") {
+                            ("", loc.as_str())
+                        } else {
+                            return absolute;
+                        };
+                        match path.strip_prefix(base.as_str()) {
+                            Some(rest)
+                                if !base.is_empty()
+                                    && (rest.is_empty() || rest.starts_with(['/', '?', '#'])) =>
+                            {
+                                let rest = if rest.starts_with('/') { rest.to_owned() } else { format!("/{rest}") };
+                                Some(format!("{prefix}{rest}"))
+                            }
+                            _ => absolute,
+                        }
+                    })
                     .and_then(|l| header::HeaderValue::from_str(&l).ok());
                 if let Some(v) = rewritten {
                     response.headers_mut().insert(header::LOCATION, v);
@@ -1233,6 +1268,11 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
         None => anyhow::bail!("proxy has no listeners"),
     };
     Ok(())
+}
+/// Open upgraded (WebSocket) connections across all listeners.
+fn upgrade_slots() -> &'static Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)))
 }
 /// Is a launched app on `port` reachable on ::1 but not 127.0.0.1? Probed at
 /// most every two seconds per port.

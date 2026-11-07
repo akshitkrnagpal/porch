@@ -125,8 +125,8 @@ fn definition(n: &str) -> Value {
         "proxy_stop" => &["port"],
         "prune" => &["force"],
         "doctor_fix" => &["yes"],
-        "run" => &["command", "name"],
-        "stop" => &["name"],
+        "run" => &["command", "name", "private", "appPort"],
+        "stop" => &["name", "all"],
         "logs" => &["name", "lines"],
         _ => &[],
     };
@@ -135,6 +135,7 @@ fn definition(n: &str) -> Value {
             "name" | "upstream" => json!({"type":"string","minLength":1}),
             "port" => json!({"type":"integer","minimum":1,"maximum":65535}),
             "lines" => json!({"type":"integer","minimum":1,"maximum":100000}),
+            "appPort" => json!({"type":"integer","minimum":1,"maximum":65535}),
             "command" => json!({"type":"array","minItems":1,"items":{"type":"string"}}),
             "tld" => json!({"type":"array","minItems":1,"items":{"type":"string"}}),
             _ => json!({"type":"boolean"}),
@@ -223,6 +224,12 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
             if let Some(name) = a["name"].as_str() {
                 v.extend(["--name".into(), name.into()]);
             }
+            if a["private"] == true {
+                v.push("--private".into());
+            }
+            if let Some(port) = a["appPort"].as_u64() {
+                v.extend(["--app-port".into(), port.to_string()]);
+            }
             v.push("--".into());
             v.extend(
                 a["command"]
@@ -233,7 +240,13 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
             );
             v
         }
-        "stop" => vec!["stop".into(), a["name"].as_str().unwrap().into()],
+        "stop" => {
+            let mut v = vec!["stop".into(), a["name"].as_str().unwrap().into()];
+            if a["all"] == true {
+                v.push("--all".into());
+            }
+            v
+        }
         "logs" => {
             let mut v = vec!["logs".into(), a["name"].as_str().unwrap().into()];
             if let Some(n) = a["lines"].as_u64() {
@@ -260,7 +273,8 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
         ("insecure", "--insecure"),
         ("https", "--https"),
     ] {
-        if a[key] == true {
+        // `run` places its own flags before the child command's `--`.
+        if a[key] == true && n != "run" {
             argv.push(flag.into());
         }
     }
@@ -289,6 +303,11 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
         .stderr(Stdio::piped())
         .env("NO_COLOR", "1")
         .env("CI", "1")
+        // Read-only tools must not even prune dead routes.
+        .env(
+            "PORCH_READ_ONLY",
+            if READ_ONLY.contains(&n) { "1" } else { "0" },
+        )
         .env_remove("FORCE_COLOR")
         .kill_on_drop(true);
     if let Some(cwd) = a["cwd"].as_str() {
