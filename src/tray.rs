@@ -79,6 +79,9 @@ pub struct Entry {
     /// A second action for this row. macOS swaps the row for this one while
     /// Option is held; elsewhere the row becomes a small submenu of both.
     pub alternate: Option<(String, Action)>,
+    /// A section heading such as "On this device": a dimmed, small bold
+    /// label that names the machine whose apps follow.
+    pub header: bool,
 }
 impl Entry {
     fn text(label: impl Into<String>) -> Self {
@@ -90,6 +93,7 @@ impl Entry {
             separator: false,
             toggle: None,
             alternate: None,
+            header: false,
         }
     }
     fn action(label: impl Into<String>, action: Action, enabled: bool) -> Self {
@@ -101,6 +105,7 @@ impl Entry {
             separator: false,
             toggle: None,
             alternate: None,
+            header: false,
         }
     }
     fn group(label: impl Into<String>, children: Vec<Entry>) -> Self {
@@ -112,6 +117,13 @@ impl Entry {
             separator: false,
             toggle: None,
             alternate: None,
+            header: false,
+        }
+    }
+    fn header(label: impl Into<String>) -> Self {
+        Self {
+            header: true,
+            ..Self::text(label)
         }
     }
     fn separator() -> Self {
@@ -123,6 +135,7 @@ impl Entry {
             separator: true,
             toggle: None,
             alternate: None,
+            header: false,
         }
     }
     /// The header row: "Porch" with a switch that starts or stops the proxy.
@@ -142,6 +155,7 @@ impl Entry {
             separator: false,
             toggle: Some(on),
             alternate: None,
+            header: false,
         }
     }
 }
@@ -257,6 +271,7 @@ fn app_entry(
                 peer: peer_id,
             },
         )),
+        header: false,
     }
 }
 /// A pure model makes enabled states and action routing testable without a display.
@@ -373,6 +388,22 @@ fn light_taskbar() -> bool {
     false
 }
 
+/// A machine's name for a section heading, without the `.local` suffix
+/// Bonjour hostnames carry.
+fn machine_label(name: &str) -> &str {
+    let trimmed = name.trim_end_matches('.');
+    match trimmed.len().checked_sub(".local".len()) {
+        Some(cut)
+            if cut > 0
+                && trimmed.is_char_boundary(cut)
+                && trimmed[cut..].eq_ignore_ascii_case(".local") =>
+        {
+            &trimmed[..cut]
+        }
+        _ => trimmed,
+    }
+}
+
 pub fn menu_model(
     snapshot: Option<&Snapshot>,
     settings: &ProxySettings,
@@ -390,9 +421,10 @@ pub fn menu_model(
     }
     entries.push(Entry::separator());
     if let Some(snapshot) = snapshot {
-        // Apps on this machine first, then one block per paired machine. No
-        // headings: each URL already names its machine.
+        // Apps on this machine first, then one section per paired machine,
+        // each under a heading that names it.
         let running = snapshot.local.proxy_running;
+        entries.push(Entry::header("On this device"));
         if snapshot.local.apps.is_empty() {
             entries.push(Entry::text("No apps yet; run porch in a project"));
         } else if !running {
@@ -408,14 +440,15 @@ pub fn menu_model(
         );
         for peer in snapshot.peers.iter().take(50) {
             entries.push(Entry::separator());
-            let name = &peer.machine.name;
+            entries.push(Entry::header(format!(
+                "On {}",
+                machine_label(&peer.machine.name)
+            )));
             if let Some(error) = &peer.error {
-                entries.push(Entry::text(format!("{name}: unavailable ({error})")));
+                entries.push(Entry::text(format!("Unavailable ({error})")));
             }
             match &peer.catalog {
-                Some(catalog) if catalog.apps.is_empty() => {
-                    entries.push(Entry::text(format!("{name}: no apps")))
-                }
+                Some(catalog) if catalog.apps.is_empty() => entries.push(Entry::text("No apps")),
                 Some(catalog) => entries.extend(
                     catalog
                         .apps
@@ -423,7 +456,7 @@ pub fn menu_model(
                         .take(100)
                         .map(|app| app_entry(app, Some(peer), settings, running)),
                 ),
-                None => entries.push(Entry::text(format!("{name}: reconnect to check"))),
+                None => entries.push(Entry::text("Reconnect to check")),
             }
         }
         if !snapshot.candidates.is_empty() {
@@ -913,7 +946,15 @@ mod native {
                         let _ = alt_label;
                     }
                 } else {
-                    let item = MenuItem::new(&entry.label, entry.enabled, None);
+                    // ⌘Q while the menu is open, as macOS menu bar apps offer.
+                    #[cfg(target_os = "macos")]
+                    let accelerator = (entry.action == Some(Action::Quit)).then(|| {
+                        use tray_icon::menu::accelerator::{Accelerator, Code, Modifiers};
+                        Accelerator::new(Modifiers::META, Code::KeyQ)
+                    });
+                    #[cfg(not(target_os = "macos"))]
+                    let accelerator = None;
+                    let item = MenuItem::new(&entry.label, entry.enabled, accelerator);
                     if let Some(action) = &entry.action {
                         built.actions.insert(item.id().0.clone(), action.clone());
                     }
@@ -933,6 +974,8 @@ mod native {
         {
             mac::attach_switches(menu, entries, offset, &mut built);
             mac::attach_alternates(menu, entries, offset);
+            mac::style_headers(menu, entries, offset);
+            mac::hide_state_column(menu);
         }
         #[cfg(not(target_os = "macos"))]
         let _ = offset;
@@ -943,24 +986,30 @@ mod native {
     mod mac {
         use super::{Built, Entry, Menu};
         use objc2::{
-            define_class, msg_send, rc::Retained, DefinedClass as _, MainThreadMarker,
-            MainThreadOnly,
+            define_class, msg_send, rc::Retained, runtime::AnyObject, sel, AllocAnyThread as _,
+            ClassType as _, DefinedClass as _, MainThreadMarker, MainThreadOnly,
         };
         use objc2_app_kit::{
-            NSAutoresizingMaskOptions, NSControlSize, NSControlStateValueOff,
-            NSControlStateValueOn, NSEvent, NSEventModifierFlags, NSFont, NSMenu,
-            NSProgressIndicator, NSProgressIndicatorStyle, NSResponder, NSSwitch, NSTextField,
-            NSView,
+            NSAutoresizingMaskOptions, NSColor, NSControlSize, NSControlStateValueOff,
+            NSControlStateValueOn, NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName,
+            NSForegroundColorAttributeName, NSMenu, NSMenuItem, NSProgressIndicator,
+            NSProgressIndicatorStyle, NSResponder, NSSwitch, NSTextField, NSView,
         };
         use objc2_foundation::{
-            NSDefaultRunLoopMode, NSObject, NSPoint, NSRect, NSRunLoop, NSSize, NSString,
+            NSAttributedString, NSAttributedStringKey, NSDefaultRunLoopMode, NSDictionary,
+            NSObject, NSPoint, NSRect, NSRunLoop, NSSize, NSString,
         };
         use std::cell::OnceCell;
         use tray_icon::menu::ContextMenu;
 
-        const WIDTH: f64 = 240.0;
-        const HEIGHT: f64 = 32.0;
-        const INSET: f64 = 14.0;
+        // The header row's geometry, after PortlessBar's: 270pt wide (the
+        // menu's minimum width; longer rows still widen it), the title 16pt
+        // from the left edge and the switch 12pt from the right. 34pt tall
+        // leaves the small switch about the padding of a regular row.
+        const WIDTH: f64 = 270.0;
+        const HEIGHT: f64 = 34.0;
+        const INSET: f64 = 16.0;
+        const TRAILING: f64 = 12.0;
         const GAP: f64 = 8.0;
 
         define_class!(
@@ -1042,6 +1091,15 @@ mod native {
             }
         }
 
+        /// Menlo at three points above the menu font, falling back to the
+        /// user's fixed-pitch face.
+        fn wordmark_font() -> Retained<NSFont> {
+            let size = NSFont::menuFontOfSize(0.0).pointSize() + 3.0;
+            NSFont::fontWithName_size(&NSString::from_str("Menlo-Regular"), size)
+                .or_else(|| NSFont::userFixedPitchFontOfSize(size))
+                .unwrap_or_else(|| NSFont::menuFontOfSize(size))
+        }
+
         /// Each top-level entry with the NSMenu index of its row. A row with
         /// an alternate takes two native items.
         fn native_indices(entries: &[Entry], offset: usize) -> Vec<(usize, &Entry)> {
@@ -1080,6 +1138,65 @@ mod native {
             }
         }
 
+        /// Draw section headings as AppKit's own section headers (macOS 14+).
+        /// muda removes items by index, so the native header can take the
+        /// place of muda's placeholder row. Older systems keep the placeholder,
+        /// styled small, bold and dimmed to look the same.
+        pub fn style_headers(menu: &Menu, entries: &[Entry], offset: usize) {
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            // SAFETY: muda owns this NSMenu for the lifetime of `menu`, and we
+            // are on the main thread.
+            let ns_menu = unsafe { &*(menu.ns_menu() as *const NSMenu) };
+            let native = NSMenuItem::class()
+                .metaclass()
+                .responds_to(sel!(sectionHeaderWithTitle:));
+            for (index, entry) in native_indices(entries, offset) {
+                if !entry.header || ns_menu.itemAtIndex(index as isize).is_none() {
+                    continue;
+                }
+                let title = NSString::from_str(&entry.label.replace("&&", "&"));
+                if native {
+                    let header = NSMenuItem::sectionHeaderWithTitle(&title, mtm);
+                    ns_menu.removeItemAtIndex(index as isize);
+                    ns_menu.insertItem_atIndex(&header, index as isize);
+                } else if let Some(item) = ns_menu.itemAtIndex(index as isize) {
+                    item.setAttributedTitle(Some(&fallback_header(&title)));
+                }
+            }
+        }
+
+        /// A section heading's look before macOS 14.
+        fn fallback_header(title: &NSString) -> Retained<NSAttributedString> {
+            let font = NSFont::boldSystemFontOfSize(NSFont::smallSystemFontSize());
+            let color = NSColor::secondaryLabelColor();
+            // SAFETY: AppKit's attribute keys, each paired with the type it
+            // expects.
+            unsafe {
+                let attributes = NSDictionary::<NSAttributedStringKey, AnyObject>::from_slices(
+                    &[NSFontAttributeName, NSForegroundColorAttributeName],
+                    &[font.as_ref(), color.as_ref()],
+                );
+                NSAttributedString::initWithString_attributes(
+                    NSAttributedString::alloc(),
+                    title,
+                    Some(&attributes),
+                )
+            }
+        }
+
+        /// Drop the checkmark column so rows start at the menu's edge
+        /// padding, as in PortlessBar. No row shows a checkmark on macOS.
+        pub fn hide_state_column(menu: &Menu) {
+            if MainThreadMarker::new().is_none() {
+                return;
+            }
+            // SAFETY: as above.
+            let ns_menu = unsafe { &*(menu.ns_menu() as *const NSMenu) };
+            ns_menu.setShowsStateColumn(false);
+        }
+
         pub fn menu_is_open() -> bool {
             let run_loop = NSRunLoop::currentRunLoop();
             run_loop
@@ -1114,11 +1231,12 @@ mod native {
                     unsafe { msg_send![super(view), initWithFrame: frame] };
                 view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
 
+                // A lower-case monospace wordmark, as `porch` is typed.
                 let label = NSTextField::labelWithString(
-                    &NSString::from_str(&entry.label.replace("&&", "&")),
+                    &NSString::from_str(&entry.label.replace("&&", "&").to_lowercase()),
                     mtm,
                 );
-                label.setFont(Some(&NSFont::boldSystemFontOfSize(14.0)));
+                label.setFont(Some(&wordmark_font()));
                 label.sizeToFit();
                 let size = label.frame().size;
                 label.setFrameOrigin(NSPoint::new(INSET, ((HEIGHT - size.height) / 2.0).round()));
@@ -1128,7 +1246,7 @@ mod native {
                 switch.setControlSize(NSControlSize::Small);
                 switch.sizeToFit();
                 let size = switch.frame().size;
-                let switch_x = WIDTH - INSET - size.width;
+                let switch_x = WIDTH - TRAILING - size.width;
                 switch.setFrameOrigin(NSPoint::new(
                     switch_x,
                     ((HEIGHT - size.height) / 2.0).round(),
@@ -1565,11 +1683,34 @@ mod tests {
             vec!["copy", "app-stable-id", "--peer", "peer-stable-id"]
         );
         assert!(remote.enabled);
-        // Machines are told apart by a separator, not a heading.
-        let local_at = entries.iter().position(|e| e == local).unwrap();
-        let remote_at = entries.iter().position(|e| e == remote).unwrap();
-        assert!(entries[local_at..remote_at].iter().any(|e| e.separator));
-        assert!(!entries.iter().any(|e| e.label.contains("This machine")));
+        // Each machine's apps sit under a heading naming it.
+        let at = |entry: &Entry| entries.iter().position(|e| e == entry).unwrap();
+        let this_device = row(&entries, "On this device");
+        let workbench = row(&entries, "On Workbench");
+        assert!(this_device.header && workbench.header);
+        assert!(!this_device.enabled && this_device.action.is_none());
+        assert!(at(this_device) < at(local));
+        assert!(at(local) < at(workbench));
+        assert!(at(workbench) < at(remote));
+        assert!(entries[at(local)..at(workbench)]
+            .iter()
+            .any(|e| e.separator));
+        assert!(!local.header && !remote.header);
+    }
+    #[test]
+    fn peer_headings_drop_the_bonjour_suffix() {
+        assert_eq!(machine_label("Akshits-Mac-mini.local"), "Akshits-Mac-mini");
+        assert_eq!(machine_label("Studio.LOCAL."), "Studio");
+        assert_eq!(machine_label("Workbench"), "Workbench");
+        assert_eq!(machine_label(".local"), ".local");
+        let mut state = snapshot();
+        state.peers[0].machine.name = "Akshits-Mac-mini.local".into();
+        state.peers[0].catalog.as_mut().unwrap().apps.clear();
+        let entries = model(Some(&state), None, None);
+        let heading = row(&entries, "On Akshits-Mac-mini");
+        assert_eq!(heading.label, "On Akshits-Mac-mini");
+        let next = entries.iter().position(|e| e == heading).unwrap() + 1;
+        assert_eq!(entries[next].label, "No apps");
     }
     #[test]
     fn unavailable_remote_app_disables_open_and_copy() {
@@ -1589,8 +1730,9 @@ mod tests {
         state.peers[0].catalog = None;
         state.peers[0].error = Some("timed out".into());
         let entries = model(Some(&state), None, None);
-        row(&entries, "Workbench: unavailable (timed out)");
-        row(&entries, "Workbench: reconnect to check");
+        row(&entries, "On Workbench");
+        row(&entries, "Unavailable (timed out)");
+        row(&entries, "Reconnect to check");
     }
     #[test]
     fn icon_reflects_proxy_and_reachable_peers() {

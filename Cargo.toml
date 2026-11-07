@@ -68,8 +68,8 @@ tao = { version = "0.37", optional = true }
 # Apple-only crates; they fail to compile anywhere else.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 ={ version = "0.6", optional = true }
-objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSGeometry", "NSObject", "NSRunLoop", "NSString"] }
-objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "objc2-core-foundation", "NSCell", "NSControl", "NSFont", "NSMenu", "NSEvent", "NSMenuItem", "NSProgressIndicator", "NSResponder", "NSSwitch", "NSText", "NSTextField", "NSView"] }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSAttributedString", "NSDictionary", "NSGeometry", "NSObject", "NSRunLoop", "NSString"] }
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "objc2-core-foundation", "NSAttributedString", "NSCell", "NSColor", "NSControl", "NSFont", "NSMenu", "NSEvent", "NSMenuItem", "NSProgressIndicator", "NSResponder", "NSSwitch", "NSText", "NSTextField", "NSView"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", optional = true }
