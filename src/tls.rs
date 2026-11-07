@@ -47,23 +47,13 @@ struct LocalResolver {
     /// entries are evicted first).
     cache: Mutex<HashMap<String, (Arc<CertifiedKey>, std::time::Instant)>>,
     settings: crate::state::ProxySettings,
-    route_state: PathBuf,
 }
 impl LocalResolver {
     fn authorize(&self, name: &str) -> Result<()> {
+        // Route names never widen issuance (see allowed_name), so there is no
+        // need to read route state here.
         if !allowed_name(name, &self.settings, &[]) {
-            let routes = match fs::read(&self.route_state) {
-                Ok(bytes) => {
-                    serde_json::from_slice::<crate::state::State>(&bytes)
-                        .context("invalid route state for TLS issuance")?
-                        .routes
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Err(error) => return Err(error.into()),
-            };
-            if !allowed_name(name, &self.settings, &routes) {
-                bail!("TLS name {name:?} is outside Porch's configured domains");
-            }
+            bail!("TLS name {name:?} is outside Porch's configured domains");
         }
         Ok(())
     }
@@ -196,10 +186,19 @@ const RESERVED: [&str; 5] = ["localhost", "local", "test", "internal", "home.arp
 /// allowed to sign all of `.com` could impersonate real sites.
 pub fn signable_domain(tld: &str) -> bool {
     let t = tld.trim_start_matches('.').to_ascii_lowercase();
-    RESERVED
+    if RESERVED
         .iter()
         .any(|r| t == *r || t.ends_with(&format!(".{r}")))
-        || t.contains('.')
+    {
+        return true;
+    }
+    // Anything else must sit inside a registrable domain (a name someone can
+    // own, such as example.com or example.co.uk), never be a public suffix
+    // itself (com, co.uk, github.io) per the Public Suffix List.
+    match (psl::suffix(t.as_bytes()), psl::domain(t.as_bytes())) {
+        (Some(suffix), Some(_)) => suffix.as_bytes() != t.as_bytes(),
+        _ => false,
+    }
 }
 fn ca_permitted(settings: &crate::state::ProxySettings) -> Vec<String> {
     let mut out: Vec<String> = RESERVED.into_iter().map(str::to_owned).collect();
@@ -341,7 +340,6 @@ fn config_in_dir(
                 ca_key: fs::read_to_string(key_path)?,
                 cache: Mutex::new(HashMap::new()),
                 settings: settings.clone(),
-                route_state: dir.join("state.json"),
             };
             resolver.issue("localhost").context("Invalid local CA")?;
             // There are no persisted leaf certificates: profile v2 takes effect on
@@ -376,8 +374,6 @@ mod tests {
             ca_key: key.serialize_pem(),
             cache: Mutex::new(HashMap::new()),
             settings: crate::state::ProxySettings::default(),
-            route_state: std::env::temp_dir()
-                .join(format!("porch-no-route-state-{}", std::process::id())),
         };
         assert!(resolver.issue("app.localhost").is_ok());
         assert!(resolver.issue("*.example.test").is_err());
@@ -392,8 +388,6 @@ mod tests {
             ca_key: key.serialize_pem(),
             cache: Mutex::new(HashMap::new()),
             settings: crate::state::ProxySettings::default(),
-            route_state: std::env::temp_dir()
-                .join(format!("porch-no-route-state-{}", std::process::id())),
         }
     }
     #[test]
@@ -501,6 +495,18 @@ mod tests {
             ..Default::default()
         };
         assert!(!ca_permitted(&risky).contains(&"com".to_owned()));
+        for public in ["co.uk", "github.io", "com.au", "dev", "app"] {
+            assert!(!signable_domain(public), "{public}");
+        }
+        for owned in [
+            "example.co.uk",
+            "local.example.com",
+            "me.github.io",
+            "test",
+            "a.test",
+        ] {
+            assert!(signable_domain(owned), "{owned}");
+        }
         assert!(ca_permitted(&risky).contains(&"dev.example.com".to_owned()));
         assert!(!allowed_name("github.com", &risky, &[]));
         assert!(allowed_name("web.dev.example.com", &risky, &[]));
@@ -544,16 +550,7 @@ mod tests {
     }
     #[tokio::test]
     async fn tls_policy_foreign_sni_handshake_rejected() {
-        let mut resolver = test_resolver();
-        let path = std::env::temp_dir().join(format!(
-            "porch-tls-handshake-{}-{}.json",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        resolver.route_state = path.clone();
+        let resolver = test_resolver();
         let mut roots = rustls::RootCertStore::empty();
         for cert in crate::pem::certs(&mut BufReader::new(resolver.ca_pem.as_bytes())) {
             roots.add(cert.unwrap()).unwrap();
@@ -594,25 +591,8 @@ mod tests {
             "configured local name must complete TLS"
         );
         assert_eq!(handshake("www.google.com").await, (false, false));
-        fs::write(
-            &path,
-            serde_json::to_vec(&crate::state::State {
-                routes: vec![crate::state::Route {
-                    name: "registered.example.com".into(),
-                    target: "http://127.0.0.1:3000".into(),
-                    pid: None,
-                }],
-                ..Default::default()
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            handshake("registered.example.com").await,
-            (false, false),
-            "a route named like a real domain must not get a certificate for it"
-        );
-        fs::remove_file(path).unwrap();
+        // A route named like a real domain doesn't get a certificate for it.
+        assert_eq!(handshake("registered.example.com").await, (false, false));
     }
     #[test]
     fn rejects_invalid_pem() {

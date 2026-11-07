@@ -2631,6 +2631,16 @@ async fn doctor() -> Result<()> {
         }
     }
     if foreign {
+    } else if stopped == 2
+        && state
+            .routes
+            .iter()
+            .any(|r| r.pid.is_some() && crate::state::route_alive(&state, r))
+    {
+        bad(
+            "stopped",
+            "apps are running but their URLs won't answer until the proxy starts; run `porch proxy start`",
+        );
     } else if stopped == 2 {
         info(
             "stopped",

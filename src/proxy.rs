@@ -728,14 +728,17 @@ async fn forward(
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or("/");
-    let target_authority = if target.scheme_str() == Some("http")
-        && target
-            .host()
-            .is_some_and(|h| matches!(h, "127.0.0.1" | "[::1]" | "::1"))
-    {
-        format!("localhost:{}", target.port_u16().unwrap_or(80))
-    } else {
-        target.authority().unwrap().to_string()
+    // Dial the address the route records. Only for an app Porch launched on
+    // 127.0.0.1 that turned out to listen on ::1 alone does the proxy use ::1
+    // (an alias never moves: another user could be listening there).
+    let launched = route.is_some_and(|r| r.pid.is_some());
+    let target_authority = match (target.host(), target.port_u16()) {
+        (Some("127.0.0.1"), Some(port))
+            if launched && target.scheme_str() == Some("http") && ipv6_only(port) =>
+        {
+            format!("[::1]:{port}")
+        }
+        _ => target.authority().unwrap().to_string(),
     };
     let uri = format!(
         "{}://{}{}{}",
@@ -1230,6 +1233,30 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
         None => anyhow::bail!("proxy has no listeners"),
     };
     Ok(())
+}
+/// Is a launched app on `port` reachable on ::1 but not 127.0.0.1? Probed at
+/// most every two seconds per port.
+fn ipv6_only(port: u16) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static SEEN: Mutex<Option<HashMap<u16, (bool, Instant)>>> = Mutex::new(None);
+    if let Ok(mut seen) = SEEN.lock() {
+        if let Some((v6, at)) = seen.get_or_insert_with(HashMap::new).get(&port) {
+            if at.elapsed() < Duration::from_secs(2) {
+                return *v6;
+            }
+        }
+    }
+    let v6 = crate::ports::accepts_ipv6_only(port);
+    if let Ok(mut seen) = SEEN.lock() {
+        let map = seen.get_or_insert_with(HashMap::new);
+        if map.len() > 4096 {
+            map.clear();
+        }
+        map.insert(port, (v6, Instant::now()));
+    }
+    v6
 }
 /// Did the upstream TLS handshake fail on the backend's certificate?
 fn certificate_error(e: &(dyn std::error::Error + 'static)) -> bool {

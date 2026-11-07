@@ -338,6 +338,33 @@ enum Commands {
     #[command(external_subcommand)]
     Named(Vec<String>),
 }
+/// A subcommand within two edits of `word`, if any.
+fn closest_subcommand(word: &str) -> Option<String> {
+    fn distance(a: &str, b: &str) -> usize {
+        let b: Vec<char> = b.chars().collect();
+        let mut prev: Vec<usize> = (0..=b.len()).collect();
+        for (i, ca) in a.chars().enumerate() {
+            let mut cur = vec![i + 1];
+            for (j, cb) in b.iter().enumerate() {
+                cur.push(
+                    (prev[j] + usize::from(ca != *cb))
+                        .min(prev[j + 1] + 1)
+                        .min(cur[j] + 1),
+                );
+            }
+            prev = cur;
+        }
+        prev[b.len()]
+    }
+    Cli::command()
+        .get_subcommands()
+        .map(|c| c.get_name().to_owned())
+        .filter(|n| n != word)
+        .map(|n| (distance(word, &n), n))
+        .filter(|(d, n)| *d <= 2 && *d < n.len().min(word.len()))
+        .min()
+        .map(|(_, n)| n)
+}
 /// The CLI definition, for tests that keep other surfaces (MCP) in sync.
 #[cfg(test)]
 pub(crate) fn command() -> clap::Command {
@@ -435,6 +462,24 @@ pub async fn run() -> Result<i32> {
         Some(Commands::SelfUpdate(a)) => return crate::update::run(a).await,
         Some(Commands::Named(mut args)) => {
             let name = args.remove(0);
+            // `porch lsit` is far more likely a typo than an app named lsit
+            // with no command.
+            // Likewise `porch stpo demo`, when `demo` isn't a program at all.
+            let runnable = |program: &str| {
+                program.contains(['/', '\\'])
+                    || std::env::var_os("PATH").is_some_and(|path| {
+                        std::env::split_paths(&path).any(|dir| {
+                            dir.join(program).is_file()
+                                || (cfg!(windows) && dir.join(format!("{program}.exe")).is_file())
+                        })
+                    })
+                    || program.starts_with('-')
+            };
+            if args.is_empty() || !runnable(&args[0]) {
+                if let Some(close) = closest_subcommand(&name) {
+                    bail!("unknown command `{name}`; did you mean `porch {close}`? (To run an app named {name}, give its command: `porch {name} <command>`.)")
+                }
+            }
             let a = App::parse_from(std::iter::once("porch".into()).chain(args));
             if let Some(d) = &a.state_dir {
                 std::env::set_var("PORCH_STATE_DIR", d)
@@ -719,22 +764,31 @@ fn tlds(values: &[String]) -> Result<Vec<String>> {
     }
     Ok(out)
 }
-/// Why a TLD is a poor choice for local apps, if it is (same list as Portless).
+/// Why a TLD is a poor choice for local apps, if it is (Portless's list, plus
+/// any public suffix such as co.uk or github.io).
 fn risky_tld(tld: &str) -> Option<&'static str> {
     let reason = |t: &str| {
         match t {
         "local" => Some("conflicts with mDNS/Bonjour on macOS (use --lan for .local names)"),
-        "dev" | "app" => Some("is Google-owned and browsers force HTTPS on it (HSTS preload); Porch won't sign certificates for it"),
-        "com" | "org" | "net" | "io" | "edu" | "gov" | "mil" | "int" => Some("is a public TLD: lookups leak to the internet, and Porch won't sign certificates for it"),
+        "dev" | "app" => Some("is Google-owned and browsers force HTTPS on it (HSTS preload)"),
+        "com" | "org" | "net" | "io" | "edu" | "gov" | "mil" | "int" => {
+            Some("is a public TLD: lookups leak to the internet, and Porch won't sign certificates for it")
+        }
         _ => None,
     }
     };
-    reason(tld).or_else(|| {
-        ["dev", "app"]
-            .iter()
-            .find(|r| tld.ends_with(&format!(".{r}")))
-            .and_then(|r| reason(r))
-    })
+    reason(tld)
+        .or_else(|| {
+            ["dev", "app"]
+                .iter()
+                .find(|r| tld.ends_with(&format!(".{r}")))
+                .and_then(|r| reason(r))
+        })
+        .or_else(|| {
+            (!crate::tls::signable_domain(tld)).then_some(
+                "is a public suffix that many unrelated sites share; Porch won't sign certificates for it",
+            )
+        })
 }
 /// Did the caller choose the proxy port (flag or PORCH_PORT)? Explicit ports never move.
 pub(crate) fn port_explicit(o: &ProxyOptions) -> bool {
@@ -1634,10 +1688,24 @@ async fn alias(
         if p == 0 {
             bail!("port must be nonzero")
         }
-        format!("http://127.0.0.1:{p}")
+        // `localhost`, like any client: reaches a server on 127.0.0.1 or ::1
+        // (newer Node binds `localhost` to ::1 only).
+        format!("http://localhost:{p}")
     } else if !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()) {
         bail!("port {target} is out of range; use 1-65535")
     } else {
+        // `127.0.0.1:5931` or `localhost:3000` mean plain HTTP there.
+        let with_scheme;
+        let target = if !target.contains("://")
+            && target
+                .rsplit_once(':')
+                .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok())
+        {
+            with_scheme = format!("http://{target}");
+            with_scheme.as_str()
+        } else {
+            target
+        };
         let u = url::Url::parse(target).with_context(|| {
             format!("target {target:?} must be a port (3000) or a URL (http://127.0.0.1:3000)")
         })?;

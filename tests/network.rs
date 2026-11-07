@@ -528,7 +528,8 @@ with context.wrap_socket(socket.create_connection(('127.0.0.1',int(sys.argv[2]))
     porch::state::mutate(|s| {
         s.routes.push(Route {
             name: "v6".into(),
-            target: format!("http://127.0.0.1:{v6port}"),
+            // What `porch alias v6 PORT` stores: localhost reaches ::1 too.
+            target: format!("http://localhost:{v6port}"),
             pid: None,
         })
     })

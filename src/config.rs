@@ -956,7 +956,12 @@ pub fn launch_plans(
                 Some(s) => format!("; try `porch --script {s}`"),
                 None => String::new(),
             };
-            if scripts.is_empty() {
+            if !cwd.join("package.json").is_file() {
+                format!(
+                    "{} has no package.json; give a command to run, e.g. `porch run python3 app.py`, or see `porch --help`",
+                    cwd.display()
+                )
+            } else if scripts.is_empty() {
                 format!(
                     "no \"{script}\" script in {}/package.json; give a command instead, e.g. `porch run node server.js`",
                     cwd.display()

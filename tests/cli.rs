@@ -122,7 +122,7 @@ fn aliases_public_urls_scoping_force_and_json() {
     assert!(!s.run(&["alias", "api.demo", "43122"]).status.success());
     s.ok(&["alias", "api.demo", "43122", "--force"]);
     let v: serde_json::Value = serde_json::from_str(&s.ok(&["list", "--json"])).unwrap();
-    assert_eq!(v["routes"][0]["target"], "http://127.0.0.1:43122");
+    assert_eq!(v["routes"][0]["target"], "http://localhost:43122");
     assert!(s.ok(&["list"]).contains("api.demo.localhost"));
     s.ok(&["alias", "--remove", "api.demo"]);
     assert_eq!(s.state()["routes"].as_array().unwrap().len(), 0);
