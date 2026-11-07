@@ -82,14 +82,14 @@ fn catalog_keeps_identity_stable_and_reports_local_only_routes_without_leaking_t
         ..Default::default()
     };
     write(&dir, "state.json", &serde_json::to_vec(&data).unwrap()).unwrap();
-    let local = catalog(&dir, m.clone(), false).unwrap();
+    let local = catalog(&dir, m.clone(), false, true).unwrap();
     assert!(!local.apps[0].remote_access);
     assert!(local.apps[0]
         .unavailable_reason
         .as_ref()
         .unwrap()
         .contains("Local only"));
-    let remote = catalog(&dir, m, true).unwrap();
+    let remote = catalog(&dir, m, true, true).unwrap();
     assert!(remote.apps[0].remote_access);
     assert_eq!(local.apps[0].id, remote.apps[0].id);
     // Only the apps can carry a route's target. The whole catalog also holds
@@ -119,9 +119,21 @@ fn private_routes_and_remote_targets_are_never_offered_to_peers() {
         ..Default::default()
     };
     write(&dir, "state.json", &serde_json::to_vec(&data).unwrap()).unwrap();
-    let apps = catalog(&dir, m, true).unwrap().apps;
+    let apps = catalog(&dir, m, true, true).unwrap().apps;
     let names: Vec<_> = apps.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(names, ["web", "router", "metadata"]);
+    // The local catalog (tray, `porch open`) still lists the private app, but
+    // never as remotely reachable.
+    let local = catalog(&dir, machine(&dir).unwrap(), true, false)
+        .unwrap()
+        .apps;
+    let secret = local.iter().find(|a| a.name == "secret").unwrap();
+    assert!(!secret.remote_access);
+    assert!(secret
+        .unavailable_reason
+        .as_ref()
+        .unwrap()
+        .contains("Private"));
     assert!(apps[0].remote_access);
     for app in &apps[1..] {
         assert!(!app.remote_access, "{}", app.name);
@@ -152,7 +164,7 @@ fn catalog_health_matches_porch_list() {
         ..Default::default()
     };
     write(&dir, "state.json", &serde_json::to_vec(&data).unwrap()).unwrap();
-    let apps = catalog(&dir, m, true).unwrap().apps;
+    let apps = catalog(&dir, m, true, true).unwrap().apps;
     // A listening app is healthy, not "status unknown" in the menu.
     assert_eq!(apps[0].health, Health::Healthy);
     assert_eq!(apps[1].health, Health::Unreachable);

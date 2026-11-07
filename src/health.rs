@@ -197,6 +197,12 @@ fn now() -> u64 {
 /// Remove dead routes whose processes are gone, remember when routes were first
 /// seen stopped, and return the health of every remaining route.
 pub fn reconcile() -> Result<(Vec<String>, Vec<RouteHealth>)> {
+    reconcile_with(true)
+}
+
+/// Like [`reconcile`], but with `apply: false` nothing is written: the dead
+/// routes that would be removed are returned instead (for `porch doctor`).
+pub fn reconcile_with(apply: bool) -> Result<(Vec<String>, Vec<RouteHealth>)> {
     let procs = processes();
     let snapshot = state::load()?;
     let mut removable = Vec::new();
@@ -220,7 +226,9 @@ pub fn reconcile() -> Result<(Vec<String>, Vec<RouteHealth>)> {
         since.entry(n.clone()).or_insert_with(now);
     }
     let mut removed = Vec::new();
-    if !removable.is_empty() || since != snapshot.stopped_since {
+    if !apply {
+        removed = removable.into_iter().map(|(n, _)| n).collect();
+    } else if !removable.is_empty() || since != snapshot.stopped_since {
         state::transaction(|s| {
             for (name, pid) in &removable {
                 // Only remove the exact registration we judged dead.

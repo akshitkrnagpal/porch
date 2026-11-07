@@ -105,12 +105,17 @@ pub async fn run(fix: bool, yes: bool) -> Result<usize> {
     }
 
     // Routes: dead ones are pruned automatically; stopped/orphaned need consent.
-    let (removed, rows) = crate::health::reconcile()?;
+    // Without --fix, doctor only reports: it never edits state.
+    let (removed, rows) = crate::health::reconcile_with(fix)?;
     for name in removed {
-        report.fixed(
-            format!("route {name}: its process exited"),
-            "removed the stale route",
-        );
+        if fix {
+            report.fixed(
+                format!("route {name}: its process exited"),
+                "removed the stale route",
+            );
+        } else {
+            report.issue(format!("route {name}: its process exited"), report.hint());
+        }
     }
     let mut stopped = Vec::new();
     let mut orphaned = Vec::new();

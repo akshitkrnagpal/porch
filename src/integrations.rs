@@ -766,6 +766,82 @@ fn trust_record() -> Result<Option<TrustRecord>> {
         Err(e) => Err(e.into()),
     }
 }
+/// What the trust stores actually say about the current local CA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaTrust {
+    /// No CA has been created yet.
+    NoCa,
+    /// Trusted, in this scope (`user` or `system`), checked in the store itself.
+    Trusted(String),
+    /// Porch never installed trust for this CA.
+    NotInstalled,
+    /// The recorded trust is for a different (older) CA.
+    Stale,
+    /// The record says installed, but the store no longer has it.
+    Removed,
+    /// The store couldn't be checked (tool missing); the record says `scope`.
+    Unverified(String),
+}
+/// Check the current CA against both Porch's record and the real trust store.
+pub fn ca_trust() -> CaTrust {
+    let ca = crate::state::dir().join("ca.pem");
+    let Ok(fingerprint) = ca_fingerprint(&ca) else {
+        return CaTrust::NoCa;
+    };
+    let Ok(Some(record)) = trust_record() else {
+        return CaTrust::NotInstalled;
+    };
+    if record.fingerprint != fingerprint {
+        return CaTrust::Stale;
+    }
+    let ca_arg = ca.to_string_lossy().into_owned();
+    let present: Option<bool> = match (record.platform.as_str(), record.scope.as_str()) {
+        ("macos", _) => {
+            // Evaluates the CA against the user's and system trust settings.
+            Command::new("security")
+                .args(["verify-cert", "-c", &ca_arg, "-p", "basic", "-L", "-q"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()
+                .map(|s| s.success())
+        }
+        ("linux", "user") => {
+            let name = nss_name(&fingerprint);
+            let mut all = Some(true);
+            for db in &record.nss_dbs {
+                let sql = format!("sql:{}", db.display());
+                match exec("certutil", &["-L", "-d", &sql]) {
+                    Ok(listing) if !nss_listing_has(&listing, &name) => all = Some(false),
+                    Ok(_) => {}
+                    Err(_) => {
+                        all = all.and(None);
+                    }
+                }
+            }
+            all
+        }
+        (_, "system") if record.installed.is_some() => {
+            let installed = record.installed.as_ref().unwrap();
+            Some(
+                fs::read(installed)
+                    .ok()
+                    .zip(fs::read(&ca).ok())
+                    .is_some_and(|(a, b)| a == b),
+            )
+        }
+        ("windows", _) => exec("certutil", &["-user", "-verifystore", "Root", &fingerprint])
+            .map(|_| true)
+            .ok(),
+        _ => None,
+    };
+    match present {
+        Some(true) => CaTrust::Trusted(record.scope),
+        Some(false) => CaTrust::Removed,
+        None => CaTrust::Unverified(record.scope),
+    }
+}
 /// Scope of the recorded CA trust (`user` or `system`), if any.
 pub fn trust_scope() -> Option<String> {
     trust_record().ok().flatten().map(|r| r.scope)
@@ -2587,20 +2663,41 @@ async fn doctor() -> Result<()> {
         }
     }
     section("HTTPS");
-    let ca = crate::state::dir().join("ca.pem").is_file();
-    let trust = trust_scope();
-    match (settings.tls, ca, trust.as_deref()) {
-        (false, _, _) => info(
+    if !settings.tls {
+        info(
             "off",
             "turn it on with `porch setup` or `porch proxy start --https`",
-        ),
-        (true, false, _) => bad(
-            "local CA",
-            "missing; it is created when the proxy starts with --https",
-        ),
-        (true, true, Some("user")) => good("local CA", "trusted for this user"),
-        (true, true, Some(_)) => good("local CA", "trusted system-wide"),
-        (true, true, None) => bad("local CA", "not trusted yet; run `porch trust`"),
+        );
+    } else if settings.cert.is_some() {
+        info("your certificate", "using --cert/--key; trust is up to you");
+    } else {
+        match ca_trust() {
+            CaTrust::NoCa => bad(
+                "local CA",
+                "missing; it is created when the proxy starts with --https",
+            ),
+            CaTrust::Trusted(scope) => good(
+                "local CA",
+                if scope == "user" {
+                    "trusted for this user (checked in the trust store)"
+                } else {
+                    "trusted system-wide (checked in the trust store)"
+                },
+            ),
+            CaTrust::Unverified(_) => info(
+                "local CA",
+                "trust was installed, but the trust store couldn't be checked here",
+            ),
+            CaTrust::NotInstalled => bad("local CA", "not trusted yet; run `porch trust`"),
+            CaTrust::Stale => bad(
+                "local CA",
+                "the trusted CA is an older one; run `porch trust` to trust the current CA",
+            ),
+            CaTrust::Removed => bad(
+                "local CA",
+                "its trust was removed from the trust store; run `porch trust` again",
+            ),
+        }
     }
     section("Tools");
     for (tool, flag, why) in [

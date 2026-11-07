@@ -1216,7 +1216,10 @@ async fn trust_if_needed(s: &ProxySettings, skip: bool) -> Result<()> {
         && s.cert.is_none()
         && !skip
         && enabled("SKIP_TRUST") != Some(true)
-        && !state::dir().join("trust.json").exists()
+        && !matches!(
+            crate::integrations::ca_trust(),
+            crate::integrations::CaTrust::Trusted(_) | crate::integrations::CaTrust::Unverified(_)
+        )
     {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() || std::env::var_os("CI").is_some() {
@@ -1551,7 +1554,11 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
         if !["http", "https"].contains(&u.scheme()) || u.host_str().is_none() {
             bail!("target must be an HTTP URL or TCP port")
         }
-        target.to_owned()
+        if !u.username().is_empty() || u.password().is_some() {
+            bail!("target {target:?} can't contain credentials; put them in your app's config instead")
+        }
+        // Store the normalized, percent-encoded form so the proxy can always parse it.
+        u.as_str().trim_end_matches('/').to_owned()
     };
     let names = alias_names(name, selected)?;
     let p = state::proxy_settings()?;
@@ -1569,6 +1576,7 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
         let incoming: Vec<_> = names.iter().flat_map(|n| route_hostnames(n, &p)).collect();
         for n in conflicts {
             let old = s.routes.iter().find(|r| r.name == n).cloned();
+            let was_private = s.private.contains(&n);
             state::remove_route(s, &n);
             if !selected.is_empty() {
                 if let Some(old) = old.filter(|r| r.pid.is_none()) {
@@ -1576,6 +1584,9 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
                         .into_iter()
                         .filter(|h| !incoming.contains(h))
                     {
+                        if was_private {
+                            s.private.insert(host.clone());
+                        }
                         s.routes.push(Route {
                             name: host,
                             target: old.target.clone(),
@@ -1623,11 +1634,15 @@ fn remove_alias(name: &str, selected: &[String]) -> Result<()> {
             bail!("no matching static alias found for {name}")
         }
         for r in old {
+            let was_private = s.private.contains(&r.name);
             state::remove_route(s, &r.name);
             for host in route_hostnames(&r.name, &p)
                 .into_iter()
                 .filter(|h| !removing.contains(h))
             {
+                if was_private {
+                    s.private.insert(host.clone());
+                }
                 s.routes.push(Route {
                     name: host,
                     target: r.target.clone(),

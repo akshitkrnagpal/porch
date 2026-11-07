@@ -751,3 +751,51 @@ fn bare_domain_serves_a_dashboard_and_app_list() {
     });
     drop(up);
 }
+
+#[test]
+fn private_survives_partial_alias_edits_and_urls_are_stored_canonically() {
+    let s = Sandbox::new();
+    std::fs::create_dir_all(s.root.join("state")).unwrap();
+    std::fs::write(
+        s.root.join("state/proxy.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "port": s.port, "tls": false, "tlds": ["localhost", "test"], "unprivileged": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    s.ok(&["alias", "hidden", "3000", "--private"]);
+    s.ok(&["remove", "hidden", "--tld", "test"]);
+    let state = s.state();
+    let private: Vec<_> = state["private"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    let routes: Vec<_> = state["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(routes, ["hidden.localhost"]);
+    assert_eq!(private, ["hidden.localhost"]);
+    // Scoped replacement keeps the untouched domain private too.
+    s.ok(&["alias", "both", "3001", "--private"]);
+    s.ok(&["alias", "both", "3002", "--tld", "test", "--force"]);
+    let state = s.state();
+    let private = state["private"].to_string();
+    assert!(private.contains("both.localhost"), "{state}");
+    // URLs are stored percent-encoded, credentials refused.
+    s.ok(&["alias", "spaced", "http://127.0.0.1:3003/hello world"]);
+    assert!(s
+        .state()
+        .to_string()
+        .contains("http://127.0.0.1:3003/hello%20world"));
+    assert!(!s
+        .run(&["alias", "creds", "http://u:p@127.0.0.1:3004"])
+        .status
+        .success());
+}

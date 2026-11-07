@@ -803,7 +803,9 @@ fn route_url(settings: &ProxySettings, name: &str) -> String {
         format!("{url}/{path}")
     }
 }
-fn catalog(dir: &Path, machine: Machine, share: bool) -> Result<Catalog> {
+/// The app catalog. `for_peer` is the copy sent to paired machines, which
+/// never mentions private apps; the local copy (tray, `porch open`) keeps them.
+fn catalog(dir: &Path, machine: Machine, share: bool, for_peer: bool) -> Result<Catalog> {
     let data: State = read(&dir.join("state.json"))?.unwrap_or_default();
     let settings: ProxySettings = read(&dir.join("proxy.json"))?.unwrap_or_default();
     let proxy_running = running(dir);
@@ -811,12 +813,13 @@ fn catalog(dir: &Path, machine: Machine, share: bool) -> Result<Catalog> {
     let apps = data
         .routes
         .iter()
-        .filter(|route| !data.private.contains(&route.name))
+        .filter(|route| !(for_peer && data.private.contains(&route.name)))
         .take(MAX_ROUTES)
         .map(|route| {
             let alive = state::route_alive(&data, route);
             let supported = route_target(route).is_ok();
-            let remote_access = share && alive && supported;
+            let private = data.private.contains(&route.name);
+            let remote_access = share && alive && supported && !private;
             App {
                 id: route_id(&machine, &route.name),
                 name: route.name.clone(),
@@ -830,7 +833,9 @@ fn catalog(dir: &Path, machine: Machine, share: bool) -> Result<Catalog> {
                     }
                 },
                 remote_access,
-                unavailable_reason: if !alive {
+                unavailable_reason: if private {
+                    Some("Private to this machine (--private)".into())
+                } else if !alive {
                     Some("App process is stopped".into())
                 } else if !share {
                     Some("Local only; remote app transport is disabled on this machine".into())
@@ -859,6 +864,7 @@ pub fn local_catalog() -> Result<Catalog> {
         &dir,
         machine(&dir)?,
         config()?.is_some_and(|c| c.share_apps),
+        false,
     )
 }
 fn response(status: StatusCode, message: impl Into<Bytes>) -> Response<Body> {
@@ -1286,6 +1292,7 @@ async fn request(
             &context.dir,
             context.machine.clone(),
             context.sharing(),
+            true,
         )?));
     }
     if req.uri().path() == "/v1/unpair" && req.method() == Method::POST {
@@ -1370,6 +1377,10 @@ async fn request(
     let origin = req.headers_mut().remove("x-porch-app-origin");
     let auth = req.headers_mut().remove("x-porch-app-authorization");
     let original_host = req.headers_mut().remove("x-porch-app-host");
+    let original_proto = req
+        .headers_mut()
+        .remove("x-porch-app-proto")
+        .filter(|v| v == "https" || v == "http");
     strip(req.headers_mut());
     req.headers_mut().remove(header::AUTHORIZATION);
     // Never let a bearer or arbitrary internal control header reach a development app.
@@ -1395,9 +1406,11 @@ async fn request(
     let host = url::Url::parse(&host)?;
     let host = &host[url::Position::BeforeHost..url::Position::AfterPort];
     req.headers_mut().insert(header::HOST, host.parse()?);
+    // The scheme the browser used on the paired machine, so apps build
+    // correct redirects and secure cookies.
     req.headers_mut().insert(
         "x-forwarded-proto",
-        header::HeaderValue::from_static("http"),
+        original_proto.unwrap_or(header::HeaderValue::from_static("http")),
     );
     if websocket {
         req.headers_mut().insert(
