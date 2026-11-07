@@ -14,6 +14,9 @@ The executable is `porch`. Configuration lives in `porch.json` or the `porch` ke
 | `porch --name NAME COMMAND...` | Same, for names that clash with a subcommand |
 | `porch NAME --app-port 4500 -- COMMAND...` | Uses a fixed app port; `--` ends Porch's options |
 | `porch NAME --force COMMAND...` | Takes over an existing route and stops the app that owned it |
+| `porch run --detach COMMAND...` (`-d`) | Runs in the background: returns once the app answers and prints its URL. Output goes to `STATE_DIR/logs/NAME.log` |
+| `porch logs NAME [--follow] [--lines N]` | Shows a background app's output |
+| `porch stop NAME` | Stops an app Porch started, here or in another terminal, with its whole process tree |
 | `porch setup [--yes] [--port N] [--https\|--no-https]` | Guided first run; safe to repeat, and current values are the defaults |
 | `porch doctor [--fix] [--yes]` | Diagnoses problems; `--fix` applies the safe fixes |
 

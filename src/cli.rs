@@ -73,6 +73,10 @@ struct RunOptions {
     /// Keep this app off paired machines, even when sharing is on
     #[arg(long)]
     private: bool,
+    /// Run in the background: print the URL once the app answers, then return.
+    /// Output goes to `porch logs NAME`; stop it with `porch stop NAME`
+    #[arg(long, short = 'd')]
+    detach: bool,
 }
 #[derive(Parser, Debug)]
 struct App {
@@ -238,6 +242,22 @@ enum Commands {
         #[arg(long, requires = "upstream")]
         insecure: bool,
     },
+    /// Stop an app Porch started (in this or another terminal, or with --detach)
+    Stop {
+        /// App name
+        name: String,
+    },
+    /// Show the output of an app started with `porch run --detach`
+    Logs {
+        /// App name
+        name: String,
+        /// Keep printing new output
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Show only the last N lines
+        #[arg(long, short = 'n', value_name = "N")]
+        lines: Option<usize>,
+    },
     /// Remove an alias
     #[command(alias = "rm")]
     Remove {
@@ -344,6 +364,7 @@ fn merge(mut a: RunOptions, b: RunOptions) -> RunOptions {
     a.cloudflare |= b.cloudflare;
     a.lan |= b.lan;
     a.private |= b.private;
+    a.detach |= b.detach;
     a
 }
 pub async fn run() -> Result<i32> {
@@ -498,6 +519,12 @@ pub async fn run() -> Result<i32> {
             }
             sync_hosts().await;
         }
+        Some(Commands::Stop { name }) => return stop_app(&name).await,
+        Some(Commands::Logs {
+            name,
+            follow,
+            lines,
+        }) => return show_logs(&name, follow, lines).await,
         Some(Commands::Remove { name, tld }) => {
             remove_alias(&name, &tld)?;
             sync_hosts().await;
@@ -2211,11 +2238,172 @@ async fn spawn_prepared(
 async fn launch(options: RunOptions, command: Vec<String>) -> Result<i32> {
     launch_extra(options, command, vec![]).await
 }
+fn log_path(name: &str) -> PathBuf {
+    state::dir().join("logs").join(format!("{name}.log"))
+}
+/// `porch run --detach`: start this same command as a background launcher
+/// writing to a log, wait until its app answers, print the URL and return.
+async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
+    let cwd = std::env::current_dir()?;
+    let plans = crate::config::launch_plans(
+        &cwd,
+        (!command.is_empty()).then(|| command.to_vec()),
+        options.name.as_deref(),
+        options.script.as_deref(),
+        options.prefix.as_deref(),
+    )?;
+    let names: Vec<String> = plans
+        .iter()
+        .filter(|p| p.proxy)
+        .map(|p| p.name.clone())
+        .collect();
+    let log_name = names.first().cloned().unwrap_or_else(|| "workspace".into());
+    let log = log_path(&log_name);
+    state::load()?;
+    fs::create_dir_all(log.parent().unwrap())?;
+    let out = fs::File::create(&log)?;
+    let mut child = Command::new(std::env::current_exe()?);
+    child
+        .args(std::env::args_os().skip(1))
+        .env("PORCH_DETACHED", "1")
+        .stdin(Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(out);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own session: closing this terminal doesn't stop the app.
+        unsafe {
+            child.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        child.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    let mut child = child.spawn().context("starting the background launcher")?;
+    let settings = resolve_settings(&ProxyOptions::default())?;
+    let timeout = crate::health::listen_timeout().max(Duration::from_secs(5));
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let tail = fs::read_to_string(&log).unwrap_or_default();
+            let tail: Vec<_> = tail.lines().rev().take(20).collect();
+            for line in tail.into_iter().rev() {
+                eprintln!("{line}");
+            }
+            bail!(
+                "the app exited ({status}) before it was ready; full output: {}",
+                log.display()
+            );
+        }
+        let s = state::load()?;
+        let ready = !names.is_empty()
+            && names.iter().all(|n| {
+                s.routes
+                    .iter()
+                    .find(|r| &r.name == n)
+                    .is_some_and(|r| crate::health::target_listening(&r.target))
+            });
+        if ready || names.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "porch: still waiting for the app to answer after {}s; it keeps starting in the background (`porch logs {log_name}`)",
+                timeout.as_secs()
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    use crate::style::{self, Stream::Stdout};
+    for n in &names {
+        println!("{}", style::url(Stdout, &settings.url(n)));
+    }
+    eprintln!(
+        "{}",
+        style::dim(
+            crate::style::Stream::Stderr,
+            &format!("Running in the background. Logs: porch logs {log_name} · Stop: porch stop {log_name}")
+        )
+    );
+    Ok(0)
+}
+/// `porch stop NAME`: stop the launcher and app behind a route.
+async fn stop_app(name: &str) -> Result<i32> {
+    let n = normalize(name)?;
+    let s = state::load()?;
+    let p = state::proxy_settings()?;
+    let names = conflicting_names(&s, std::slice::from_ref(&n), &p);
+    let launched: Vec<String> = names
+        .into_iter()
+        .filter(|m| s.routes.iter().any(|r| &r.name == m && r.pid.is_some()))
+        .collect();
+    if launched.is_empty() {
+        if s.routes.iter().any(|r| r.name == n) {
+            bail!("{n} is an alias, not an app Porch started; remove it with `porch alias --remove {n}`")
+        }
+        bail!("no running app named {n}; see `porch list`")
+    }
+    evict_conflicts(&launched, &p, true).await?;
+    crate::health::reconcile_quietly();
+    for m in &launched {
+        println!("Stopped {}", p.url(m));
+    }
+    Ok(0)
+}
+/// `porch logs NAME`: print (and with --follow, keep printing) a background app's output.
+async fn show_logs(name: &str, follow: bool, lines: Option<usize>) -> Result<i32> {
+    let n = normalize(name)?;
+    let path = log_path(&n);
+    let text = fs::read_to_string(&path).with_context(|| {
+        format!("no log for {n}; logs exist for apps started with `porch run --detach`")
+    })?;
+    let all: Vec<&str> = text.lines().collect();
+    let start = lines.map_or(0, |k| all.len().saturating_sub(k));
+    for line in &all[start..] {
+        println!("{line}");
+    }
+    if !follow {
+        return Ok(0);
+    }
+    let mut offset = text.len() as u64;
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() < offset {
+            offset = 0; // the app was restarted and its log recreated
+        }
+        if meta.len() > offset {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut f = fs::File::open(&path)?;
+            f.seek(SeekFrom::Start(offset))?;
+            let mut chunk = Vec::new();
+            f.read_to_end(&mut chunk)?;
+            offset += chunk.len() as u64;
+            std::io::stdout().write_all(&chunk)?;
+            std::io::stdout().flush()?;
+        }
+    }
+}
 async fn launch_extra(
     options: RunOptions,
     command: Vec<String>,
     extra: Vec<String>,
 ) -> Result<i32> {
+    if options.detach && std::env::var_os("PORCH_DETACHED").is_none() {
+        let mut all = command.clone();
+        all.extend(extra.iter().cloned());
+        return detach(&options, &all).await;
+    }
     // Subscribe before publishing route ownership, so a signal observed by a
     // supervising caller cannot fall into the registration-to-spawn window.
     let mut signals = TerminationSignals::new()?;

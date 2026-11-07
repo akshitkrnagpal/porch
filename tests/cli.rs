@@ -912,3 +912,40 @@ fn upstream_alias_dials_loopback_with_its_own_host_and_verifies_tls() {
     });
     drop(servers);
 }
+
+#[test]
+fn detached_runs_answer_log_and_stop() {
+    let s = Sandbox::new();
+    let o = s.run(&[
+        "run", "--detach", "--name", "bg", "python3", "-c",
+        "import http.server,os;print('hello from bg',flush=True);http.server.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),http.server.SimpleHTTPRequestHandler).serve_forever()",
+    ]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        o.status.success(),
+        "{out}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(out.trim(), format!("http://bg.localhost:{}", s.port));
+    // Ready means answering: the route is healthy as soon as run returns.
+    let list: serde_json::Value = serde_json::from_str(&s.ok(&["list", "--json"])).unwrap();
+    assert_eq!(list["routes"][0]["health"], "ok", "{list}");
+    let logs = s.ok(&["logs", "bg"]);
+    assert!(logs.contains("hello from bg"), "{logs}");
+    assert!(s.ok(&["stop", "bg"]).contains("Stopped"));
+    let list: serde_json::Value = serde_json::from_str(&s.ok(&["list", "--json"])).unwrap();
+    assert!(list["routes"].as_array().unwrap().is_empty(), "{list}");
+    assert!(!s.run(&["stop", "bg"]).status.success());
+    // A command that dies before answering reports it instead of hanging.
+    let o = s.run(&[
+        "run",
+        "--detach",
+        "--name",
+        "dies",
+        "python3",
+        "-c",
+        "raise SystemExit(3)",
+    ]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("exited"));
+}

@@ -107,10 +107,11 @@ Any client that launches stdio servers works. Use command `porch` and arguments 
 
 | Profile | Tools |
 | --- | --- |
-| `core` (also `default`) | `list`, `get`, `machines`, `alias_add`, `alias_remove`, `tools_profiles` |
+| `core` (also `default`) | `list`, `get`, `machines`, `logs`, `alias_add`, `alias_remove`, `tools_profiles` |
 | `proxy` | `proxy_start`, `proxy_stop` |
 | `diagnostics` | `doctor`, `prune`, `version`, `doctor_fix` |
-| `readonly` | `list`, `get`, `machines`, `tools_profiles`, `doctor`, `version`: nothing that changes routes, the proxy or processes |
+| `apps` | `run`, `stop`, `logs`: start dev servers in the background and manage them |
+| `readonly` | `list`, `get`, `machines`, `logs`, `tools_profiles`, `doctor`, `version`: nothing that changes routes, the proxy or processes |
 | `all` (also `full`) | Everything above |
 
 Example: `porch mcp --tools core,diagnostics`. Calling a tool outside the active profiles returns "Tool is disabled; restart porch mcp --tools all".
@@ -124,6 +125,9 @@ Except `tools_profiles`, every tool accepts `cwd` (directory to run in), `extraA
 | `list` | none | `porch list --json` | Routes with name, URL, target, pid, health, `private` and sharing URLs, plus proxy settings. `extraArgs: ["--all"]` includes paired machines. Read-only |
 | `get` | `name` (required), `noWorktree` | `porch get NAME` | Pass `cwd` as the project directory so the worktree prefix matches. Read-only |
 | `alias_add` | `name`, `port` (required), `force`, `tld`, `private`, `upstream` | `porch alias NAME PORT` | Routes a name to a local port; `upstream` takes `https`, `https://HOST` or `http://HOST` |
+| `run` | `command` (array, required), `name`, `cwd` | `porch run --detach -- COMMAND` | Starts a dev server in the background and returns its URL once it answers |
+| `stop` | `name` (required) | `porch stop NAME` | Stops an app and its process tree. Destructive |
+| `logs` | `name` (required), `lines` | `porch logs NAME` | Output of a background app. Read-only |
 | `machines` | none | `porch list --all --json` | This computer's and every paired machine's apps, with the local URL for each remote app. Read-only |
 | `alias_remove` | `name` (required), `tld` | `porch remove NAME` | Removes an alias; app routes aren't touched |
 | `tools_profiles` | none | — | Active and available profiles. Read-only |

@@ -92,6 +92,7 @@ porch run pnpm dev         # any command; the name comes from package.json or th
 porch api node server.js   # choose the name: http://api.localhost
 porch alias db 5432        # name a server Porch didn't start
 porch list                 # every route and whether it's answering
+porch run -d pnpm dev      # in the background; then porch logs / porch stop
 ```
 
 ```console

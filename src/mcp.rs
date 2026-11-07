@@ -17,6 +17,9 @@ const NAMES: &[&str] = &[
     "version",
     "doctor_fix",
     "machines",
+    "run",
+    "stop",
+    "logs",
 ];
 /// What each tool does, for agents choosing between them.
 fn description(n: &str) -> &'static str {
@@ -31,6 +34,9 @@ fn description(n: &str) -> &'static str {
         "doctor" => "Read-only health check: proxy listeners, routes, name resolution, HTTPS trust and optional tools. Returns a non-zero exit code when it finds problems. Never changes anything; use doctor_fix to apply fixes.",
         "prune" => "Remove routes whose apps have exited. With force, also stop processes those routes left behind.",
         "version" => "Print the Porch version.",
+        "run" => "Start a dev server in the background behind a stable URL (porch run --detach). Give command as an argument list, e.g. [\"pnpm\",\"dev\"], and cwd as the project directory; name is optional. Returns once the app answers, with its URL. Use logs to read its output and stop to end it.",
+        "stop" => "Stop an app Porch started (its launcher and whole process tree). Aliases are not affected.",
+        "logs" => "Read the output of an app started with run (porch run --detach). lines limits it to the last N lines.",
         "machines" => "List this computer's apps and every paired machine's apps, with the URL that opens each remote app through the local proxy (APP.MACHINE.localhost). Use this to reach a dev server running on another computer.",
         "doctor_fix" => "Apply doctor's safe fixes: move a stopped proxy off a busy port, prune dead routes, restart an outdated proxy. With yes, also terminate stopped or orphaned launches without asking.",
         _ => "",
@@ -42,11 +48,21 @@ fn allowed_extra(n: &str) -> Option<&'static [&'static str]> {
     match n {
         "list" => Some(&["--all", "--json"]),
         "get" => Some(&["--no-worktree"]),
-        "doctor" | "version" | "tools_profiles" | "machines" => Some(&[]),
+        "doctor" | "version" | "tools_profiles" | "machines" | "logs" => Some(&[]),
         "doctor_fix" => Some(&[]),
         _ => None,
     }
 }
+/// Tools that never change routes, the proxy or processes.
+const READ_ONLY: &[&str] = &[
+    "list",
+    "get",
+    "tools_profiles",
+    "doctor",
+    "version",
+    "machines",
+    "logs",
+];
 fn profiles(s: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for p in s.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -55,7 +71,7 @@ fn profiles(s: &str) -> Result<Vec<String>> {
             "full" => "all",
             p => p,
         };
-        if !["core", "all", "proxy", "diagnostics", "readonly"].contains(&p) {
+        if !["core", "all", "proxy", "diagnostics", "readonly", "apps"].contains(&p) {
             bail!("Unknown tools profile: {p}");
         }
         if !out.iter().any(|x| x == p) {
@@ -71,19 +87,13 @@ fn enabled(p: &[String], n: &str) -> bool {
     p.iter().any(|p| {
         p == "all"
             || match p.as_str() {
-                "core" => NAMES[..5].contains(&n) || n == "machines",
+                "core" => NAMES[..5].contains(&n) || n == "machines" || n == "logs",
+                // Start and stop dev servers in the background.
+                "apps" => ["run", "stop", "logs"].contains(&n),
                 "proxy" => NAMES[5..7].contains(&n),
-                "diagnostics" => NAMES[7..].contains(&n) && n != "machines",
+                "diagnostics" => ["doctor", "prune", "version", "doctor_fix"].contains(&n),
                 // Inspection only: nothing that changes routes, the proxy or processes.
-                "readonly" => [
-                    "list",
-                    "get",
-                    "tools_profiles",
-                    "doctor",
-                    "version",
-                    "machines",
-                ]
-                .contains(&n),
+                "readonly" => READ_ONLY.contains(&n),
                 _ => false,
             }
     })
@@ -101,31 +111,29 @@ fn definition(n: &str) -> Value {
         "proxy_stop" => &["port"],
         "prune" => &["force"],
         "doctor_fix" => &["yes"],
+        "run" => &["command", "name"],
+        "stop" => &["name"],
+        "logs" => &["name", "lines"],
         _ => &[],
     };
     for f in fields {
         properties[*f] = match *f {
             "name" | "upstream" => json!({"type":"string","minLength":1}),
             "port" => json!({"type":"integer","minimum":1,"maximum":65535}),
+            "lines" => json!({"type":"integer","minimum":1,"maximum":100000}),
+            "command" => json!({"type":"array","minItems":1,"items":{"type":"string"}}),
             "tld" => json!({"type":"array","minItems":1,"items":{"type":"string"}}),
             _ => json!({"type":"boolean"}),
         };
     }
     let required: Vec<&str> = match n {
-        "get" | "alias_remove" => vec!["name"],
+        "get" | "alias_remove" | "stop" | "logs" => vec!["name"],
+        "run" => vec!["command"],
         "alias_add" => vec!["name", "port"],
         _ => vec![],
     };
-    let read = [
-        "list",
-        "get",
-        "tools_profiles",
-        "doctor",
-        "version",
-        "machines",
-    ]
-    .contains(&n);
-    json!({"name":n,"description":description(n),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read,"destructiveHint":(["alias_add","alias_remove","proxy_stop","prune","doctor_fix"].contains(&n)),"idempotentHint":n!="alias_add","openWorldHint":n=="proxy_start"}})
+    let read = READ_ONLY.contains(&n);
+    json!({"name":n,"description":description(n),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read,"destructiveHint":(["alias_add","alias_remove","proxy_stop","prune","doctor_fix","stop"].contains(&n)),"idempotentHint":n!="alias_add","openWorldHint":n=="proxy_start"}})
 }
 fn validate(n: &str, a: &Value) -> Result<()> {
     let d = definition(n);
@@ -195,6 +203,29 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
         "version" => vec!["--version".into()],
         "doctor_fix" => vec!["doctor".into(), "--fix".into()],
         "machines" => vec!["list".into(), "--all".into(), "--json".into()],
+        "run" => {
+            let mut v = vec!["run".into(), "--detach".into()];
+            if let Some(name) = a["name"].as_str() {
+                v.extend(["--name".into(), name.into()]);
+            }
+            v.push("--".into());
+            v.extend(
+                a["command"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c.as_str().unwrap().to_owned()),
+            );
+            v
+        }
+        "stop" => vec!["stop".into(), a["name"].as_str().unwrap().into()],
+        "logs" => {
+            let mut v = vec!["logs".into(), a["name"].as_str().unwrap().into()];
+            if let Some(n) = a["lines"].as_u64() {
+                v.extend(["--lines".into(), n.to_string()]);
+            }
+            v
+        }
         _ => vec![n.into()],
     };
     if n.starts_with("proxy_") {

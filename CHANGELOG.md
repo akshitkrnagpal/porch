@@ -10,6 +10,7 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - The 404 page shows other devices app names only, not the ports and URLs behind them.
 
 ### New
+- `porch run --detach` starts an app in the background and returns once it answers; `porch logs NAME` and `porch stop NAME` manage it. MCP gains matching `run`, `stop` and `logs` tools (the `apps` profile), so agents can start dev servers themselves.
 - **URLs without a port, without sudo.** New installs serve `http://web.localhost` when the OS lets this user bind port 80 (macOS, Windows, Linux with a lowered `ip_unprivileged_port_start`), and fall back to 7462 otherwise. `porch setup` asks; `PORCH_CLEAN_URLS=0` opts out.
 - Port and host flags for Django, Flask, FastAPI, uvicorn, gunicorn, Streamlit, MkDocs, Jupyter, Hugo, Jekyll and `python -m http.server`, including through `uv run`, `poetry run` and `bundle exec`.
 - `--private` keeps an app or alias off paired machines.
