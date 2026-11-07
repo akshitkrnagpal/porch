@@ -171,7 +171,7 @@ cargo test --all-targets
 cargo build --release
 ```
 
-CI runs these on native Ubuntu x86_64 and macOS ARM64 runners. A Windows runner lints and builds the CLI and tray, smoke-runs the CLI and checks packaging; its test run does not gate yet. Pushing a `v*` tag builds release archives (CLI, tray, and `Porch.app` on macOS; `.exe` binaries on Windows), publishes them on GitHub Releases with `SHA256SUMS`, and updates the Homebrew formula when the `HOMEBREW_TAP_TOKEN` secret is set. Archives are not signed or notarized.
+CI runs these on native Ubuntu x86_64 and macOS ARM64 runners. A Windows runner lints and builds the CLI and tray, runs the unit and integration tests, and checks packaging; the `first_run`, `integrations`, `lifecycle` and `pty` suites are Unix-only so far. Pushing a `v*` tag builds release archives (CLI, tray, and `Porch.app` on macOS; `.exe` binaries on Windows), publishes them on GitHub Releases with `SHA256SUMS`, and updates the Homebrew formula when the `HOMEBREW_TAP_TOKEN` secret is set. Archives are not signed or notarized.
 
 Configuration lookup prefers `porch.json`, then the package `porch` key, then `portless.json`, then the package `portless` key. A native package key can override app fields from the file, consistent with leaf package overrides. A malformed selected native configuration is an error, never a reason to fall back to legacy settings. Legacy child environment names are also emitted for migration.
 

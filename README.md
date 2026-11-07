@@ -148,7 +148,7 @@ Porch is a standalone Rust rewrite of [Portless](https://github.com/vercel-labs/
 | macOS, Apple Silicon | Supported, tested in CI |
 | macOS, Intel | Release builds, not tested in CI |
 | Linux x86_64 (glibc 2.39+) | Supported, tested in CI |
-| Windows 10/11 x86_64 | Preview: builds and smoke-tested in CI; the test suite does not pass there yet |
+| Windows 10/11 x86_64 | Preview: tested in CI; some lifecycle and terminal tests are Unix-only so far |
 
 macOS builds are not notarized. On older Linux distributions, build from source.
 

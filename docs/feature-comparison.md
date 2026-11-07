@@ -32,4 +32,4 @@ The CLI adds `list --json`, route removal/list aliases, explicit bind/redirect o
 
 ## Verification boundaries
 
-CI builds and tests `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu` natively. `x86_64-pc-windows-msvc` is built, linted and smoke-run natively; its tests do not gate yet. Real privileged trust/service installation, live Docker/tunnel providers and physical LAN transitions are outside automated testing. Existing trusted CA identity/validity is preserved; application-level issuance policy is restricted, while the root has no DNS NameConstraints.
+CI builds and tests `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu` natively. `x86_64-pc-windows-msvc` is built, linted and tested natively; the `first_run`, `integrations`, `lifecycle` and `pty` suites are Unix-only so far. Real privileged trust/service installation, live Docker/tunnel providers and physical LAN transitions are outside automated testing. Existing trusted CA identity/validity is preserved; application-level issuance policy is restricted, while the root has no DNS NameConstraints.
