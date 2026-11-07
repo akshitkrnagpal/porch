@@ -13,6 +13,8 @@ pub mod sockets;
 pub mod state;
 pub mod tls;
 pub mod update;
+#[cfg(windows)]
+pub mod win_net;
 
 pub mod discovery;
 #[cfg(feature = "tray")]

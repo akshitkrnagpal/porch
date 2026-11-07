@@ -254,7 +254,11 @@ fn interface_addresses() -> Vec<std::net::Ipv4Addr> {
     }
     out
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn interface_addresses() -> Vec<std::net::Ipv4Addr> {
+    crate::win_net::interface_addresses()
+}
+#[cfg(not(any(unix, windows)))]
 fn interface_addresses() -> Vec<std::net::Ipv4Addr> {
     vec![]
 }

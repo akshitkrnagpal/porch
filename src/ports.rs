@@ -1,8 +1,9 @@
 //! Proxy port defaults, conflict ownership and TCP listener probes.
 //!
-//! Ownership lookups are best effort: they use `lsof` on macOS and `ss` (then
-//! `lsof`) on Linux. Listeners owned by other users may be invisible without
-//! administrator rights, so callers must cope with an unknown owner.
+//! Ownership lookups are best effort: they use `lsof` on macOS, `ss` (then
+//! `lsof`) on Linux and the TCP table on Windows. Listeners owned by other
+//! users may be invisible without administrator rights, so callers must cope
+//! with an unknown owner.
 #[cfg(unix)]
 use std::process::Command;
 use std::{
@@ -35,6 +36,9 @@ impl fmt::Display for Listener {
 pub fn describe_owner(port: u16) -> String {
     match owner(port) {
         Some(l) => l.to_string(),
+        None if cfg!(windows) => {
+            format!("another process (identify it with `netstat -ano -p tcp | findstr :{port}` in an administrator terminal)")
+        }
         None => {
             format!("another process (identify it with `sudo lsof -nP -iTCP:{port} -sTCP:LISTEN`)")
         }
@@ -43,7 +47,8 @@ pub fn describe_owner(port: u16) -> String {
 
 /// Is this listener a Porch process (any state directory)?
 pub fn is_porch(l: &Listener) -> bool {
-    let name = l.name.rsplit('/').next().unwrap_or(&l.name);
+    let name = l.name.rsplit(['/', '\\']).next().unwrap_or(&l.name);
+    let name = name.strip_suffix(".exe").unwrap_or(name);
     name == "porch" || name.starts_with("porch-")
 }
 
@@ -76,7 +81,24 @@ fn all_listeners(port: Option<u16>, pids: Option<&[u32]>) -> Vec<Listener> {
     {
         lsof_listeners(port, pids)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::win_net::tcp_listeners()
+            .into_iter()
+            .filter(|(p, pid)| {
+                *pid != 0
+                    && port.is_none_or(|want| want == *p)
+                    && pids.is_none_or(|ps| ps.contains(pid))
+            })
+            .map(|(port, pid)| Listener {
+                pid,
+                // Unnamed when the process belongs to another user or a service.
+                name: crate::win_net::process_name(pid).unwrap_or_else(|| "unknown".into()),
+                port,
+            })
+            .collect()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (port, pids);
         Vec::new()
