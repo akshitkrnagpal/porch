@@ -82,12 +82,14 @@ mod imp {
         }
     }
 
-    /// Windows treats a group id that names no live process on this console
+    /// Windows treats a group id that names no process group on this console
     /// like 0: the event then reaches every process sharing the console,
-    /// including this one, the user's shell and every other app in it. A
-    /// child that has already exited (even one whose handle is still open, so
-    /// its id is not reused) must therefore never be signaled. The handle held
-    /// across the check also keeps the id from naming a new process.
+    /// including this one, the user's shell and every other app in it. So
+    /// `group` must be a process the caller started with
+    /// CREATE_NEW_PROCESS_GROUP (callers guarantee that), and it must still be
+    /// running: a child that has exited (even one whose handle is still open,
+    /// so its id is not reused) is never signaled. The handle held across the
+    /// check also keeps the id from naming a new process.
     pub fn interrupt_group(group: u32) -> bool {
         use windows_sys::Win32::System::Threading::{
             GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,

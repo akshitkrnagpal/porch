@@ -1348,7 +1348,13 @@ fn remove_alias(name: &str, selected: &[String]) -> Result<()> {
 fn kill_route(s: &state::State, name: &str, signal: i32) -> Result<()> {
     if let Some(i) = s.owners.get(name) {
         if let Some(child) = i.child {
-            if state::group_matches(child, i.child_started.as_deref()) {
+            // Windows: only a group's own launcher may send it Ctrl+Break. The
+            // recorded child can be a daemon that took over the route and leads
+            // no console group, and Ctrl+Break to such an id reaches every
+            // process on the console. Callers ask the owning launcher to stop
+            // instead (`signal_pid`), and force with SIGKILL semantics.
+            let allowed = cfg!(unix) || signal == 9;
+            if allowed && state::group_matches(child, i.child_started.as_deref()) {
                 signal_group(child, signal);
             }
         }
