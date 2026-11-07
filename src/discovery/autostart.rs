@@ -347,7 +347,9 @@ mod tests {
         assert!(body.contains("<string>dev.porch.discovery</string>"));
         assert!(body.contains("<string>/Users/a&amp;b/.local/bin/porch</string><string>discovery</string><string>serve</string><string>--autostart</string>"));
         assert!(body.contains("<key>PORCH_STATE_DIR</key><string>/Users/a&amp;b/state</string>"));
-        assert!(body.contains("<string>/Users/a&amp;b/state/discovery.log</string>"));
+        let log = Path::new("/Users/a&b/state").join("discovery.log");
+        let log = crate::integrations::xml(&log.to_string_lossy());
+        assert!(body.contains(&format!("<string>{log}</string>")));
         assert!(body.contains("<key>SuccessfulExit</key><false/>"));
         assert!(body.contains("<key>RunAtLoad</key><true/>"));
     }

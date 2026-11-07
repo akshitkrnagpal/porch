@@ -36,8 +36,8 @@ jobs:
       - run: cargo build --release
   windows:
     # The CLI and tray must build and lint clean, the CLI must smoke-start
-    # without state, and packaging must work. Unit tests run for signal only
-    # until they pass on Windows.
+    # without state, packaging must work and unit tests must pass. Integration
+    # tests run for signal only until they pass on Windows.
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v7
@@ -63,9 +63,10 @@ jobs:
         run: target/release/porch.exe --state-dir "$env:RUNNER_TEMP/porch-smoke" list --json
       - run: python scripts/test_packaging.py
       - run: python scripts/package.py --target x86_64-pc-windows-msvc --binaries target/release
-      - name: Unit tests (not yet required)
+      - run: cargo test --no-fail-fast --lib
+      - name: Integration tests (not yet required)
         continue-on-error: true
-        run: cargo test --no-fail-fast --lib
+        run: cargo test --no-fail-fast --tests
   tray:
     strategy:
       fail-fast: false

@@ -27,9 +27,34 @@ pub fn bind(addr: SocketAddr, v6_only: bool) -> io::Result<TcpListener> {
     if addr.is_ipv6() {
         socket.set_only_v6(v6_only)?;
     }
+    #[cfg(windows)]
+    exclusive(&socket)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     Ok(socket.into())
+}
+
+/// Windows lets a wildcard bind share a port with a specific-address
+/// listener, and lets another process bind a more specific address over ours.
+/// Exclusive use restores the Unix behavior: a port in use cannot be bound.
+#[cfg(windows)]
+fn exclusive(socket: &socket2::Socket) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{setsockopt, SOL_SOCKET, SO_EXCLUSIVEADDRUSE};
+    let on: i32 = 1;
+    let status = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&on as *const i32).cast(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Hold both address families, including wildcard interfaces, until the app starts.

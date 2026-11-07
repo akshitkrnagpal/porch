@@ -90,6 +90,9 @@ pub(super) fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(path, dir.join(name))?;
+    // Windows cannot open a directory as a file, and its renames need no
+    // directory sync to be durable.
+    #[cfg(unix)]
     fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
