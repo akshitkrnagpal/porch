@@ -2398,6 +2398,8 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         _ => bail!("expected hosts, service, trust, share, lan, compose, or doctor"),
     }
 }
+/// Problems the last `doctor` report marked with ✗, for its exit code.
+pub static DOCTOR_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 async fn doctor() -> Result<()> {
     use crate::style::{self, Stream::Stdout};
     let good = |label: &str, detail: &str| {
@@ -2407,8 +2409,10 @@ async fn doctor() -> Result<()> {
             style::dim(Stdout, detail)
         )
     };
-    let bad =
-        |label: &str, detail: &str| println!("  {} {label}  {detail}", style::red(Stdout, "✗"));
+    let bad = |label: &str, detail: &str| {
+        DOCTOR_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        println!("  {} {label}  {detail}", style::red(Stdout, "✗"))
+    };
     let info = |label: &str, detail: &str| {
         println!(
             "  {} {label}  {}",
@@ -2462,6 +2466,8 @@ async fn doctor() -> Result<()> {
     let token =
         fs::read_to_string(crate::state::dir().join("proxy.hosts-sync-token")).unwrap_or_default();
     let challenge = "ab".repeat(32);
+    let mut stopped = 0;
+    let mut foreign = false;
     for address in ["127.0.0.1", "[::1]"] {
         let label = format!("listener {address}");
         let response = client
@@ -2488,20 +2494,48 @@ async fn doctor() -> Result<()> {
                     good(&label, "Porch is ready (identity verified)");
                 } else {
                     let who = crate::ports::describe_owner(settings.port);
-                    bad(
-                        &label,
-                        &format!("foreign/unverified listener ({who}); port collision or stale daemon state"),
+                    let detail = format!(
+                        "foreign/unverified listener ({who}); port collision or stale daemon state"
                     );
+                    if owned_ready {
+                        bad(&label, &detail);
+                    } else {
+                        // Porch's proxy is stopped and another program holds
+                        // its port: the busy-port check below reports (and
+                        // with --fix resolves) that, so don't count it twice.
+                        println!("  {} {label}  {detail}", style::yellow(Stdout, "!"));
+                    }
                 }
             }
-            Err(e) if e.is_connect() => {
-                bad(&label, "nothing is listening; run `porch proxy start`")
-            }
-            Err(e) => bad(
+            Err(e) if e.is_connect() && !owned_ready => stopped += 1,
+            Err(e) if e.is_connect() => bad(
+                &label,
+                "the proxy should be here but nothing answers; run `porch proxy start`",
+            ),
+            Err(e) if owned_ready => bad(
                 &label,
                 &format!("unavailable ({e}); run `porch proxy start`"),
             ),
+            Err(_) => {
+                foreign = true;
+                println!(
+                    "  {} {label}  another program answers on this port (see Issues)",
+                    style::yellow(Stdout, "!")
+                );
+            }
         }
+    }
+    if foreign {
+    } else if stopped == 2 {
+        info(
+            "stopped",
+            "the proxy starts with your next app, or run `porch proxy start`",
+        );
+    } else if stopped == 1 {
+        info(
+            "one listener",
+            "only one loopback address answers (IPv6 may be off)",
+        );
     }
     section("Routes");
     if state.routes.is_empty() {

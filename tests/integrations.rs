@@ -885,7 +885,9 @@ fn doctor_does_not_call_a_foreign_listener_ready() {
                 c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         }
     });
-    let out = s.ok(&["doctor"]);
+    let out = s.run(&["doctor"]);
+    // A foreign program on the proxy port is a problem: doctor fails.
+    assert_eq!(out.status.code(), Some(1));
     done.store(true, std::sync::atomic::Ordering::SeqCst);
     // Wake the accept loop so it sees the flag.
     let _ = std::net::TcpStream::connect(("127.0.0.1", s.port));

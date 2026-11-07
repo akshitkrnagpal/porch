@@ -9,14 +9,21 @@ use anyhow::Result;
 struct Report {
     fix: bool,
     count: usize,
+    /// Issues still present after this run (fixed ones don't count).
+    unresolved: usize,
 }
 impl Report {
+    fn fixed(&mut self, problem: impl std::fmt::Display, outcome: impl std::fmt::Display) {
+        self.issue(problem, outcome);
+        self.unresolved -= 1;
+    }
     fn issue(&mut self, problem: impl std::fmt::Display, outcome: impl std::fmt::Display) {
         use crate::style::{self, Stream::Stdout};
         if self.count == 0 {
             println!("{}", style::bold(Stdout, "Issues"));
         }
         self.count += 1;
+        self.unresolved += 1;
         println!("  {} {problem} → {outcome}", style::yellow(Stdout, "!"));
     }
     fn hint(&self) -> &'static str {
@@ -28,8 +35,12 @@ impl Report {
     }
 }
 
-pub async fn run(fix: bool, yes: bool) -> Result<()> {
-    let mut report = Report { fix, count: 0 };
+pub async fn run(fix: bool, yes: bool) -> Result<usize> {
+    let mut report = Report {
+        fix,
+        count: 0,
+        unresolved: 0,
+    };
     let interactive = crate::setup::interactive(yes);
     let settings = state::proxy_settings()?;
 
@@ -47,7 +58,7 @@ pub async fn run(fix: bool, yes: bool) -> Result<()> {
             let mut s = settings.clone();
             s.unprivileged = true;
             state::save_proxy_settings(&s)?;
-            report.issue(problem, "switched to no-sudo mode (saved)");
+            report.fixed(problem, "switched to no-sudo mode (saved)");
         } else {
             report.issue(problem, report.hint());
         }
@@ -62,7 +73,7 @@ pub async fn run(fix: bool, yes: bool) -> Result<()> {
         );
         if fix {
             match cli::restart_outdated_proxy().await {
-                Ok(_) => report.issue(problem, "restarted the proxy; routes kept"),
+                Ok(_) => report.fixed(problem, "restarted the proxy; routes kept"),
                 Err(e) => report.issue(problem, format!("restart failed ({e:#})")),
             }
         } else {
@@ -78,7 +89,7 @@ pub async fn run(fix: bool, yes: bool) -> Result<()> {
             );
             if fix {
                 match cli::move_off_busy_port(settings, false) {
-                    Ok(s) => report.issue(
+                    Ok(s) => report.fixed(
                         problem,
                         format!(
                             "moved Porch to port {} (saved); it starts with your next `porch run`",
@@ -96,7 +107,7 @@ pub async fn run(fix: bool, yes: bool) -> Result<()> {
     // Routes: dead ones are pruned automatically; stopped/orphaned need consent.
     let (removed, rows) = crate::health::reconcile()?;
     for name in removed {
-        report.issue(
+        report.fixed(
             format!("route {name}: its process exited"),
             "removed the stale route",
         );
@@ -131,7 +142,7 @@ pub async fn run(fix: bool, yes: bool) -> Result<()> {
                 ))
         {
             match cli::terminate_routes(std::slice::from_ref(&name)).await {
-                Ok(()) => report.issue(problem, "terminated the launch and removed its route"),
+                Ok(()) => report.fixed(problem, "terminated the launch and removed its route"),
                 Err(e) => report.issue(
                     problem,
                     format!("could not terminate ({e:#}); run `porch doctor --fix --yes` again"),
@@ -155,14 +166,21 @@ pub async fn run(fix: bool, yes: bool) -> Result<()> {
                 ))
         {
             cli::prune(true).await?;
-            report.issue(problem, "terminated them and removed their routes");
+            report.fixed(problem, "terminated them and removed their routes");
         } else {
             report.issue(problem, report.hint());
         }
     }
 
-    if report.count == 0 {
-        println!("\nNo problems found.");
+    let failures = crate::integrations::DOCTOR_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    let total = report.unresolved + failures;
+    if total == 0 {
+        println!("No problems found.");
+    } else if report.unresolved == 0 {
+        println!(
+            "{total} problem{} marked ✗ above.",
+            if total == 1 { "" } else { "s" }
+        );
     }
-    Ok(())
+    Ok(total)
 }

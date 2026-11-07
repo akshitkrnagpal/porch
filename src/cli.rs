@@ -551,7 +551,9 @@ pub async fn run() -> Result<i32> {
         Some(Commands::Lan) => integration("lan", vec![]).await?,
         Some(Commands::Doctor { fix, yes }) => {
             integration("doctor", vec![]).await?;
-            crate::doctor::run(fix, yes).await?;
+            if crate::doctor::run(fix, yes).await? > 0 {
+                return Ok(1);
+            }
         }
         Some(Commands::Setup(args)) => crate::setup::run(args).await?,
         Some(Commands::Trust { system }) => {

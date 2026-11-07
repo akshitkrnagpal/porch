@@ -379,7 +379,10 @@ fn stopped_launch_is_reported_and_doctor_fix_terminates_it() {
         health(&s, "frozen").as_deref() == Some("stopped")
     });
     // Without consent nothing is terminated.
-    let (out, _) = s.ok(&["doctor", "--fix"]);
+    let o = s.run(&["doctor", "--fix"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    // The problem remains, so doctor fails.
+    assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(out.contains("frozen"), "{out}");
     assert!(out.contains("porch doctor --fix --yes"), "{out}");
     assert_eq!(health(&s, "frozen").as_deref(), Some("stopped"));

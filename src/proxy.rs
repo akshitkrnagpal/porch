@@ -513,8 +513,7 @@ async fn forward(
             };
             // The bare domain (http://localhost) is Porch's dashboard: a 200
             // page listing every app, rather than an error.
-            let dashboard =
-                settings.tlds.contains(&hostname) || hostname == "porch.localhost";
+            let dashboard = settings.tlds.contains(&hostname) || hostname == "porch.localhost";
             let page = if dashboard {
                 *response.status_mut() = StatusCode::OK;
                 page(

@@ -15,7 +15,36 @@ const NAMES: &[&str] = &[
     "doctor",
     "prune",
     "version",
+    "doctor_fix",
 ];
+/// What each tool does, for agents choosing between them.
+fn description(n: &str) -> &'static str {
+    match n {
+        "list" => "List the apps Porch is serving on this computer: name, URL, upstream target, owning pid, health (ok, not listening, stopped, dead) and any sharing URLs. Use this to find the URL of a running dev server instead of guessing a localhost port.",
+        "get" => "Print the stable URL for an app name, applying the current Git worktree prefix unless noWorktree is set. Works before the app runs, so it is safe for wiring one app's URL into another's config.",
+        "alias_add" => "Route NAME.localhost to an existing local port that Porch did not start (a database UI, a Docker container). Fails if the name is taken unless force is set.",
+        "alias_remove" => "Remove a static alias created with alias_add. Never stops a process.",
+        "tools_profiles" => "Report which tool profiles are active and which exist (core, proxy, diagnostics, all).",
+        "proxy_start" => "Start the Porch proxy in the background if it is not running. Apps start it automatically, so this is rarely needed.",
+        "proxy_stop" => "Stop the Porch proxy. Running apps keep their routes but their URLs stop answering until the proxy starts again.",
+        "doctor" => "Read-only health check: proxy listeners, routes, name resolution, HTTPS trust and optional tools. Returns a non-zero exit code when it finds problems. Never changes anything; use doctor_fix to apply fixes.",
+        "prune" => "Remove routes whose apps have exited. With force, also stop processes those routes left behind.",
+        "version" => "Print the Porch version.",
+        "doctor_fix" => "Apply doctor's safe fixes: move a stopped proxy off a busy port, prune dead routes, restart an outdated proxy. With yes, also terminate stopped or orphaned launches without asking.",
+        _ => "",
+    }
+}
+/// Extra CLI arguments each tool may pass through. Read-only tools accept only
+/// read-only flags, so `extraArgs` can never turn an inspection into a repair.
+fn allowed_extra(n: &str) -> Option<&'static [&'static str]> {
+    match n {
+        "list" => Some(&["--all", "--json"]),
+        "get" => Some(&["--no-worktree"]),
+        "doctor" | "version" | "tools_profiles" => Some(&[]),
+        "doctor_fix" => Some(&[]),
+        _ => None,
+    }
+}
 fn profiles(s: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for p in s.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -59,6 +88,7 @@ fn definition(n: &str) -> Value {
         "proxy_start" => &["port", "noTls", "lan", "tld", "wildcard", "unprivileged"],
         "proxy_stop" => &["port"],
         "prune" => &["force"],
+        "doctor_fix" => &["yes"],
         _ => &[],
     };
     for f in fields {
@@ -75,7 +105,7 @@ fn definition(n: &str) -> Value {
         _ => vec![],
     };
     let read = ["list", "get", "tools_profiles", "doctor", "version"].contains(&n);
-    json!({"name":n,"description":format!("Porch {}", n.replace('_', " ")),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read,"destructiveHint":(["alias_add","alias_remove","proxy_stop","prune"].contains(&n)),"idempotentHint":n!="alias_add","openWorldHint":n=="proxy_start"}})
+    json!({"name":n,"description":description(n),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read,"destructiveHint":(["alias_add","alias_remove","proxy_stop","prune","doctor_fix"].contains(&n)),"idempotentHint":n!="alias_add","openWorldHint":n=="proxy_start"}})
 }
 fn validate(n: &str, a: &Value) -> Result<()> {
     let d = definition(n);
@@ -122,17 +152,14 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
             false,
         ));
     }
-    // Route listing uses the same persistent state as the proxy.
-    if n == "list" && a.as_object().unwrap().is_empty() {
-        let state = crate::state::load()?;
-        let settings = crate::state::proxy_settings()?;
-        let routes: Vec<_> = state
-            .routes
-            .iter()
-            .filter(|r| crate::state::route_alive(&state,r))
-            .map(|r| json!({"name":r.name,"url":settings.url(&r.name),"target":r.target,"pid":r.pid,"urls":state.shares.get(&r.name)}))
-            .collect();
-        return Ok(tool_result(json!({"routes":routes}), false));
+    if let (Some(allowed), Some(extra)) = (allowed_extra(n), a["extraArgs"].as_array()) {
+        for arg in extra {
+            let s = arg.as_str().unwrap_or_default();
+            let flag = s.split('=').next().unwrap_or(s);
+            if !allowed.contains(&flag) {
+                bail!("{n} does not accept the argument {s:?}");
+            }
+        }
     }
     let mut argv: Vec<String> = match n {
         "list" => vec!["list".into(), "--json".into()],
@@ -146,6 +173,7 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
         "proxy_start" => vec!["proxy".into(), "start".into()],
         "proxy_stop" => vec!["proxy".into(), "stop".into()],
         "version" => vec!["--version".into()],
+        "doctor_fix" => vec!["doctor".into(), "--fix".into()],
         _ => vec![n.into()],
     };
     if n.starts_with("proxy_") {
@@ -160,6 +188,7 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
         ("lan", "--lan"),
         ("wildcard", "--wildcard"),
         ("unprivileged", "--unprivileged"),
+        ("yes", "--yes"),
     ] {
         if a[key] == true {
             argv.push(flag.into());
@@ -363,6 +392,42 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn read_only_tools_reject_repair_arguments() {
+        for (tool, extra) in [
+            ("doctor", "--fix"),
+            ("doctor", "--yes"),
+            ("list", "--force"),
+            ("get", "--force"),
+        ] {
+            let err = call(
+                tool,
+                &json!({"extraArgs":[extra]})
+                    .as_object()
+                    .map(|o| {
+                        let mut o = o.clone();
+                        if tool == "get" {
+                            o.insert("name".into(), json!("web"));
+                        }
+                        Value::Object(o)
+                    })
+                    .unwrap(),
+                &["all".into()],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("does not accept"),
+                "{tool} {extra}: {err}"
+            );
+        }
+        let doctor = definition("doctor");
+        assert_eq!(doctor["annotations"]["readOnlyHint"], true);
+        assert_eq!(
+            definition("doctor_fix")["annotations"]["destructiveHint"],
+            true
+        );
+    }
+    #[tokio::test]
     async fn lifecycle() {
         let mut s = Server {
             profiles: profiles("core").unwrap(),
@@ -391,6 +456,13 @@ mod tests {
                 .len(),
             5
         );
+        let tools = s
+            .handle(r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#)
+            .await
+            .unwrap();
+        for tool in tools["result"]["tools"].as_array().unwrap() {
+            assert!(tool["description"].as_str().unwrap().len() > 40, "{tool}");
+        }
         s.handle(r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#)
             .await;
         assert!(s.shutdown);
