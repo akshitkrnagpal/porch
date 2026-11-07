@@ -17,12 +17,68 @@ pub struct State {
     pub shares: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     pub compose_projects: BTreeMap<String, Vec<String>>,
+    /// Aliases that dial a loopback port with their own scheme, Host and TLS
+    /// name (`porch alias NAME PORT --upstream ...`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub upstreams: BTreeMap<String, Upstream>,
     /// Routes never offered to paired machines (`--private`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub private: std::collections::BTreeSet<String>,
     /// Unix seconds when a route's processes were first seen job-control stopped.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub stopped_since: BTreeMap<String, u64>,
+}
+/// How the proxy talks to an alias's loopback port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Upstream {
+    /// Speak TLS to the backend.
+    pub tls: bool,
+    /// `host[:port]` sent as Host (and, for TLS, the server name checked);
+    /// `None` keeps the browser's Host.
+    pub authority: Option<String>,
+    /// Skip backend certificate verification (explicit `--insecure` only).
+    #[serde(default)]
+    pub insecure: bool,
+}
+impl Upstream {
+    /// Parse `https`, `https://host[:port]` or `http://host[:port]`.
+    pub fn parse(spec: &str, insecure: bool) -> Result<Upstream> {
+        if spec == "https" {
+            return Ok(Upstream {
+                tls: true,
+                authority: None,
+                insecure,
+            });
+        }
+        let u = url::Url::parse(spec).with_context(|| {
+            format!(
+                "--upstream must be https, https://HOST[:PORT] or http://HOST[:PORT], not {spec:?}"
+            )
+        })?;
+        let tls = match u.scheme() {
+            "https" => true,
+            "http" => false,
+            _ => bail!("--upstream must use http or https"),
+        };
+        if u.host_str().is_none()
+            || !u.username().is_empty()
+            || u.password().is_some()
+            || !matches!(u.path(), "" | "/")
+            || u.query().is_some()
+            || u.fragment().is_some()
+            || spec.chars().any(char::is_whitespace)
+        {
+            bail!("--upstream takes only a scheme, host and optional port, like https://api.internal:8443");
+        }
+        if insecure && !tls {
+            bail!("--insecure only applies to an https upstream");
+        }
+        Ok(Upstream {
+            tls,
+            authority: Some(u[url::Position::BeforeHost..url::Position::AfterPort].to_owned()),
+            insecure,
+        })
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
@@ -323,6 +379,7 @@ pub fn remove_route(s: &mut State, name: &str) {
     s.shares.remove(name);
     s.stopped_since.remove(name);
     s.private.remove(name);
+    s.upstreams.remove(name);
     for names in s.compose_projects.values_mut() {
         names.retain(|n| n != name);
     }
@@ -511,4 +568,50 @@ pub fn live_routes() -> Result<std::sync::Arc<State>> {
         state: state.clone(),
     });
     Ok(state)
+}
+
+#[cfg(test)]
+mod upstream_tests {
+    use super::Upstream;
+    #[test]
+    fn upstream_specs() {
+        assert_eq!(
+            Upstream::parse("https", false).unwrap(),
+            Upstream {
+                tls: true,
+                authority: None,
+                insecure: false
+            }
+        );
+        assert_eq!(
+            Upstream::parse("https://api.internal:8443", true).unwrap(),
+            Upstream {
+                tls: true,
+                authority: Some("api.internal:8443".into()),
+                insecure: true
+            }
+        );
+        assert_eq!(
+            Upstream::parse("http://api.internal", false).unwrap(),
+            Upstream {
+                tls: false,
+                authority: Some("api.internal".into()),
+                insecure: false
+            }
+        );
+        for bad in [
+            "ftp://x",
+            "https://u:p@x",
+            "https://x/path",
+            "https://x?q=1",
+            "https://x#f",
+            "tls",
+        ] {
+            assert!(Upstream::parse(bad, false).is_err(), "{bad}");
+        }
+        assert!(
+            Upstream::parse("http://x", true).is_err(),
+            "--insecure needs https"
+        );
+    }
 }

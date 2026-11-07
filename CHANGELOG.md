@@ -20,6 +20,8 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - Release archives carry signed build-provenance attestations, and `porch self-update` verifies them when the GitHub CLI is installed (`PORCH_UPDATE_VERIFY=require` makes it mandatory).
 - Agent skills (`skills/porch`, `skills/oauth`), docs for coding agents, troubleshooting and recipes, examples, and a JSON Schema for `porch.json`.
 - `porch.name`, `porch.ports` and `porch.enable` Compose labels.
+- `porch alias NAME PORT --upstream https|https://HOST|http://HOST` talks TLS or a custom Host to a loopback service, verifying its certificate (`--insecure` to opt out per alias).
+- The proxy caps open connections and times out clients that don't send a request head.
 
 ### Fixed
 - An app listening only on IPv6 loopback showed as "not listening" even though the proxy reached it.

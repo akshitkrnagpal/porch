@@ -799,3 +799,109 @@ fn private_survives_partial_alias_edits_and_urls_are_stored_canonically() {
         .status
         .success());
 }
+
+#[test]
+fn upstream_alias_dials_loopback_with_its_own_host_and_verifies_tls() {
+    let s = Sandbox::new();
+    let dir = s.root.join("backend");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "k.pem",
+            "-out",
+            "c.pem",
+            "-subj",
+            "/CN=api.internal",
+            "-addext",
+            "subjectAltName=DNS:api.internal",
+            "-days",
+            "1",
+        ])
+        .current_dir(&dir)
+        .output();
+    if !cert.is_ok_and(|o| o.status.success()) {
+        eprintln!("skipping: openssl unavailable");
+        return;
+    }
+    let tls_port = common::free_port();
+    let plain_port = common::free_port();
+    let script = "import http.server,ssl,sys\nclass H(http.server.BaseHTTPRequestHandler):\n def do_GET(self):\n  b=('host='+str(self.headers.get('Host'))).encode();self.send_response(200);self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)\n def log_message(self,*a):pass\ns=http.server.HTTPServer(('127.0.0.1',int(sys.argv[1])),H)\nif sys.argv[2]=='tls':\n c=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);c.load_cert_chain('c.pem','k.pem');s.socket=c.wrap_socket(s.socket,server_side=True)\nprint('ready',flush=True)\ns.serve_forever()\n";
+    let mut servers: Vec<_> = [(tls_port, "tls"), (plain_port, "plain")]
+        .into_iter()
+        .map(|(port, mode)| {
+            Command::new("python3")
+                .args(["-c", script, &port.to_string(), mode])
+                .current_dir(&dir)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for server in &mut servers {
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(server.stdout.as_mut().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+    }
+    s.ok(&[
+        "alias",
+        "verified",
+        &tls_port.to_string(),
+        "--upstream",
+        "https://api.internal",
+    ]);
+    s.ok(&[
+        "alias",
+        "insecure",
+        &tls_port.to_string(),
+        "--upstream",
+        "https://api.internal",
+        "--insecure",
+    ]);
+    s.ok(&[
+        "alias",
+        "plain",
+        &plain_port.to_string(),
+        "--upstream",
+        "http://api.internal:8080",
+    ]);
+    s.ok(&["proxy", "start"]);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let get = |name: &str| {
+            client
+                .get(format!("http://127.0.0.1:{}/", s.port))
+                .header("host", format!("{name}.localhost"))
+                .send()
+        };
+        // A self-signed backend is refused unless the alias opted out.
+        let verified = get("verified").await.unwrap();
+        assert_eq!(verified.status(), 502);
+        assert!(verified
+            .text()
+            .await
+            .unwrap()
+            .contains("upstream_certificate"));
+        assert_eq!(
+            get("insecure").await.unwrap().text().await.unwrap(),
+            "host=api.internal"
+        );
+        assert_eq!(
+            get("plain").await.unwrap().text().await.unwrap(),
+            "host=api.internal:8080"
+        );
+    });
+    for mut server in servers {
+        let _ = server.kill();
+        let _ = server.wait();
+    }
+}

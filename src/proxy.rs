@@ -16,9 +16,15 @@ const MAX_CONNECTIONS: usize = 4096;
 /// Time a client gets to send a complete HTTP/1 request head.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 type Upstream = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
+type LoopbackUpstream = Client<hyper_rustls::HttpsConnector<HttpConnector<LoopbackResolver>>, Body>;
 #[derive(Clone)]
 struct ProxyContext {
     client: Upstream,
+    /// Dials every name on loopback, for `--upstream` aliases: the URI host is
+    /// the TLS server name, the connection still goes to this computer.
+    loopback: LoopbackUpstream,
+    /// The same, without certificate verification (`--insecure` aliases only).
+    loopback_insecure: LoopbackUpstream,
     settings: Arc<ProxySettings>,
     token: Arc<String>,
     stopped: tokio::sync::watch::Receiver<bool>,
@@ -421,6 +427,8 @@ async fn forward(
 ) -> Result<Response<Body>, Infallible> {
     let ProxyContext {
         client,
+        loopback,
+        loopback_insecure,
         settings,
         token,
         mut stopped,
@@ -572,6 +580,7 @@ async fn forward(
             crate::discovery::gateway::target(&hostname, peer.ip().is_loopback(), &settings.tlds)
         })
         .flatten();
+    let upstream_spec = route.and_then(|r| state.upstreams.get(&r.name)).cloned();
     let Some(target) = route.map(|r| r.target.clone()).or(remote) else {
         let local_name = settings
             .tlds
@@ -725,6 +734,25 @@ async fn forward(
         target.path().trim_end_matches('/'),
         path
     );
+    // `--upstream`: same loopback port, but our own scheme and TLS name.
+    let uri = match &upstream_spec {
+        Some(up) => {
+            let name = up
+                .authority
+                .as_deref()
+                .and_then(|a| a.parse::<hyper::http::uri::Authority>().ok())
+                .map(|a| a.host().to_owned())
+                .unwrap_or_else(|| "127.0.0.1".to_owned());
+            format!(
+                "{}://{}:{}{}",
+                if up.tls { "https" } else { "http" },
+                name,
+                target.port_u16().unwrap_or(80),
+                path
+            )
+        }
+        None => uri,
+    };
     let Ok(uri) = uri.parse::<hyper::Uri>() else {
         return Ok(error(
             StatusCode::BAD_GATEWAY,
@@ -826,11 +854,14 @@ async fn forward(
                 target.authority().unwrap()
             )
         });
-    let host_header = if remote_origin.is_some() {
-        target.authority().unwrap().to_string()
-    } else {
-        host.clone()
-    };
+    let host_header =
+        if let Some(authority) = upstream_spec.as_ref().and_then(|u| u.authority.clone()) {
+            authority
+        } else if remote_origin.is_some() {
+            target.authority().unwrap().to_string()
+        } else {
+            host.clone()
+        };
     if let Ok(v) = host_header.parse() {
         req.headers_mut().insert(header::HOST, v);
     }
@@ -846,7 +877,12 @@ async fn forward(
             body.boxed_unsync()
         },
     );
-    match client.request(req).await {
+    let sent = match &upstream_spec {
+        Some(up) if up.insecure => loopback_insecure.request(req).await,
+        Some(_) => loopback.request(req).await,
+        None => client.request(req).await,
+    };
+    match sent {
         Ok(mut response) => {
             if response.status() == StatusCode::SWITCHING_PROTOCOLS {
                 if let Some(key) = ws_key {
@@ -911,6 +947,18 @@ async fn forward(
             let mut r = response.map(|b| b.boxed_unsync());
             marker(&mut r);
             Ok(r)
+        }
+        Err(e)
+            if upstream_spec.as_ref().is_some_and(|u| u.tls)
+                && format!("{e:?}").to_ascii_lowercase().contains("certificate") =>
+        {
+            Ok(error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_certificate",
+                "The app's TLS certificate isn't trusted for this name. Trust its CA, or re-register the alias with --insecure.",
+                &host,
+                html,
+            ))
         }
         Err(_) => Ok(error(
             StatusCode::BAD_GATEWAY,
@@ -1080,12 +1128,32 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
     http.set_connect_timeout(Some(Duration::from_secs(10)));
     http.set_happy_eyeballs_timeout(Some(Duration::from_millis(50)));
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config)
+        .with_tls_config(tls_config.clone())
         .https_or_http()
         .enable_http1()
         .enable_http2()
         .wrap_connector(http);
     let client = Client::builder(TokioExecutor::new()).build::<_, Body>(connector);
+    let loopback_client = |tls: rustls::ClientConfig| {
+        let mut http = HttpConnector::new_with_resolver(LoopbackResolver);
+        http.enforce_http(false);
+        http.set_connect_timeout(Some(Duration::from_secs(10)));
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(http);
+        Client::builder(TokioExecutor::new()).build::<_, Body>(connector)
+    };
+    let loopback = loopback_client(tls_config.clone());
+    let insecure_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(NoVerify))
+    .with_no_client_auth();
+    let loopback_insecure = loopback_client(insecure_config);
     let binds = if let Some(bind) = &settings.bind {
         vec![bind.clone()]
     } else if settings.lan
@@ -1127,6 +1195,8 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
     let (_shutdown, stopped) = tokio::sync::watch::channel(false);
     let context = ProxyContext {
         client,
+        loopback,
+        loopback_insecure,
         settings: settings.clone(),
         token,
         stopped,
@@ -1240,5 +1310,75 @@ mod tests {
         );
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
         assert_eq!(escape("<script>\"'&"), "&lt;script&gt;&quot;&#39;&amp;");
+    }
+}
+
+/// Resolves every name to this computer's loopback addresses, so an
+/// `--upstream` alias can present a TLS server name while dialing locally.
+#[derive(Clone)]
+struct LoopbackResolver;
+impl tower_service::Service<hyper_util::client::legacy::connect::dns::Name> for LoopbackResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = std::io::Error;
+    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, _: hyper_util::client::legacy::connect::dns::Name) -> Self::Future {
+        std::future::ready(Ok(vec![
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+        ]
+        .into_iter()))
+    }
+}
+/// Accepts any backend certificate. Used only for aliases registered with an
+/// explicit `--insecure`, which always dial loopback.
+#[derive(Debug)]
+struct NoVerify;
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }

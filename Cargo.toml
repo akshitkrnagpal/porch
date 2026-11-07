@@ -26,6 +26,7 @@ hyper = { version = "1", features = ["full"] }
 # Only what Porch uses: the legacy pooled client and the HTTP/1+2 auto server.
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "tokio", "http1", "http2"] }
 http-body-util = "0.1"
+tower-service = "0.3"
 futures-util = "0.3"
 tokio-tungstenite = "0.28"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

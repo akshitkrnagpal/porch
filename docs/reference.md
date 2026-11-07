@@ -66,7 +66,18 @@ porch list                               # routes with health and sharing URLs
 porch list --json                        # routes with health, proxy settings and version
 ```
 
-Aliases can also point at an HTTP or HTTPS URL. For a target that isn't on this machine (`porch alias api https://staging.example.com`), Porch sends the target's own name in `Host` and TLS SNI, verifies its certificate against the system trust store, and rewrites the target's redirects to itself so they stay on the Porch URL. Targets can't carry a query string or fragment. `remove`/`rm` and `routes` are shorthands for removing and listing.
+Aliases can also point at an HTTP or HTTPS URL. For a target that isn't on this machine (`porch alias api https://staging.example.com`), Porch sends the target's own name in `Host` and TLS SNI, verifies its certificate against the system trust store, and rewrites the target's redirects to itself so they stay on the Porch URL. Targets can't carry a query string, fragment or credentials.
+
+`--upstream` sets how Porch talks to an alias's port, which it always dials on this computer:
+
+```sh
+porch alias api 8443 --upstream https                       # TLS, keeps the browser's Host
+porch alias api 8443 --upstream https://api.internal        # TLS; Host and server name api.internal
+porch alias api 8080 --upstream http://api.internal:8080    # plain HTTP with that Host
+porch alias api 8443 --upstream https --insecure            # skip certificate checks (self-signed)
+```
+
+Porch verifies the backend's certificate against the system trust store and its own CA, for the name in `--upstream` (or `127.0.0.1` with plain `https`). A certificate that doesn't verify returns a 502 with the error code `upstream_certificate`. `--insecure` turns verification off for that alias only. Portless always turns it off. `remove`/`rm` and `routes` are shorthands for removing and listing.
 
 `porch list` health values:
 

@@ -2108,6 +2108,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.28.0",
+ "tower-service",
  "tray-icon",
  "url",
  "windows-sys 0.61.2",

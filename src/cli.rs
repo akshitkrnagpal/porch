@@ -230,6 +230,13 @@ enum Commands {
         /// Keep this alias off paired machines, even when sharing is on
         #[arg(long)]
         private: bool,
+        /// How to talk to the port: https (TLS, keep Host), https://HOST[:PORT]
+        /// (TLS with that server name and Host) or http://HOST[:PORT] (that Host)
+        #[arg(long, value_name = "SPEC")]
+        upstream: Option<String>,
+        /// With an https upstream, don't verify its certificate (self-signed dev servers)
+        #[arg(long, requires = "upstream")]
+        insecure: bool,
     },
     /// Remove an alias
     #[command(alias = "rm")]
@@ -468,6 +475,8 @@ pub async fn run() -> Result<i32> {
             force,
             tld,
             private,
+            upstream,
+            insecure,
         }) => {
             if private {
                 std::env::set_var("PORCH_PRIVATE", "1")
@@ -475,11 +484,15 @@ pub async fn run() -> Result<i32> {
             if let Some(n) = remove {
                 remove_alias(&n, &tld)?
             } else {
+                let upstream = upstream
+                    .map(|spec| state::Upstream::parse(&spec, insecure))
+                    .transpose()?;
                 alias(
                     &name.context("name required")?,
                     &target.context("port or HTTP target required")?,
                     force,
                     &tld,
+                    upstream,
                 )
                 .await?
             }
@@ -1536,7 +1549,16 @@ fn conflicting_names(s: &state::State, names: &[String], p: &ProxySettings) -> V
         .map(|r| r.name.clone())
         .collect()
 }
-async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Result<()> {
+async fn alias(
+    name: &str,
+    target: &str,
+    force: bool,
+    selected: &[String],
+    upstream: Option<state::Upstream>,
+) -> Result<()> {
+    if upstream.is_some() && target.parse::<u16>().is_err() {
+        bail!("--upstream needs a port target (it always dials this computer), e.g. `porch alias api 8443 --upstream https`")
+    }
     let target = if let Ok(p) = target.parse::<u16>() {
         if p == 0 {
             bail!("port must be nonzero")
@@ -1577,6 +1599,7 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
         for n in conflicts {
             let old = s.routes.iter().find(|r| r.name == n).cloned();
             let was_private = s.private.contains(&n);
+            let old_upstream = s.upstreams.get(&n).cloned();
             state::remove_route(s, &n);
             if !selected.is_empty() {
                 if let Some(old) = old.filter(|r| r.pid.is_none()) {
@@ -1586,6 +1609,9 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
                     {
                         if was_private {
                             s.private.insert(host.clone());
+                        }
+                        if let Some(up) = &old_upstream {
+                            s.upstreams.insert(host.clone(), up.clone());
                         }
                         s.routes.push(Route {
                             name: host,
@@ -1606,11 +1632,15 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
             if enabled("PRIVATE") == Some(true) {
                 s.private.insert(n.clone());
             }
+            if let Some(up) = &upstream {
+                s.upstreams.insert(n.clone(), up.clone());
+            }
         }
         Ok(())
     })?;
+    let shown = resolve_settings(&ProxyOptions::default()).unwrap_or(p);
     for n in &names {
-        println!("{} -> {target}", p.url(n));
+        println!("{} -> {target}", shown.url(n));
     }
     Ok(())
 }
@@ -1635,6 +1665,7 @@ fn remove_alias(name: &str, selected: &[String]) -> Result<()> {
         }
         for r in old {
             let was_private = s.private.contains(&r.name);
+            let old_upstream = s.upstreams.get(&r.name).cloned();
             state::remove_route(s, &r.name);
             for host in route_hostnames(&r.name, &p)
                 .into_iter()
@@ -1642,6 +1673,9 @@ fn remove_alias(name: &str, selected: &[String]) -> Result<()> {
             {
                 if was_private {
                     s.private.insert(host.clone());
+                }
+                if let Some(up) = &old_upstream {
+                    s.upstreams.insert(host.clone(), up.clone());
                 }
                 s.routes.push(Route {
                     name: host,
