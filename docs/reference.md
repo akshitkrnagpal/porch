@@ -1,35 +1,37 @@
 # Porch reference
 
-Compatibility baseline: [Portless `49586cfa566ffce8dcc4368f0b74fce560dced49`](https://github.com/vercel-labs/portless/tree/49586cfa566ffce8dcc4368f0b74fce560dced49), frozen on 2026-11-06. The executable is `porch`; configuration uses `porch.json` and the `package.json` `porch` key. Legacy Portless names remain compatibility fallbacks.
+The executable is `porch`. Configuration lives in `porch.json` or the `porch` key in `package.json`. Portless names (`portless.json`, the `portless` key and `PORTLESS_*` variables) still work as fallbacks. Compatibility is measured against [Portless at `49586cf`](https://github.com/vercel-labs/portless/tree/49586cfa566ffce8dcc4368f0b74fce560dced49), as of 2026-11-06.
 
 ## Launching apps
 
-| Invocation | Behavior |
+| Command | What it does |
 | --- | --- |
-| `porch` | Run the configured package script, default `dev`; discover workspace packages at a workspace root |
-| `porch --script start` | Select a package script |
-| `porch run COMMAND ARGS...` | Infer an app name from package.json, Git root, or directory |
-| `porch run --name NAME COMMAND...` | Override the base name while retaining worktree naming |
-| `porch NAME COMMAND ARGS...` | Launch an explicitly named app |
-| `porch --name NAME COMMAND...` | Permit names that collide with subcommands |
-| `porch NAME --app-port 4500 -- COMMAND...` | Choose a fixed app port and terminate Porch option parsing |
-| `porch NAME --force COMMAND...` | Take over an existing route and terminate its owned app group |
-| `porch setup [--yes] [--port N] [--https\|--no-https]` | First-run walkthrough; idempotent, current values are the defaults |
-| `porch doctor [--fix] [--yes]` | Diagnose; `--fix` applies safe fixes |
+| `porch` | Runs the package's configured script (default `dev`). At a workspace root, starts every workspace package |
+| `porch --script start` | Runs a different package script |
+| `porch run COMMAND ARGS...` | Runs a command, naming the app from `package.json`, the Git root or the directory |
+| `porch run --name NAME COMMAND...` | Overrides the base name but keeps worktree naming |
+| `porch NAME COMMAND ARGS...` | Runs a command under an explicit name |
+| `porch --name NAME COMMAND...` | Same, for names that clash with a subcommand |
+| `porch NAME --app-port 4500 -- COMMAND...` | Uses a fixed app port; `--` ends Porch's options |
+| `porch NAME --force COMMAND...` | Takes over an existing route and stops the app that owned it |
+| `porch setup [--yes] [--port N] [--https\|--no-https]` | Guided first run; safe to repeat, and current values are the defaults |
+| `porch doctor [--fix] [--yes]` | Diagnoses problems; `--fix` applies the safe fixes |
 
-Launch options include `--name`, `--script`, `--prefix`, `--app-port`, `--force`, `--lan`, `--ip`, `--tailscale`, `--funnel`, `--ngrok`, and `--cloudflare`. Options following the child command belong to that child. `--prefix ''` suppresses worktree naming. `--help`, `-h`, `--version`, `-v`, and `-V` provide CLI information.
+Launch options are `--name`, `--script`, `--prefix`, `--app-port`, `--force`, `--lan`, `--ip`, `--tailscale`, `--funnel`, `--ngrok` and `--cloudflare`. Anything after the child command belongs to the child. `--prefix ''` turns off worktree naming. `--help`/`-h` and `--version`/`-v`/`-V` work as usual.
 
-The proxy starts automatically and launch waits for listener readiness before spawning the app. After spawning, Porch waits up to `PORCH_LISTEN_TIMEOUT` seconds (default 15, `0` disables) for something to accept TCP on the assigned port. If nothing does, it prints a warning and the app keeps running. When a process in the app's tree listens on a different port, the warning names it (`app is listening on 4321 instead`) and suggests `porch run --app-port 4321 COMMAND`. Porch never reroutes automatically. Its last saved configuration survives stop/restart. App ports are reserved under the shared route lock and selected from 4000–4999 when unspecified, excluding browser-blocked ports 4045 and 4190. A fixed port must be available and unreserved.
+A launch starts the proxy if needed and waits for it to accept connections before starting the app. It then waits up to `PORCH_LISTEN_TIMEOUT` seconds (default 15, `0` disables) for something to accept TCP on the assigned port. If nothing does, Porch prints a warning and leaves the app running. If a process in the app's tree is listening on another port, the warning names it (`app is listening on 4321 instead`) and suggests `porch run --app-port 4321 COMMAND`. Porch never reroutes on its own. Unless you pick one, app ports come from 4000–4999, skipping 4045 and 4190, which browsers block. A fixed port must be free and not reserved by another route.
 
-Child exit codes are preserved. Unix children lead their own process groups; signal forwarding and cleanup cover descendants. Persistent ownership records include process start identity so stale routes can be distinguished from a reused PID. `prune --force` removes orphan routes and terminates their owned children. Successful commands that leave an owned listening daemon transfer their route to that process. On Windows, children lead their own console process group and receive Ctrl+Break from their launcher; Porch's own processes (proxy, discovery agent, launchers) stop on a named-event request and are force-ended only as a fallback. Windows code uses native process identity and kill-on-close Job Objects for tree termination; native Windows runtime acceptance is a separate verification requirement.
+Porch exits with the child's exit code. On Unix, each child leads its own process group, so signals and cleanup reach its descendants. Route ownership records store each process's start time as well as its PID, so a reused PID isn't mistaken for the original app. When a command exits successfully but leaves a daemon it started listening, the route moves to that daemon. `porch prune --force` removes orphaned routes and stops the processes they own.
+
+On Windows, each child gets its own console process group and receives Ctrl+Break from its launcher. Porch's own processes (proxy, discovery agent, launchers) stop when asked through a named event and are force-ended only as a fallback. Job Objects make sure a whole process tree ends together.
 
 ## Proxy and routes
 
 ```sh
-porch proxy start                         # HTTP, port 7462, no sudo (default)
-porch proxy start --port 8080             # HTTP, custom port, no sudo
-porch proxy start --https                 # opt-in HTTPS on 7462 with HTTP/2, per-user CA trust, no sudo
-porch proxy start --https --port 443      # HTTPS without a port in the URL (binding 443 asks for sudo)
+porch proxy start                         # HTTP on port 7462, no sudo (default)
+porch proxy start --port 8080             # HTTP on another port, no sudo
+porch proxy start --https                 # HTTPS with HTTP/2 on the same port, per-user CA trust, no sudo
+porch proxy start --https --port 443      # HTTPS without a port in URLs (binding 443 needs sudo)
 porch proxy start --foreground
 porch proxy start --tld localhost --tld test --wildcard
 porch proxy start --cert ./cert.pem --key ./key.pem
@@ -38,131 +40,162 @@ porch proxy stop
 porch proxy status
 ```
 
-Proxy options are `--port`/`-p`, `--https`, `--no-tls`, `--foreground`, `--skip-trust`, `--unprivileged`, `--lan`, `--ip`, repeatable/comma-separated `--tld`, `--wildcard`, paired `--cert`/`--key`, and `--state-dir`. Porch also provides explicit `--bind` and `--redirect-port` overrides. A custom certificate implies TLS.
+Proxy options: `--port`/`-p`, `--https`, `--no-tls`, `--foreground`, `--skip-trust`, `--unprivileged`, `--lan`, `--ip`, `--tld` (repeatable or comma-separated), `--wildcard`, `--cert` with `--key`, `--state-dir`, `--bind` and `--redirect-port`. Passing a certificate turns on TLS.
 
-Port and privilege mode are one setting. Ports ≥1024 imply unprivileged mode: no sudo and no hosts-file synchronization. HTTPS keeps the current high port; it moves to 7462 only when switching from port 80. CA trust is per user and needs no sudo, so interactive HTTPS starts on any port offer it; unattended no-sudo starts print a `porch trust` hint instead of failing. Browsers resolve `*.localhost` without hosts entries. Set `PORCH_SYNC_HOSTS=1` only if you explicitly want hosts entries on a high port. Ports below 1024 (HTTPS on 443) need administrator rights. Interactive startup runs `sudo -v` before detaching. Unattended startup uses cached sudo authorization or fails with `porch proxy start --no-tls --port 7462` as the no-sudo alternative. `--unprivileged` still forces no-sudo mode on a low port where the OS allows wildcard binding.
+**Ports and sudo.** The port decides whether Porch needs administrator rights. On ports 1024 and up, Porch never uses sudo and doesn't edit the hosts file, since browsers resolve `*.localhost` on their own. Set `PORCH_SYNC_HOSTS=1` if you want hosts entries anyway. Turning on HTTPS keeps the current port, except that a proxy on port 80 moves to 7462. Trusting the local CA is per user and needs no sudo, so an interactive HTTPS start offers to do it on any port. An unattended start skips the prompt and prints a `porch trust` hint. Ports below 1024 (such as HTTPS on 443) need administrator rights: an interactive start runs `sudo -v` before detaching, and an unattended start uses cached sudo credentials or fails and suggests `porch proxy start --no-tls --port 7462`. `--unprivileged` forces no-sudo mode on a low port where the OS allows it.
 
-Normal listeners bind IPv4 and IPv6 loopback. LAN mode, and unprivileged low ports, bind both wildcard addresses; the proxy rejects non-loopback peers unless LAN is enabled. Listeners and app reservations use exclusive non-reuse binds across IPv4/IPv6 wildcard interfaces.
+**Listeners.** The proxy normally binds the IPv4 and IPv6 loopback addresses. LAN mode, and unprivileged low ports, bind the wildcard addresses instead, and the proxy turns away non-loopback clients unless LAN mode is on. Proxy listeners and app port reservations use exclusive binds.
 
-Port conflicts never dead-end. When the proxy port is busy, Porch identifies the owner (pid and process name via `lsof` on macOS, `ss` then `lsof` on Linux; best effort, since other users' processes may be invisible without sudo). A default or saved port moves to the next free port, skipping 7463 (reserved for Porch discovery). The new port is saved, and one line reports the move. An explicit `--port` or `PORCH_PORT` never moves silently; startup fails with the owner and a suggested `porch proxy start --port N`. An HTTPS port below 1024 does not move; Porch suggests the no-sudo HTTP default instead. A port held only by recently closed connections (no listener, typically for about 30 seconds after a proxy stop) is waited out, up to 60 seconds, rather than moved.
+**Busy ports.** When the proxy port is taken, Porch names the process holding it (via `lsof` on macOS, `ss` then `lsof` on Linux; processes owned by other users may be hidden without sudo). A default or saved port moves to the next free port, skipping 7463, which is reserved for discovery, and Porch saves the new port and prints one line about the move. A port you chose with `--port` or `PORCH_PORT` never moves: startup fails, names the owner and suggests `porch proxy start --port N`. An HTTPS port below 1024 doesn't move either; Porch suggests the no-sudo HTTP default instead. If the port is held only by recently closed connections (usually for about 30 seconds after the proxy stops), Porch waits up to 60 seconds for it rather than moving.
 
-The proxy records its version in `proxy.version`. When a newer `porch` binary finds an older proxy running (or one that predates the record), it restarts the proxy with the same saved settings. Routes live in state and survive the restart.
+**Upgrades.** The proxy writes its version to `proxy.version`. When a newer `porch` finds an older proxy running, it restarts the proxy with the same settings. Routes are kept in state, so they survive the restart.
 
-HTTPS supports HTTP/1.1 and HTTP/2. The proxy streams request/response bodies, forwards WebSocket Upgrade and RFC 8441 extended CONNECT, preserves forwarding metadata, and detects recursive proxy loops. Plain HTTP requests on a TLS listener redirect to HTTPS; an additional redirect listener can be configured. Unknown configured hosts receive a structured 404; unrelated domains receive 421. HTML and JSON error responses include a useful error code.
+**Protocols.** The proxy speaks HTTP/1.1 and, over TLS, HTTP/2. It streams request and response bodies, forwards WebSocket upgrades (including RFC 8441 extended CONNECT), adds forwarding headers and detects proxy loops. Plain HTTP requests to a TLS port are redirected to HTTPS, and `--redirect-port` adds a separate redirect listener. Requests for an unknown name under a configured TLD get a 404 page; requests for unrelated domains get a 421. Error pages come in HTML or JSON and include an error code.
 
-TLD labels obey DNS rules. Multi-segment and overlapping TLDs match the longest configured suffix. Strict routing is the default; `--wildcard` falls back to the most specific registered parent. Exact routes win. Explicit TLD aliases remain scoped to the selected configured domains.
+**Matching.** TLDs must be valid DNS labels. When configured TLDs overlap, the longest match wins. Routing is strict by default: with `--wildcard`, a request for an unregistered subdomain goes to the closest registered parent. An exact route always wins. An alias registered with `--tld` applies only to that TLD.
 
 ```sh
 porch alias database 5432
 porch alias web 3000 --force --tld test
 porch alias --remove web --tld test
-porch get web                            # public URL, even before registration
+porch get web                            # the app's URL, even before it is registered
 porch get web --no-worktree
-porch list                               # routes with health, plus sharing URLs
-porch list --json                         # structured routes (with health), proxy settings and version
+porch list                               # routes with health and sharing URLs
+porch list --json                        # routes with health, proxy settings and version
 ```
 
-Aliases also accept HTTP/HTTPS upstream URLs. `remove`/`rm` and `routes` are additional aliases for removal and listing.
+Aliases can also point at an HTTP or HTTPS URL. `remove`/`rm` and `routes` are shorthands for removing and listing.
 
-`list` health values: `ok`; `not listening` (nothing accepts on the target); `stopped` (an owned process is job-control stopped, state T, e.g. frozen by SIGTTOU/SIGTTIN; JSON includes `stopped_seconds`); `dead` (launcher exited while app processes remain; `porch prune --force`). Routes whose launcher and app are both gone are removed automatically on `list`, on launch, on proxy start, and every 5 seconds by the running proxy.
+`porch list` health values:
+
+- `ok`: the target accepts connections.
+- `not listening`: nothing accepts connections on the target.
+- `stopped`: a process the route owns is suspended by job control (state T, for example after SIGTTOU or SIGTTIN). JSON output adds `stopped_seconds`.
+- `dead`: the launcher has exited but app processes remain. Clean up with `porch prune --force`.
+
+Routes whose launcher and app are both gone are removed automatically on `list`, on launch, on proxy start, and every 5 seconds while the proxy runs.
 
 ## Configuration and workspaces
 
-Every caller selects one source per directory: `porch.json`, then `package.json` `porch`, then `portless.json`, then `package.json` `portless`. A malformed selected source fails explicitly; lower-priority sources are fallbacks, not merged overrides.
+Porch reads one configuration source per directory, the first it finds of: `porch.json`, the `porch` key in `package.json`, `portless.json`, the `portless` key in `package.json`. Sources are not merged. If the chosen source is malformed, Porch reports an error rather than falling back to the next one.
 
 | Field | Meaning |
 | --- | --- |
 | `name` | Base hostname; inferred when absent |
-| `script` | Package script, default `dev` |
-| `appPort` | Fixed app port from 1–65535 |
-| `proxy` | Whether this app/task gets a route and assigned port |
-| `apps` | Workspace overrides keyed by relative package directory |
-| `turbo` | Use the root Turbo runner unless explicitly false |
+| `script` | Package script to run, default `dev` |
+| `appPort` | Fixed app port, 1–65535 |
+| `proxy` | Whether this app or task gets a route and an assigned port |
+| `apps` | Per-package overrides, keyed by the package's path relative to the workspace root |
+| `turbo` | Run through the root Turbo task unless set to `false` |
 | `worktree.prefix` | `last-segment` (default) or `branch` |
-| `worktree.hostnameTemplate` | Template containing `{worktree}`, optionally `{name}` |
+| `worktree.hostnameTemplate` | Template containing `{worktree}` and optionally `{name}` |
 
-A package's `porch` value can be a name string or app settings object. CLI selections take priority; leaf package settings override workspace app entries. Worktree fields merge from root to leaf. Direct leaf launches inherit root worktree settings and matching `apps` entries, but not root name/appPort/script. A root name supplies the project domain, so packages infer `web.shop` and `api.shop`. At the workspace root, the root script remains the coordinator default. Long generated labels receive a stable hash suffix. Linked worktrees on feature branches get a prefix; the main checkout and default branches do not.
+A package's `porch` value can be a name string or a settings object. Precedence, highest first: CLI options, the package's own settings, then the matching `apps` entry at the root. Worktree settings merge from the root down to the package. When you launch a package directly, it inherits the root's worktree settings and its `apps` entry, but not the root's `name`, `appPort` or `script`. A root `name` becomes the project domain, so packages are named `web.shop`, `api.shop` and so on. At the workspace root, the root's own script still runs by default. Very long generated names are shortened with a stable hash suffix.
 
-Workspace discovery reads `pnpm-workspace.yaml` or array/object `package.json` workspaces and supports single-segment star patterns and exclusions. Unlisted apps infer `<package>.<project>` using the common npm scope, then root name/directory fallback. Known build-only commands such as `tsc` and `tsup` run as tasks without routes. Duplicate generated app names fail before launch.
+In a linked Git worktree on a feature branch, names get a prefix from the branch. The main checkout and default branches get no prefix.
 
-Package managers are resolved from `packageManager` and ancestor lockfiles: npm, pnpm, yarn, and bun. Package scripts execute through the package manager, preserving shell semantics and lifecycle hooks. Local and ancestor `node_modules/.bin` directories are added to PATH.
+Workspaces come from `pnpm-workspace.yaml` or the `workspaces` field in `package.json` (array or object form). Patterns support `*` within a path segment, `**` for any depth, and `!` exclusions. Packages without their own name are named `<package>.<project>`, using the shared npm scope, the root name or the directory as the project. Build-only commands such as `tsc` and `tsup` run as tasks without routes. Two packages that would get the same name stop the launch before anything starts.
 
-With `turbo.json`/`turbo.jsonc`, Porch reserves package routes and runs the root task command once. A per-launch Node preload supplies each package's environment without replacing the Turbo graph. It also supplies required framework flags to Node framework CLIs. Package wrappers using `dev: porch` with `porch.script: dev:app` inherit the reserved environment and avoid a second route owner. Use `porch -- --filter=web` to pass arguments to the root Turbo runner. Setting `turbo: false` uses direct concurrent spawning. Explicit named Turbo graph commands (including root `pnpm run dev` scripts that invoke Turbo) are rejected at multi-package roots: use bare `porch` or coordinator filtering to retain separate ports.
+The package manager (npm, pnpm, Yarn or Bun) comes from `packageManager` or the nearest lockfile. Scripts run through it, so shell syntax and lifecycle hooks behave normally. Local and parent `node_modules/.bin` directories are added to PATH.
 
-Framework detection covers Vite, VitePress, VitePlus (`vp`), React Router, Rsbuild, Astro, Angular (`ng`), React Native, Expo, and Wrangler. It recognizes package runners and one level of package-script indirection. Existing port/host choices are preserved. Build/non-server commands receive no server flags. Compound scripts, trailing comments, and framework `--` boundaries are deliberately left to the package manager rather than appending flags to the wrong command. Expo in LAN mode receives neither an injected HOST variable nor a forced localhost host flag.
+**Turborepo.** With a `turbo.json` or `turbo.jsonc`, Porch reserves a route for each package and runs the root task once. A Node preload gives each package its own `PORT`, URL and framework flags, so Turbo keeps its task graph and TUI. A package whose `dev` script is `porch`, with `porch.script` set to `dev:app`, picks up the reserved environment instead of creating a second route. Pass arguments to Turbo after `--`, for example `porch -- --filter=web`. Set `turbo: false` to start packages directly and concurrently instead. At a multi-package root, a named command that runs the Turbo graph (including a root `pnpm run dev` that calls Turbo) is rejected, because every package would share one port. Use bare `porch` or Turbo's filters instead.
+
+**Framework flags.** Porch adds port and host flags for Vite, VitePress, VitePlus (`vp`), React Router, Rsbuild, Astro, Angular (`ng`), React Native, Expo and Wrangler. It sees through package runners and one level of package script. Port and host flags you already set are kept, and build commands get none. Compound scripts, trailing comments and framework `--` separators are left alone, because appending flags there could hit the wrong command. Expo in LAN mode gets no `HOST` variable and no forced localhost flag.
 
 ## Environment
 
-Public `PORCH_*` settings take precedence over the corresponding `PORTLESS_*` compatibility setting.
+Each `PORCH_*` setting overrides its `PORTLESS_*` equivalent.
 
-| Suffix | Input behavior |
+| Variable (`PORCH_` + …) | Meaning |
 | --- | --- |
 | `STATE_DIR` | State directory, default `~/.porch` |
-| `PORT` | Proxy port (default 7462); explicit, so a busy port fails rather than moves |
-| `APP_PORT` | App port; explicit CLI selection wins |
-| `HTTPS` | `1` opts in to HTTPS on the same port (default 7462; set `PORT=443` for the standard port); plain HTTP by default |
-| `LAN`, `LAN_IP` | LAN mode and optional pinned address |
-| `TLD` | Comma-separated configured domains |
-| `PREFIX` | Worktree prefix; empty disables |
-| `WILDCARD` | Parent wildcard fallback |
-| `UNPRIVILEGED` | No elevation or automatic hosts changes; implied for ports ≥1024 |
-| `SYNC_HOSTS` | `0` disables automatic hosts reconciliation; `1` requests it even on a high port |
+| `PORT` | Proxy port (default 7462). Counts as an explicit choice, so a busy port fails instead of moving |
+| `APP_PORT` | App port; a CLI option overrides it |
+| `HTTPS` | `1` turns on HTTPS on the same port (default 7462; set `PORCH_PORT=443` for the standard port) |
+| `LAN`, `LAN_IP` | LAN mode and an optional fixed address |
+| `TLD` | Comma-separated list of domains to serve |
+| `PREFIX` | Worktree prefix; empty turns it off |
+| `WILDCARD` | Fall back to the closest registered parent |
+| `UNPRIVILEGED` | Never use sudo or edit the hosts file; implied for ports 1024 and up |
+| `SYNC_HOSTS` | `0` turns off hosts-file updates; `1` turns them on even on a high port |
 | `LISTEN_TIMEOUT` | Seconds to wait for a launched app to listen before warning (default 15, `0` disables) |
-| `TAILSCALE`, `FUNNEL`, `NGROK`, `CLOUDFLARE` | Sharing provider selection |
-| `SKIP_TRUST` | Skip interactive CA trust setup |
+| `TAILSCALE`, `FUNNEL`, `NGROK`, `CLOUDFLARE` | Sharing provider |
+| `SKIP_TRUST` | Skip the interactive CA trust prompt |
 
-`PORCH=0` or `PORTLESS=0` bypasses routing; `false` and `skip` are also accepted. The child keeps the normal package command and its inherited environment. It receives no newly allocated port or proxy URL.
+`PORCH=0` or `PORTLESS=0` (also `false` or `skip`) turns Porch off for a run. The command runs as normal with its inherited environment and no assigned port or URL.
 
-Child outputs include `PORT`, `HOST`, `PORCH_URL`, `NODE_EXTRA_CA_CERTS` for the generated CA, `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS` for configured domains, and provider variables `PORCH_TAILSCALE_URL`, `PORCH_NGROK_URL`, and `PORCH_CLOUDFLARE_URL`. The launcher records sharing URLs for list output. Expo LAN intentionally omits HOST. Internal active/manifest/authentication variables are implementation details, not configuration inputs.
+Porch sets these variables for the app: `PORT`, `HOST`, `PORCH_URL`, `NODE_EXTRA_CA_CERTS` (the local CA), `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS` (the configured domains), and when sharing, `PORCH_TAILSCALE_URL`, `PORCH_NGROK_URL` or `PORCH_CLOUDFLARE_URL`. The matching `PORTLESS_*` names are set too, for apps that read them. Expo in LAN mode gets no `HOST`. Other internal variables are not configuration and may change.
 
-## Host, service, sharing and Compose integration
+## HTTPS and trust
 
-`hosts sync` and `hosts clean` reconcile only Porch's managed hosts block, preserving other entries and validating file reads/writes. Automatic elevated sync uses a private token and loopback challenge/proof authentication; browser-origin requests are rejected. Tests override the hosts path and never touch the real file.
+`porch trust` installs the local CA for the current user, without sudo:
 
-`trust` installs the generated CA for the current user without sudo: the macOS login keychain (one password or Touch ID dialog), the Linux NSS databases used by Chrome/Chromium (`~/.pki/nssdb`, created if missing) and every Firefox profile (needs NSS `certutil`), the Windows user Root store, and on WSL also the Windows user store. `trust --system` instead uses the macOS System keychain or the distribution's CA tooling, so command-line tools trust it too; it asks for sudo. Apps that Porch launches already get `NODE_EXTRA_CA_CERTS`. The record keeps the scope, so `clean` removes per-user trust as you and only elevates for system trust. `clean` removes owned trust/service/hosts resources and known state, retaining certificate material when trust removal cannot be completed safely. CA generation and HTTPS client verification are exercised without adding test CAs to the host trust store. In unattended sessions, an untrusted CA never prompts: no-sudo HTTPS starts continue with a `porch trust` hint, and privileged (port 443) starts fail with a descriptive error; `--skip-trust` or `PORCH_SKIP_TRUST=1` supports clients that explicitly load the generated CA.
+- macOS: the login keychain (one password or Touch ID prompt).
+- Linux: the NSS database Chrome and Chromium use (`~/.pki/nssdb`, created if missing) and every Firefox profile. Needs NSS `certutil`.
+- Windows: the current user's Root store. Under WSL, Porch also uses the Windows user store.
 
-`service install`, `service status`, and `service uninstall` generate/manage launchd, systemd, or Windows Task Scheduler startup definitions. Install accepts the proxy configuration flags and state directory. Generated definitions persist explicit settings and logs. Their foreground daemon skips interactive trust setup so boot is unattended; the app launcher or `porch trust` installs browser trust. Native privileged startup/trust installation has not been exercised by ordinary acceptance tests.
+`porch trust --system` installs the CA machine-wide instead (the macOS System keychain or the distribution's CA tools), so command-line tools trust it too. It needs sudo. Apps that Porch launches trust the CA through `NODE_EXTRA_CA_CERTS` either way. Porch records where it installed the CA, so `porch clean` removes per-user trust without sudo and asks for sudo only to remove system trust.
 
-`--tailscale` and `--funnel` check tailnet/HTTPS prerequisites and allocate an independent HTTPS port for each registration. `--ngrok` and `--cloudflare` wait for a usable public URL before app spawn. Sharing sessions own their external processes/registrations and clean them up on exit. Live provider credentials and public network access are not needed by the fake-executable tests.
+When no one is at the terminal, Porch never shows a trust prompt. A no-sudo HTTPS start carries on and prints a `porch trust` hint; a start on port 443 fails with an explanation. Clients that load the CA themselves can use `--skip-trust` or `PORCH_SKIP_TRUST=1`.
 
-`compose [GLOBAL FLAGS] up [ARGS...]` resolves the Compose model, allocates stable loopback ports for HTTP services, registers service/port names, and leaves non-HTTP published ports intact. Global flags such as `-f`, `-p`, `--profile`, `--env-file`, and `--project-directory` retain their meaning. Repeated runs reuse route ports; down/stale reconciliation removes only that project's routes. Docker interaction is fixture-tested; a live Docker Engine check remains external verification.
+Porch issues certificates only for configured TLDs, registered route names and, in LAN mode, `.local` names. Requests for any other name are refused before a certificate is created, including names that were removed after a certificate was cached. Leaf certificates are valid for at most 365 days and the CA for at most 10 years. An existing CA and key are never rewritten, so trust you have installed keeps working. Replacing a CA made by an older version means running `porch clean` and setting up trust again.
 
-LAN advertisement publishes route-specific `.local` names and refreshes route/IP changes every two seconds. A pinned IP remains fixed. Multicast reachability and physical network transitions need a real multi-device LAN check.
+## Hosts file, startup, sharing and Compose
 
-`doctor` reports proxy/state/routes, hostname resolution, trust, and external-tool prerequisites, then lists issues as `problem → fix applied` or `problem → command to run`. `doctor --fix` applies safe fixes. It moves a stopped proxy off a busy port, prunes dead routes, restarts an outdated proxy, and switches legacy high-port settings to no-sudo mode. Terminating stopped or orphaned launches asks first; `--yes` accepts. Non-interactive sessions without `--yes` never terminate anything. `prune [--force]` terminates stale owned children; `clean` performs explicit teardown.
+**Hosts file.** `porch hosts sync` and `porch hosts clean` edit only Porch's own block in the hosts file and leave other entries alone. Automatic updates on low ports go through the proxy, which authenticates each request with a private token and a loopback challenge and rejects requests from browsers. When an update fails, Porch prints one hint per state directory, since browsers resolve `.localhost` without hosts entries. Other clients may still need `sudo porch hosts sync`.
+
+**Start at login.** `porch service install`, `porch service status` and `porch service uninstall` manage a launchd, systemd or Windows Task Scheduler entry that starts the proxy at boot. `install` accepts the same options as `porch proxy start`, and saves them along with a log location. The service skips the interactive trust prompt; run `porch trust` or launch an app to install browser trust.
+
+**Sharing.** `--tailscale` and `--funnel` check that Tailscale and HTTPS are ready, then give each app its own HTTPS port. `--ngrok` and `--cloudflare` wait for the public URL before starting the app. Porch stops the tunnel processes and removes the registrations it created when the app exits.
+
+**Docker Compose.** `porch compose [GLOBAL FLAGS] up [ARGS...]` reads the Compose model, assigns each HTTP service a stable loopback port and registers a route named after the service and port. Ports for non-HTTP services are left as they are. Global flags such as `-f`, `-p`, `--profile`, `--env-file` and `--project-directory` work as they do in Docker Compose. Running it again reuses the same ports, and `down` or stale containers remove only that project's routes.
+
+**LAN.** `--lan` publishes a `.local` name for each route over mDNS and checks for route and IP changes every two seconds. A fixed `--ip` never changes.
+
+**Cleanup.** `porch doctor` checks the proxy, state, routes, name resolution, trust and external tools, then lists each problem with either `fix applied` or the command to run. `porch doctor --fix` moves a stopped proxy off a busy port, prunes dead routes, restarts an outdated proxy and switches old high-port settings to no-sudo mode. It asks before stopping any process; `--yes` answers for you, and without `--yes` a non-interactive run never stops anything. `porch prune [--force]` stops processes left by stale routes, and `porch clean` removes everything Porch installed: trust, services, hosts entries and state. It keeps the CA files if it can't safely remove their trust.
 
 ## First run: `porch setup`
 
-`porch setup` walks through four choices and is safe to re-run. Each prompt defaults to the current value.
+`porch setup` asks four questions. Each defaults to your current setting, so running it again only changes what you change.
 
-1. HTTPS opt-in (default no): keeps the proxy port and adds a local CA to your user's trust store, without sudo.
-2. Proxy port (default 7462, for HTTP and HTTPS): a busy port is reported with its owner, and the next free port is offered.
-3. Start at login (default: current): installs or uninstalls the `porch service` startup definition, which asks for sudo. When sharing is also on, discovery starts at login too (`porch discovery autostart`, per-user, no sudo).
-4. Share with your other machines (default: current): enables or disables discovery on this machine's private address through the discovery API, with app sharing granted. Peers still pair explicitly.
+1. **HTTPS** (default no). Keeps the proxy port and adds a local CA to your user's trust store, without sudo.
+2. **Proxy port** (default 7462, for HTTP and HTTPS). If the port is busy, Porch names the process using it and offers the next free port.
+3. **Start at login.** Installs or removes the `porch service` entry, which asks for sudo. If sharing is also on, discovery starts at login too (`porch discovery autostart`, per user, no sudo).
+4. **Share with your other machines.** Turns sharing on or off on this machine's private address. Other machines still have to pair.
 
-Then it saves settings and starts (or restarts) the proxy. It prints a three-line summary and the next command. `--yes`, or stdin that is not a terminal, accepts every default without prompting. `--port`, `--https` and `--no-https` preselect answers.
+Setup then saves the settings, starts or restarts the proxy, and prints a short summary and the next command to run. `--yes`, or input that isn't a terminal, accepts every default. `--port`, `--https` and `--no-https` answer those questions in advance.
 
 ## Updates
 
-`porch self-update` upgrades Porch. When the running binary lives in a Homebrew Cellar it prints and runs `brew upgrade akshitkrnagpal/tap/porch`. Otherwise it reads the latest GitHub Release, downloads `porch-VERSION-TARGET.tar.gz`, verifies it against the release `SHA256SUMS`, and atomically replaces the running executable (temp file beside it, fsync, rename, `porch.old` kept until `porch --version` reports the new version). `porch-tray`/`porch-login` beside it and, on macOS, an installed `~/Applications/Porch.app` are replaced too. Running apps, the proxy, and the tray keep running; a proxy started by the previous version is restarted on next use. Binaries inside a Cargo `target/` directory are refused unless `--force`.
+`porch self-update` installs the latest release. If `porch` was installed with Homebrew, it runs `brew upgrade akshitkrnagpal/tap/porch`. Otherwise it downloads `porch-VERSION-TARGET.tar.gz` from the latest GitHub Release, checks it against the release's `SHA256SUMS`, and replaces the running binary safely: it writes a temporary file beside it, syncs and renames it, and keeps `porch.old` until the new binary reports its version. It also replaces `porch-tray` and `porch-login` if they sit beside `porch`, and on macOS the installed `~/Applications/Porch.app`. Running apps, the proxy and the tray keep running, and a proxy started by the old version restarts the next time you use Porch. Binaries inside a Cargo `target/` directory are left alone unless you pass `--force`.
 
-`--check` prints current and latest versions and exits 0 (up to date), 1 (update available), or 2 (error). `--dry-run` prints the plan without downloading or running brew. `--force` reinstalls the latest release.
+`--check` prints the current and latest versions and exits with 0 (up to date), 1 (update available) or 2 (error). `--dry-run` prints what would happen without downloading anything. `--force` reinstalls the latest release.
 
-| Variable | Behavior |
+| Variable | Meaning |
 | --- | --- |
 | `PORCH_UPDATE_REPO` | Release repository, default `akshitkrnagpal/porch` |
 | `PORCH_UPDATE_API` | GitHub API base URL, default `https://api.github.com` |
-| `GITHUB_TOKEN`, `GH_TOKEN` | Token for private repositories; `porch self-update` also tries `gh auth token` |
-| `PORCH_NO_UPDATE_CHECK=1` | Disable the passive update notice |
-| `PORCH_APP_DIR` | Directory holding the installed `Porch.app`, default `~/Applications` |
+| `GITHUB_TOKEN`, `GH_TOKEN` | Token for a private repository; `porch self-update` also tries `gh auth token` |
+| `PORCH_NO_UPDATE_CHECK=1` | Turns off the update notice |
+| `PORCH_APP_DIR` | Where `Porch.app` is installed, default `~/Applications` |
 
-Interactive commands check for a newer release in a background thread (2 s timeout) at most once per 24 hours, caching the result in `STATE_DIR/update-check.json`, and print at most one dim line per day: `porch 0.3.1 is available — run porch self-update`. The check is skipped when stderr is not a terminal, for `--json` output, `mcp`, `tray`, `self-update`, under `CI`, and when running as root. The passive check never invokes `gh`.
+Interactive commands check for a new release at most once a day, in the background with a 2-second timeout, and cache the answer in `STATE_DIR/update-check.json`. When one is out, they print a single dim line such as `porch 0.5.0 is available — run porch self-update`. The check is skipped when stderr isn't a terminal, for `--json` output, for `mcp`, `tray` and `self-update`, when `CI` is set and when running as root. It never calls `gh`.
 
 ## MCP
 
-`porch mcp [--tools core,proxy,diagnostics,all]` serves newline-delimited stdio JSON-RPC. `default` aliases `core`; `full` aliases `all`. Core exposes list/get/static alias management and profile discovery; proxy adds start/stop; diagnostics adds doctor/prune/version. The server does not spawn development servers. Tool arguments include `cwd`, `extraArgs`, and `timeoutMs`, with typed route/proxy options where applicable. Foreground commands are rejected. Stdout is reserved for protocol responses.
+`porch mcp [--tools core,proxy,diagnostics,all]` runs an MCP server over stdio (newline-delimited JSON-RPC). `default` is the same as `core`, and `full` the same as `all`. `core` lists and looks up routes, manages static aliases and reports which tool profiles are active; `proxy` adds start and stop; `diagnostics` adds doctor, prune and version. The server can't start dev servers or run foreground commands. Tools accept `cwd`, `extraArgs` and `timeoutMs`, plus route and proxy options where they apply. Stdout carries only protocol messages.
 
-## Build verification
+## Machines and the tray
+
+`porch pair` shows a 6-digit code. It starts the discovery agent on port 7463 and turns on app sharing, using a private interface chosen automatically. Run `porch pair CODE [--host NAME-OR-IP]` on another machine to pair the two in both directions. Scripts can use `--bind IP`, `--port PORT`, `--no-wait` and `--json`. `porch unpair MACHINE` removes a pairing on both machines.
+
+Apps on a paired machine open at `http://APP.MACHINE.localhost:PROXY_PORT` through your local proxy. `porch list --all [--json]` and `porch peers [list|refresh] [--json]` show local and remote apps together. `porch open APP [--peer ID] [--url-only]` opens an app and `porch copy APP [--peer ID]` copies its URL. `porch tray` starts the optional `porch-tray` app; the `porch` CLI itself has no desktop dependencies.
+
+`porch discovery enable --bind PRIVATE_IP [--port 7463] [--share-apps] [--no-advertise]` starts the discovery agent by hand. Sharing apps is a separate opt-in. `discovery serve` runs the saved configuration in the foreground, and `discovery autostart enable|disable|status` starts the agent at login (a LaunchAgent on macOS, a systemd user unit on Linux, a scheduled task on Windows; no sudo). `status [--json]`, `fingerprint`, `pair-token`, `revoke`, `disconnect` and `disable` manage this machine's agent. For setups that skip codes, `porch peers add ENDPOINT --fingerprint SHA256 [--token-file PATH]` enrolls a machine with a one-time token (`peers trust` is the same command), and `peers remove ID` forgets a machine on this side only.
+
+Porch never turns on sharing, login startup, trust, Tailscale Serve or Funnel, or public tunnels by itself. [Apps across machines](discovery.md) covers setup, the security model and the wire protocol.
+
+## Building and CI
 
 ```sh
 cargo fmt --all -- --check
@@ -171,20 +204,4 @@ cargo test --all-targets
 cargo build --release
 ```
 
-CI runs these on native Ubuntu x86_64 and macOS ARM64 runners. A Windows runner lints and builds the CLI and tray, runs the unit and integration tests, and checks packaging; the `first_run`, `integrations`, `lifecycle` and `pty` suites are Unix-only so far. Pushing a `v*` tag builds release archives (CLI, tray, and `Porch.app` on macOS; `.exe` binaries on Windows), publishes them on GitHub Releases with `SHA256SUMS`, and updates the Homebrew formula when the `HOMEBREW_TAP_TOKEN` secret is set. Archives are not signed or notarized.
-
-Configuration lookup prefers `porch.json`, then the package `porch` key, then `portless.json`, then the package `portless` key. A native package key can override app fields from the file, consistent with leaf package overrides. A malformed selected native configuration is an error, never a reason to fall back to legacy settings. Legacy child environment names are also emitted for migration.
-
-
-## Certificate issuance and hosts capability
-
-Automatic TLS issuance accepts configured TLDs, registered route names, and `.local` in LAN mode; unrelated SNI is rejected before certificate creation, including previously cached names after removal. Leaves have hostname CN/SAN, serverAuth EKU and at most 365 days validity. New local CAs have at most 3650 days validity and pathLen=0. Persisted roots/keys are retained byte-for-byte to preserve installed trust, with profile-v2 leaves taking effect after daemon restart and a one-time legacy-root hint. DNS NameConstraints are not fixed on the root because domains can change; the running resolver enforces the issuance boundary. Replacing a legacy root requires explicit cleanup and renewed trust setup. Real trusted-CA Safari/Chrome/Firefox behavior remains unverified.
-
-Automatic hosts updates use the daemon's recorded write capability to avoid requesting writes from an incapable proxy. Custom-domain permission errors retain setup guidance; authentication failures remain separate 403 responses, while write failures return 409. Browser `.localhost` resolution needs no hosts entries, so failure yields one hint per state directory. Other clients may still require explicit `sudo porch hosts sync`. The loopback challenge/proof, token and Origin protections apply unchanged.
-
-
-## Desktop and discovery
-
-`porch pair` shows a 6-digit code (starting the discovery agent and app sharing on an automatically chosen private interface, port 7463); `porch pair CODE [--host NAME-OR-IP]` on another machine pairs both machines with each other. `[--bind IP] [--port PORT] [--no-wait] [--json]` are for scripts. `porch unpair MACHINE` forgets a machine on both sides. Paired apps open at `http://APP.MACHINE.localhost:PROXY_PORT` through the local proxy. `porch tray` launches the optional `porch-tray` companion. The CLI remains headless with no desktop runtime dependencies. `porch list --all [--json]` and `porch peers [list|refresh] [--json]` return the shared versioned local/remote catalog. Advanced: `porch peers add ENDPOINT --fingerprint SHA256 [--token-file PATH]` enrolls using a one-time token on stdin or a private file; `peers trust` aliases Add. `peers remove ID` forgets local trust. `porch open APP [--peer ID] [--url-only]` and `porch copy APP [--peer ID]` use supported state; remote apps use readable URLs served by the local proxy.
-
-`porch discovery enable --bind PRIVATE_IP [--port 7463] [--share-apps] [--no-advertise]` starts an independent TLS agent. App transport is a separate explicit grant. `discovery serve` runs the saved configuration in the foreground; `discovery autostart enable|disable|status` installs or removes per-user login startup for it (macOS LaunchAgent, Linux systemd user unit; no sudo); `status [--json]`, `fingerprint`, `pair-token`, `revoke`, `disconnect`, and `disable` manage local discovery only. Nothing automatically enables network sharing, login startup, trust, Tailscale Serve/Funnel, or public tunnels. See the [complete two-machine setup, security model and wire protocol](discovery.md).
+CI runs these on Ubuntu x86_64 and macOS ARM64. A Windows job lints and builds the CLI and tray, runs the unit and integration tests, and checks packaging; the `config`, `first_run`, `integrations`, `lifecycle` and `pty` suites run only on macOS and Linux. Pushing a `v*` tag builds the release archives (CLI and tray, plus `Porch.app` on macOS and `.exe` files on Windows), publishes them with `SHA256SUMS` on GitHub Releases, and updates the Homebrew formula when the `HOMEBREW_TAP_TOKEN` secret is set. Archives aren't signed or notarized.
