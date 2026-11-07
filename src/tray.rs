@@ -1391,8 +1391,10 @@ mod tests {
         let json = serde_json::to_string(&snapshot()).unwrap();
         fs::write(&cli, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n")).unwrap();
         fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+        // Discovery is due far less often than the catalog poll, so catalog
+        // refreshes happen in between even when each CLI call is slow.
         let (commands, updates) =
-            worker_with_intervals(cli, Duration::from_millis(30), Duration::from_millis(50));
+            worker_with_intervals(cli, Duration::from_millis(30), Duration::from_millis(400));
         assert!(matches!(
             updates.recv_timeout(Duration::from_secs(5)).unwrap(),
             Update::Snapshot(Ok(_))
@@ -1403,19 +1405,20 @@ mod tests {
                 peer: Some("peer-stable-id".into()),
             })
             .unwrap();
-        let mut found_scan = false;
-        for _ in 0..10 {
+        // Wait for the observable outcome, not a number of updates: a catalog
+        // refresh and a periodic discovery, both after the open.
+        let (mut found_catalog, mut found_scan) = (false, false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !(found_catalog && found_scan) && std::time::Instant::now() < deadline {
             let _ = updates.recv_timeout(Duration::from_secs(5)).unwrap();
             let calls = fs::read_to_string(&log).unwrap();
-            if calls
+            let after_open = calls
+                .split_once("open app-stable-id --peer peer-stable-id\n")
+                .map_or("", |(_, after)| after);
+            found_catalog = after_open.lines().any(|line| line == "list --all --json");
+            found_scan = after_open
                 .lines()
-                .filter(|line| *line == "peers refresh --json")
-                .count()
-                >= 2
-            {
-                found_scan = true;
-                break;
-            }
+                .any(|line| line == "peers refresh --json");
         }
         commands.send(Action::Quit).unwrap();
         while updates.recv_timeout(Duration::from_secs(5)).is_ok() {}
@@ -1428,10 +1431,7 @@ mod tests {
             calls.contains("open app-stable-id --peer peer-stable-id\n"),
             "remote open: {calls}"
         );
-        assert!(
-            calls.contains("list --all --json\n"),
-            "catalog refresh: {calls}"
-        );
+        assert!(found_catalog, "catalog refresh: {calls}");
         assert!(found_scan, "periodic discovery: {calls}");
         assert!(!calls.contains("proxy stop"), "quit must not stop proxy");
         fs::remove_dir_all(directory).unwrap();

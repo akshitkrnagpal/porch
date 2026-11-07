@@ -1,5 +1,6 @@
 //! Two isolated Porch installations on loopback, using the actual CLI and TLS agent.
 //! This proves machine targeting; it does not claim physical LAN/tailnet reachability.
+mod common;
 use porch::discovery::types::{Snapshot, PROTOCOL_VERSION};
 use serde_json::Value;
 use std::{
@@ -69,13 +70,7 @@ async fn ok(dir: &Path, args: &[&str]) -> String {
     );
     String::from_utf8(output.stdout).unwrap()
 }
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+use common::free_port;
 async fn upstream(label: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -814,11 +809,24 @@ async fn autostart_hands_sharing_to_a_login_agent_and_disable_keeps_it_running()
 
     // Enable: the hand-started agent is replaced by the launchd-run one.
     let (ok, out) = run(&["discovery", "autostart", "enable"]);
-    assert!(ok && out.contains("now starts at login"), "{out}");
+    let supervised = pid();
+    // On failure, show why the launchd-started agent never became ready.
+    let evidence = || {
+        format!(
+            "enable: {out}\nmanual pid {manual}, ready pid {supervised:?}\nlaunchctl calls:\n{}\ndiscovery.log:\n{}",
+            std::fs::read_to_string(root.join("launchctl.log")).unwrap_or_default(),
+            std::fs::read_to_string(node.join("discovery.log")).unwrap_or_default()
+        )
+    };
+    assert!(ok && out.contains("now starts at login."), "{}", evidence());
+    assert!(!out.contains("not ready yet"), "{}", evidence());
     let body = std::fs::read_to_string(&plist).unwrap();
     assert!(body.contains("<string>serve</string><string>--autostart</string>"));
-    let supervised = pid();
-    assert!(!supervised.is_empty() && supervised != manual);
+    assert!(
+        !supervised.is_empty() && supervised != manual,
+        "{}",
+        evidence()
+    );
     let (_, status) = run(&["discovery", "status"]);
     assert!(
         status.contains("running") && status.contains("Start at login: on"),

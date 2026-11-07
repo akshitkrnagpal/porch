@@ -1499,11 +1499,23 @@ fn reserve(
                 .duration_since(std::time::UNIX_EPOCH)?
                 .subsec_nanos() as u16
                 % 1000;
+            let mut last_error = None;
             (0..1000)
                 .map(|i| 4000 + (start + i) % 1000)
                 .filter(|p| !used.contains(p) && ![4045, 4190].contains(p))
-                .find_map(|p| crate::sockets::reserve(p).ok())
-                .context("all app ports 4000-4999 are occupied")?
+                .find_map(|p| {
+                    crate::sockets::reserve(p)
+                        .map_err(|e| last_error = Some(e))
+                        .ok()
+                })
+                .with_context(|| match last_error {
+                    // Name the cause when binding failed for another reason
+                    // (for example, out of file descriptors).
+                    Some(e) if e.kind() != std::io::ErrorKind::AddrInUse => {
+                        format!("no app port in 4000-4999 could be reserved: {e}")
+                    }
+                    _ => "all app ports 4000-4999 are occupied".to_owned(),
+                })?
         };
         let port = listener.port()?;
         state::remove_route(s, &name);
