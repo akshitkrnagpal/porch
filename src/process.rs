@@ -33,6 +33,11 @@ pub fn keep_std_handles_private() {
 }
 
 /// Put each application in an independent process tree before it starts.
+///
+/// On Windows the child starts suspended: `TreeGuard::new` puts it in its job
+/// and then lets it run, so nothing it starts can be outside the job. Always
+/// create the guard right after spawning (a child dropped before that is
+/// killed, `kill_on_drop`).
 pub fn configure(command: &mut Command) {
     command.kill_on_drop(true);
     #[cfg(unix)]
@@ -51,7 +56,56 @@ pub fn configure(command: &mut Command) {
         });
     }
     #[cfg(windows)]
-    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+    command.creation_flags(
+        windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
+            | windows_sys::Win32::System::Threading::CREATE_SUSPENDED,
+    );
+}
+
+/// Let a child created suspended (see `configure`) run: resume its threads.
+#[cfg(windows)]
+fn resume(pid: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+                THREADENTRY32,
+            },
+            Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
+        },
+    };
+    let mut resumed = 0;
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        let mut more = Thread32First(snapshot, &mut entry) != 0;
+        while more {
+            if entry.th32OwnerProcessID == pid {
+                let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                if !thread.is_null() {
+                    if ResumeThread(thread) != u32::MAX {
+                        resumed += 1;
+                    }
+                    CloseHandle(thread);
+                }
+            }
+            more = Thread32Next(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+    }
+    if resumed == 0 {
+        return Err(std::io::Error::other(format!(
+            "could not resume process {pid}"
+        )));
+    }
+    Ok(())
 }
 
 /// Dropping this guard terminates remaining processes in the owned tree.
@@ -145,6 +199,10 @@ impl TreeGuard {
             if unsafe { AssignProcessToJobObject(job, process.cast()) } == 0 {
                 return Err(std::io::Error::last_os_error()).context("assigning child process job");
             }
+            // Only now may it run (it was created suspended): everything it
+            // starts is in the job from its first instruction.
+            resume(child.id().context("child has already been reaped")?)
+                .context("starting child process")?;
             Ok(guard)
         }
     }

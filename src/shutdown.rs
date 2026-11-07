@@ -285,9 +285,11 @@ pub fn interrupt_group(group: u32) -> bool {
 /// A descendant whose parent already exited before the first snapshot has no
 /// remaining link to the tree, so no process walk can find it (`taskkill /T`
 /// cannot either). Complete containment needs a job object created before
-/// the children start, which is how Porch runs apps: each launch's tree is in
-/// its launcher's job (`process::TreeGuard`, kill-on-close), and forced stops
-/// also end the owning launcher, closing that job. This function is the
+/// the children start, which is how Porch runs apps: each app is created
+/// suspended, joins its launcher's kill-on-close job and only then runs
+/// (`process::configure`, `process::TreeGuard`), so its whole tree is in that
+/// job; forced stops also end the owning launcher, closing that job. This
+/// function is the
 /// fallback for processes outside such a job.
 #[cfg(windows)]
 pub fn kill_tree(pid: u32) {
