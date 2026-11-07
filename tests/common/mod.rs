@@ -23,9 +23,11 @@ fn slots() -> impl Iterator<Item = u16> {
 const SLOTS_PER_TEST: usize = 8;
 
 /// Ports at the start of a slot that tests bind directly (the proxy port and
-/// the few above it that `first_run.rs` occupies). They must be free when the
-/// slot is claimed; the rest of the slot is only probed or assigned by Porch,
-/// which skips busy ports.
+/// the few above it that `first_run.rs` occupies). They, and the slot's app
+/// port range, must be free when the slot is claimed: a port left in
+/// TIME_WAIT by the slot's previous test could become free again in the
+/// middle of a test that relies on it being taken, or the other way round.
+/// The rest of the slot is only probed by Porch, which skips busy ports.
 const CHECKED_PER_SLOT: u16 = 8;
 
 /// A TCP port that is free right now, for a proxy or app the test starts.
@@ -159,8 +161,8 @@ impl Drop for Batch {
     }
 }
 
-/// The slots among `bases` whose first `CHECKED_PER_SLOT` ports are bindable
-/// (see [`bindable`]).
+/// The slots among `bases` whose first `CHECKED_PER_SLOT` ports and app
+/// port range are bindable (see [`bindable`]).
 fn clean_slots(bases: &[u16]) -> Vec<u16> {
     if bases.is_empty() {
         return Vec::new();
@@ -169,10 +171,10 @@ fn clean_slots(bases: &[u16]) -> Vec<u16> {
     {
         const CHECK: &str = r#"
 import errno, socket, sys
-size = int(sys.argv[1])
-for base in map(int, sys.argv[2:]):
+size, app, slot = map(int, sys.argv[1:4])
+for base in map(int, sys.argv[4:]):
     clean = True
-    for port in range(base, base + size):
+    for port in list(range(base, base + size)) + list(range(base + app, base + slot)):
         for family, host in ((socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')):
             try:
                 s = socket.socket(family)
@@ -198,6 +200,8 @@ for base in map(int, sys.argv[2:]):
             .arg("-c")
             .arg(CHECK)
             .arg(CHECKED_PER_SLOT.to_string())
+            .arg(APP_OFFSET.to_string())
+            .arg(SLOT.to_string())
             .args(bases.iter().map(u16::to_string))
             .stdin(std::process::Stdio::null())
             .output()
@@ -214,7 +218,9 @@ for base in map(int, sys.argv[2:]):
             .iter()
             .copied()
             .filter(|base| {
-                (*base..base + CHECKED_PER_SLOT).all(|port| porch::sockets::reserve(port).is_ok())
+                (*base..base + CHECKED_PER_SLOT)
+                    .chain(base + APP_OFFSET..base + SLOT)
+                    .all(|port| porch::sockets::reserve(port).is_ok())
             })
             .collect()
     }

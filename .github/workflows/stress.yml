@@ -40,14 +40,21 @@ jobs:
       - name: Repeat the suite with two concurrent loops for extra load
         shell: bash
         run: |
+          mkdir -p stress-logs
+          # Windows runs one test at a time so the test in flight is known if
+          # the console is torn down.
+          threads=""
+          if [ "$RUNNER_OS" = Windows ]; then threads="--test-threads=1"; fi
           loop() {
             local fails=0
             for round in $(seq "$ROUNDS"); do
               for bin in $(cat bins.txt); do
-                if ! out=$("$bin" 2>&1); then
+                local log="stress-logs/$1-$round-$(basename "$bin").log"
+                echo "START $(date +%T) $(basename "$bin")" >> "stress-logs/progress-$1"
+                if ! "$bin" $threads > "$log" 2>&1; then
                   fails=$((fails + 1))
                   echo "::error::loop $1 round $round $(basename "$bin") failed"
-                  echo "$out" | tail -80
+                  tail -80 "$log"
                 fi
               done
             done
@@ -60,3 +67,14 @@ jobs:
           wait $a || status=1
           wait $b || status=1
           exit $status
+      - name: Show the tests in flight
+        if: always()
+        shell: bash
+        run: |
+          for p in stress-logs/progress-*; do
+            echo "== $p"; tail -3 "$p"
+            last=$(tail -1 "$p" | awk '{print $3}')
+            loop=${p##*-}
+            log=$(ls -t stress-logs/$loop-*-"$last".log 2>/dev/null | head -1)
+            echo "-- $log"; tail -15 "$log"
+          done

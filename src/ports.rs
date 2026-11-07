@@ -331,4 +331,36 @@ mod tests {
         assert!(next.is_some_and(|p| p > busy && p < busy + 200), "{next:?}");
         assert_ne!(next_free(DEFAULT_PROXY_PORT), Some(DISCOVERY_PORT));
     }
+    #[test]
+    fn test_port_slots_are_unique_across_concurrent_tests_and_capped_per_test() {
+        // Threads stand in for concurrently running tests: each claims its
+        // whole batch at once and hands out its slots one by one. All hold
+        // their claims together (a finished test releases its slots).
+        let together = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let claims: Vec<Vec<u16>> = (0..4)
+            .map(|_| {
+                let together = together.clone();
+                std::thread::spawn(move || {
+                    let ports: Vec<u16> =
+                        (0..8).map(|_| crate::test_support::free_port()).collect();
+                    together.wait();
+                    ports
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        let mut all: Vec<u16> = claims.concat();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 32, "{claims:?}");
+        // A test asking for more than its batch fails instead of waiting.
+        let over = std::thread::spawn(|| {
+            for _ in 0..9 {
+                crate::test_support::free_port();
+            }
+        });
+        assert!(over.join().is_err());
+    }
 }
