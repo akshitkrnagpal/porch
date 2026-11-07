@@ -365,3 +365,50 @@ fn nextjs_page_and_hmr_socket_work_through_porch() {
     });
     drop(launch);
 }
+
+/// Astro ignores PORT: Porch must add `--port` and `--host` to `astro dev`.
+#[test]
+fn astro_gets_its_port_flags_from_porch() {
+    if std::env::var("PORCH_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping: set PORCH_E2E=1 to install Astro from npm and run it");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("porch-e2e-astro-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app = root.join("app");
+    std::fs::create_dir_all(app.join("src/pages")).unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        r#"{"name":"e2e-astro","private":true,"type":"module","scripts":{"dev":"astro dev"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("src/pages/index.astro"),
+        "---\n---\n<html><body><h1>astro through porch</h1></body></html>\n",
+    )
+    .unwrap();
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let install = Command::new(npm)
+        .args(["install", "--no-audit", "--no-fund", "--silent", "astro@5"])
+        .current_dir(&app)
+        .status()
+        .expect("npm is required for PORCH_E2E");
+    assert!(install.success(), "npm install astro failed");
+    let port = common::free_port();
+    let launch = porch_run(
+        &root,
+        &app,
+        port,
+        &[
+            "run", "--name", "astro", "--prefix", "", "npm", "run", "dev",
+        ],
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(wait_for_page(
+        port,
+        "astro.localhost",
+        "astro through porch",
+        Duration::from_secs(120),
+    ));
+    drop(launch);
+}

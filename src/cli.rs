@@ -2146,7 +2146,10 @@ async fn spawn_prepared(
             let tip = state::dir().join("tip-https");
             if std::io::stderr().is_terminal()
                 && std::env::var_os("CI").is_none()
-                && !p.env.get("PORCH_URL").is_some_and(|u| u.starts_with("https:"))
+                && !p
+                    .env
+                    .get("PORCH_URL")
+                    .is_some_and(|u| u.starts_with("https:"))
                 && !tip.exists()
             {
                 let _ = state::atomic_write("tip-https", b"shown\n");
