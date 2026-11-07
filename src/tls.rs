@@ -131,6 +131,11 @@ fn allowed_name(
     {
         return false;
     }
+    // Only names under a domain Porch serves: the configured TLDs and, in LAN
+    // mode, `.local`. A route's name never widens this: a route called
+    // `github.com` is served as `github.com.localhost`, so the CA must never
+    // sign `github.com` itself. Real domains need your own --cert/--key.
+    let _ = routes;
     let in_domain = |domain: &str| name == domain || name.ends_with(&format!(".{domain}"));
     name == "localhost"
         || settings
@@ -138,14 +143,6 @@ fn allowed_name(
             .iter()
             .any(|tld| in_domain(tld.trim_start_matches('.')))
         || (settings.lan && in_domain("local"))
-        || routes.iter().any(|route| {
-            let domain = route.name.split('/').next().unwrap_or("");
-            if let Some(suffix) = domain.strip_prefix("*.") {
-                name.ends_with(&format!(".{suffix}"))
-            } else {
-                name == domain
-            }
-        })
 }
 fn set_validity(params: &mut CertificateParams, days: u64) {
     // A short backdate tolerates normal clock skew without extending the profile.
@@ -153,8 +150,62 @@ fn set_validity(params: &mut CertificateParams, days: u64) {
     params.not_before = start.into();
     params.not_after = (start + Duration::from_secs(days * 86_400)).into();
 }
-fn ca_params() -> Result<CertificateParams> {
+/// Domains a new local CA may ever sign for: reserved, never-public names plus
+/// the TLDs configured when it is created. Browsers enforce these X.509 name
+/// constraints, so even a leaked CA key can't impersonate a real website.
+fn ca_permitted(settings: &crate::state::ProxySettings) -> Vec<String> {
+    let mut out: Vec<String> = ["localhost", "local", "test", "internal", "home.arpa", "lan"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    for t in &settings.tlds {
+        let t = t.trim_start_matches('.').to_ascii_lowercase();
+        if !out.iter().any(|p| t == *p || t.ends_with(&format!(".{p}"))) {
+            out.push(t);
+        }
+    }
+    out
+}
+/// The configured TLDs the CA's name constraints don't cover (none for an
+/// older, unconstrained CA).
+pub fn uncovered_tlds(ca_pem: &str, settings: &crate::state::ProxySettings) -> Vec<String> {
+    let Ok(ca) = CertificateParams::from_ca_cert_pem(ca_pem) else {
+        return vec![];
+    };
+    let Some(constraints) = ca.name_constraints else {
+        return vec![];
+    };
+    let permitted: Vec<String> = constraints
+        .permitted_subtrees
+        .iter()
+        .filter_map(|s| match s {
+            rcgen::GeneralSubtree::DnsName(d) => {
+                Some(d.trim_start_matches('.').to_ascii_lowercase())
+            }
+            _ => None,
+        })
+        .collect();
+    settings
+        .tlds
+        .iter()
+        .chain(settings.lan.then(|| "local".to_owned()).iter())
+        .map(|t| t.trim_start_matches('.').to_ascii_lowercase())
+        .filter(|t| {
+            !permitted
+                .iter()
+                .any(|p| t == p || t.ends_with(&format!(".{p}")))
+        })
+        .collect()
+}
+fn ca_params(settings: &crate::state::ProxySettings) -> Result<CertificateParams> {
     let mut params = CertificateParams::new(Vec::<String>::new())?;
+    params.name_constraints = Some(rcgen::NameConstraints {
+        permitted_subtrees: ca_permitted(settings)
+            .into_iter()
+            .map(rcgen::GeneralSubtree::DnsName)
+            .collect(),
+        excluded_subtrees: vec![],
+    });
     set_validity(&mut params, 3650);
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params
@@ -212,7 +263,7 @@ fn config_in_dir(
             let key_path = dir.join("ca-key.pem");
             if !cert_path.exists() && !key_path.exists() {
                 let key = KeyPair::generate()?;
-                let params = ca_params()?;
+                let params = ca_params(settings)?;
                 let ca = params.self_signed(&key)?;
                 write_private(&key_path, &key.serialize_pem())?;
                 write_private(&cert_path, &ca.pem())?;
@@ -225,6 +276,13 @@ fn config_in_dir(
                 route_state: dir.join("state.json"),
             };
             resolver.issue("localhost").context("Invalid local CA")?;
+            let uncovered = uncovered_tlds(&resolver.ca_pem, settings);
+            if !uncovered.is_empty() {
+                bail!(
+                    "your local CA is limited to the domains it was created for, and doesn't cover {}. Run `porch clean` and start the proxy again to create a CA for the current domains, then `porch trust`",
+                    uncovered.join(", ")
+                );
+            }
             // There are no persisted leaf certificates: profile v2 takes effect on
             // every new handshake after restart. Preserve an existing root and key
             // byte-for-byte, since silently rotating them would invalidate trust.
@@ -322,8 +380,16 @@ mod tests {
             target: "http://127.0.0.1:3000".into(),
             pid: None,
         }];
-        assert!(allowed_name("registered.example.com", &settings, &routes));
+        // A route's raw name is never a certificate name outside the TLDs.
+        assert!(!allowed_name("registered.example.com", &settings, &routes));
         assert!(!allowed_name("other.example.com", &settings, &routes));
+        let github = vec![crate::state::Route {
+            name: "github.com".into(),
+            target: "http://127.0.0.1:3000".into(),
+            pid: None,
+        }];
+        assert!(!allowed_name("github.com", &settings, &github));
+        assert!(allowed_name("github.com.localhost", &settings, &github));
         assert!(!allowed_name("registered.example.com", &settings, &[]));
         for invalid in [
             "*.localhost",
@@ -352,6 +418,27 @@ mod tests {
         let params = CertificateParams::from_ca_cert_pem(&cert).unwrap();
         assert!((params.not_after - params.not_before).whole_days() <= 3650);
         assert_eq!(params.is_ca, IsCa::Ca(BasicConstraints::Constrained(0)));
+        // New CAs are name-constrained to never-public names and the TLDs.
+        let permitted: Vec<_> = params
+            .name_constraints
+            .as_ref()
+            .expect("new CA has name constraints")
+            .permitted_subtrees
+            .iter()
+            .filter_map(|s| match s {
+                rcgen::GeneralSubtree::DnsName(d) => Some(d.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(permitted.contains(&"localhost") && permitted.contains(&"local"));
+        assert!(!permitted.iter().any(|p| *p == "com" || p.is_empty()));
+        assert!(uncovered_tlds(&cert, &settings).is_empty());
+        let other = crate::state::ProxySettings {
+            tlds: vec!["dev.example.com".into()],
+            ..Default::default()
+        };
+        assert_eq!(uncovered_tlds(&cert, &other), ["dev.example.com"]);
+        assert!(config_in_dir(&other, &path).is_err());
         // Install an old profile only in this temporary fixture; no system trust.
         let resolver = test_resolver();
         fs::write(path.join("ca.pem"), &resolver.ca_pem).unwrap();
@@ -437,13 +524,12 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(handshake("registered.example.com").await, (true, true));
-        fs::remove_file(path).unwrap();
         assert_eq!(
             handshake("registered.example.com").await,
             (false, false),
-            "cached certificate must not survive route removal"
+            "a route named like a real domain must not get a certificate for it"
         );
+        fs::remove_file(path).unwrap();
     }
     #[test]
     fn rejects_invalid_pem() {
