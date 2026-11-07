@@ -16,7 +16,6 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - `http://localhost` is a dashboard of every running app.
 - Remote aliases (`porch alias staging https://staging.example.com`) send the target's own `Host`, verify its certificate and rewrite its redirects to the Porch URL.
 - Install with one command and no Python: `scripts/install.sh` (macOS, Linux) and `scripts/install.ps1` (Windows) verify the checksum and build attestation.
-- An npm package, `porch-cli`, with one prebuilt binary package per platform and no install scripts, so projects can pin Porch as a devDependency. Releases publish it with npm provenance once the `NPM_TOKEN` secret is set. `porch self-update` defers to the package manager for npm installs.
 - Static, CLI-only Linux builds for x86_64 and ARM64 that run on any distribution.
 - Release archives carry signed build-provenance attestations, and `porch self-update` verifies them when the GitHub CLI is installed (`PORCH_UPDATE_VERIFY=require` makes it mandatory).
 - Agent skills (`skills/porch`, `skills/oauth`), docs for coding agents, troubleshooting and recipes, examples, and a JSON Schema for `porch.json`.

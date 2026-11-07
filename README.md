@@ -54,13 +54,6 @@ curl -fsSL https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/i
 
 On Windows, in PowerShell: `irm https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.ps1 | iex`
 
-**npm** (pin it per project, like any devDependency; published starting with the next release). It installs a prebuilt binary for your platform, with no install scripts:
-
-```sh
-npm install --save-dev porch-cli      # then "dev": "porch run next dev" in package.json
-npx porch-cli run pnpm dev            # or try it once
-```
-
 **Homebrew** (macOS and Linux, CLI only):
 
 ```sh
