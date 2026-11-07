@@ -403,9 +403,17 @@ fn trust_install_and_cleanup_use_only_recorded_certificate() {
         ("linux", false),
     ] {
         let s = Sandbox::new();
-        for tool in ["security", "update-ca-certificates", "certutil"] {
+        for tool in ["security", "update-ca-certificates"] {
             s.fake(tool, "");
         }
+        // Listing a database shows the nickname Porch installed.
+        s.fake(
+            "certutil",
+            &format!(
+                "if a==['-L','-d',a[2]]:print('Porch Local CA {}   C,,')",
+                &PORCH_CA_SHA1[..12]
+            ),
+        );
         // A Firefox profile alongside the shared Chrome NSS database.
         let profile = s.dir.join("home/.mozilla/firefox/abc.default");
         fs::create_dir_all(&profile).unwrap();
@@ -909,23 +917,37 @@ fn linux_user_trust(s: &Sandbox) -> PathBuf {
 fn linux_user_trust_cleanup_removes_only_when_certutil_is_certain() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let nickname = format!("Porch Local CA {}", &PORCH_CA_SHA1[..12]);
+    // A real-format `certutil -L -d` listing, with or without the Porch nickname.
+    let list = |with: bool| {
+        format!(
+            "\nif a[0]=='-L':\n print('\\nCertificate Nickname{pad}Trust Attributes\\n{pad}SSL,S/MIME,JAR/XPI\\n'{row})",
+            pad = " ".repeat(40),
+            row = if with {
+                format!("+'\\n{nickname}{}C,,'", " ".repeat(30))
+            } else {
+                String::new()
+            }
+        )
+    };
     // (certutil script, clean succeeds, deletion attempted, stderr fragment)
     let cases = [
-        ("", true, true, ""),
+        (list(true), true, true, ""),
+        (list(false), true, false, ""),
         (
-            "\nif '-L' in a:\n print('certutil: Could not find cert: '+a[-1]+'\\n: PR_FILE_NOT_FOUND_ERROR: File not found',file=sys.stderr);sys.exit(255)",
-            true,
+            // A lookup failure reported with "not found" wording must not count as absent.
+            "\nprint('certutil: Could not find cert: x\\n: PR_FILE_NOT_FOUND_ERROR: File not found',file=sys.stderr);sys.exit(255)".into(),
             false,
-            "",
+            false,
+            "trust record kept for retry",
         ),
         (
-            "\nprint('certutil: function failed: SEC_ERROR_BAD_DATABASE: security library: bad database.',file=sys.stderr);sys.exit(255)",
+            "\nprint('certutil: function failed: SEC_ERROR_BAD_DATABASE: security library: bad database.',file=sys.stderr);sys.exit(255)".into(),
             false,
             false,
             "bad database",
         ),
         (
-            "\nif '-D' in a:\n print('certutil: could not delete',file=sys.stderr);sys.exit(255)",
+            format!("{}\nif a[0]=='-D':\n print('certutil: could not delete',file=sys.stderr);sys.exit(255)", list(true)),
             false,
             true,
             "could not remove Porch CA",
@@ -933,7 +955,7 @@ fn linux_user_trust_cleanup_removes_only_when_certutil_is_certain() {
     ];
     for (script, ok, deleted, stderr) in cases {
         let s = Sandbox::new();
-        s.fake("certutil", script);
+        s.fake("certutil", &script);
         linux_user_trust(&s);
         let out = s
             .cmd()
@@ -944,8 +966,11 @@ fn linux_user_trust_cleanup_removes_only_when_certutil_is_certain() {
         let err = String::from_utf8_lossy(&out.stderr);
         let log = s.log();
         assert_eq!(out.status.success(), ok, "{script}: {err}");
-        assert!(log.contains(&nickname), "{log}");
+        assert!(log.contains("\"-L\""), "{log}");
         assert_eq!(log.contains("\"-D\""), deleted, "{script}: {log}");
+        if deleted {
+            assert!(log.contains(&nickname), "{log}");
+        }
         assert!(err.contains(stderr), "{err}");
         // The trust record survives every failure so cleanup can be retried.
         assert_eq!(!s.dir.join("state/trust.json").exists(), ok, "{script}");
@@ -1010,4 +1035,29 @@ fn trust_needs_no_openssl() {
         .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not issued as Porch Local CA"));
+}
+
+#[test]
+fn linux_user_trust_cleanup_keeps_record_for_inaccessible_db() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root ignores directory permissions
+    }
+    let s = Sandbox::new();
+    s.fake("certutil", "");
+    linux_user_trust(&s);
+    let pki = s.dir.join("home/.pki");
+    fs::set_permissions(&pki, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = s
+        .cmd()
+        .env("PORCH_TRUST_PLATFORM", "linux")
+        .args(["clean"])
+        .output()
+        .unwrap();
+    fs::set_permissions(&pki, fs::Permissions::from_mode(0o755)).unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("could not access NSS database"), "{err}");
+    assert!(s.dir.join("state/trust.json").exists());
 }

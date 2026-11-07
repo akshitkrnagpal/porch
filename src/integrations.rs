@@ -837,13 +837,13 @@ fn verify_porch_ca(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-/// True only when certutil ran and reported that the nickname is not in the database.
-/// Spawn failures, timeouts and database errors are not "absent".
-fn nss_cert_absent(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}").to_lowercase();
-    message.contains("certutil failed:")
-        && message.contains("could not find cert")
-        && !message.contains("sec_error_bad_database")
+/// Whether a successful `certutil -L -d <db>` listing contains `nickname`. Absence is
+/// only ever concluded from a full listing, never from a failed lookup's error text.
+fn nss_listing_has(listing: &str, nickname: &str) -> bool {
+    listing.lines().any(|line| {
+        line.strip_prefix(nickname)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace) && rest.trim().contains(','))
+    })
 }
 fn linux_ca_layout(os_release: &str) -> (&'static str, &'static str) {
     let os = os_release.to_lowercase();
@@ -1098,25 +1098,30 @@ fn untrust() -> Result<()> {
                 if !db.is_absolute() || !db.starts_with(&home) {
                     bail!("invalid recorded NSS database path; refusing removal");
                 }
-                if !db.is_dir() {
-                    continue;
-                }
-                let sql = format!("sql:{}", db.display());
-                // Only delete the nickname this fingerprint installed, and only where present.
-                // Anything other than an explicit "not found" keeps the trust record for retry.
-                match exec("certutil", &["-L", "-d", &sql, "-n", &name]) {
-                    Ok(_) => {
-                        exec("certutil", &["-D", "-d", &sql, "-n", &name]).with_context(|| {
-                            format!("could not remove Porch CA from {}", db.display())
-                        })?;
-                    }
-                    Err(e) if nss_cert_absent(&e) => {}
+                match fs::metadata(db) {
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => {
-                        return Err(e.context(format!(
-                            "could not check {} for the Porch CA; trust record kept for retry",
+                        return Err(anyhow::Error::from(e).context(format!(
+                            "could not access NSS database {}; trust record kept for retry",
                             db.display()
                         )))
                     }
+                }
+                let sql = format!("sql:{}", db.display());
+                // Only delete the nickname this fingerprint installed, and only where a full
+                // listing shows it. Any certutil failure keeps the trust record for retry.
+                let listing = exec("certutil", &["-L", "-d", &sql]).with_context(|| {
+                    format!(
+                        "could not list {} to check for the Porch CA; trust record kept for retry",
+                        db.display()
+                    )
+                })?;
+                if nss_listing_has(&listing, &name) {
+                    exec("certutil", &["-D", "-d", &sql, "-n", &name]).with_context(|| {
+                        format!("could not remove Porch CA from {}", db.display())
+                    })?;
                 }
             }
         }
@@ -2536,26 +2541,15 @@ mod tests {
         let _ = fs::remove_file(&dir);
     }
     #[test]
-    fn nss_absent_only_on_explicit_not_found() {
-        let failed = |stderr: &str| {
-            anyhow::anyhow!("exit status: 255").context(format!("certutil failed: {stderr}"))
-        };
-        assert!(nss_cert_absent(&failed(
-            "certutil: Could not find cert: Porch Local CA ABCDEF012345\n: PR_FILE_NOT_FOUND_ERROR: File not found"
-        )));
-        assert!(nss_cert_absent(&failed(
-            "certutil: could not find certificate named \"Porch Local CA ABCDEF012345\""
-        )));
-        assert!(!nss_cert_absent(&failed(
-            "certutil: function failed: SEC_ERROR_BAD_DATABASE: security library: bad database."
-        )));
-        assert!(!nss_cert_absent(
-            &anyhow::anyhow!("No such file or directory")
-                .context("could not start certutil; install it and ensure it is on PATH")
+    fn nss_listing_matches_exact_nickname() {
+        let listing = "\nCertificate Nickname                                         Trust Attributes\n                                                             SSL,S/MIME,JAR/XPI\n\nPorch Local CA 8B7699335C1F                                  C,,\nPorch Local CA 8B7699335C1F0 other                           CT,C,C\n";
+        assert!(nss_listing_has(listing, "Porch Local CA 8B7699335C1F"));
+        assert!(!nss_listing_has(listing, "Porch Local CA 8B7699335C"));
+        assert!(!nss_listing_has(listing, "Porch Local CA ABCDEF012345"));
+        assert!(!nss_listing_has(
+            "\nCertificate Nickname                                         Trust Attributes\n                                                             SSL,S/MIME,JAR/XPI\n\n",
+            "Porch Local CA 8B7699335C1F"
         ));
-        assert!(!nss_cert_absent(&anyhow::anyhow!(
-            "certutil timed out after 30000ms"
-        )));
     }
     #[test]
     fn hosts_preserve_unmanaged() {
