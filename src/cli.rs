@@ -962,9 +962,18 @@ pub(crate) async fn start_proxy(
         }
         if tokio::time::Instant::now() >= deadline {
             let _ = child.kill();
+            let log = state::dir().join("proxy.log");
+            let text = fs::read_to_string(&log).unwrap_or_default();
+            let tail: Vec<&str> = text.lines().rev().take(20).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
             bail!(
-                "proxy readiness timed out; see {}",
-                state::dir().join("proxy.log").display()
+                "proxy readiness timed out; see {}{}",
+                log.display(),
+                if tail.is_empty() {
+                    " (empty)".to_owned()
+                } else {
+                    format!(":\n{}", tail.join("\n"))
+                }
             )
         }
         tokio::time::sleep(Duration::from_millis(30)).await;

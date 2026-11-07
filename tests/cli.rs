@@ -334,13 +334,21 @@ fn orphan_prune_kills_child_group_and_preserves_static_alias() {
 #[test]
 fn https_opt_in_ca_environment_allows_node_to_call_another_app() {
     let s = Sandbox::new();
-    let mut server=s.command(&["secure","node","-e","require('http').createServer((q,r)=>r.end('from-secure')).listen(process.env.PORT,'127.0.0.1')"])
+    let mut server=s.command(&["secure","node","-e","const fs=require('fs');require('http').createServer((q,r)=>r.end('from-secure')).listen(process.env.PORT,'127.0.0.1',()=>{fs.writeFileSync('secure.tmp','');fs.renameSync('secure.tmp','secure.ready')})"])
       .env("PORCH_HTTPS", "1").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     s.wait_route("secure");
+    // A registered route only means the app was started; the client must not
+    // reach it (and get a 502) before it listens.
+    let d = Instant::now() + Duration::from_secs(30);
+    while !s.root.join("secure.ready").exists() {
+        assert!(Instant::now() < d, "secure app never listened");
+        std::thread::sleep(Duration::from_millis(30));
+    }
     let settings: serde_json::Value =
         serde_json::from_slice(&std::fs::read(s.root.join("state/proxy.json")).unwrap()).unwrap();
     assert_eq!(settings["tls"], true);
-    let script=format!("const https=require('https');let n=0;function fetch(){{https.get({{hostname:'127.0.0.1',port:{},servername:'secure.localhost',headers:{{host:'secure.localhost'}}}},r=>{{let b='';r.on('data',c=>b+=c);r.on('end',()=>{{console.log(b);process.exit(b==='from-secure'?0:1)}})}}).on('error',e=>{{if(++n<50)setTimeout(fetch,30);else{{console.error(e);process.exit(1)}}}})}}fetch()",s.port);
+    // One request: the proxy and the app are both ready, so any failure is real.
+    let script=format!("const https=require('https');https.get({{hostname:'127.0.0.1',port:{},servername:'secure.localhost',headers:{{host:'secure.localhost'}}}},r=>{{let b='';r.on('data',c=>b+=c);r.on('end',()=>{{console.log(b);if(b!=='from-secure')console.error('status '+r.statusCode+': '+b);process.exit(b==='from-secure'?0:1)}})}}).on('error',e=>{{console.error(e);process.exit(1)}})",s.port);
     let output = s
         .command(&["client", "node", "-e", &script])
         .env("PORCH_HTTPS", "1")
