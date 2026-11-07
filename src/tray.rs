@@ -1,6 +1,10 @@
 //! Porch's optional native menu. All network/lifecycle work goes through the CLI
 //! on a Tokio worker; native UI objects never leave the OS main thread.
-use crate::discovery::types::{App, Health, Snapshot, Source};
+use crate::discovery::{
+    gateway,
+    types::{App, Health, PeerCatalog, Snapshot},
+};
+use crate::state::ProxySettings;
 use anyhow::{bail, Context, Result};
 use std::{
     collections::HashMap,
@@ -67,6 +71,9 @@ pub struct Entry {
     /// Draw this entry as an on/off switch in the given state. macOS shows a
     /// native switch beside the label; Linux shows a check item.
     pub toggle: Option<bool>,
+    /// A second action for this row. macOS swaps the row for this one while
+    /// Option is held; elsewhere the row becomes a small submenu of both.
+    pub alternate: Option<(String, Action)>,
 }
 impl Entry {
     fn text(label: impl Into<String>) -> Self {
@@ -77,6 +84,7 @@ impl Entry {
             children: vec![],
             separator: false,
             toggle: None,
+            alternate: None,
         }
     }
     fn action(label: impl Into<String>, action: Action, enabled: bool) -> Self {
@@ -87,6 +95,7 @@ impl Entry {
             children: vec![],
             separator: false,
             toggle: None,
+            alternate: None,
         }
     }
     fn group(label: impl Into<String>, children: Vec<Entry>) -> Self {
@@ -97,6 +106,7 @@ impl Entry {
             children,
             separator: false,
             toggle: None,
+            alternate: None,
         }
     }
     fn separator() -> Self {
@@ -107,6 +117,7 @@ impl Entry {
             children: vec![],
             separator: true,
             toggle: None,
+            alternate: None,
         }
     }
     /// The header row: "Porch" with a switch that starts or stops the proxy.
@@ -125,6 +136,7 @@ impl Entry {
             children: vec![],
             separator: false,
             toggle: Some(on),
+            alternate: None,
         }
     }
 }
@@ -144,48 +156,78 @@ fn health_label(health: &Health) -> &'static str {
         Health::Unknown => "status unknown",
     }
 }
-fn app_entry(app: &App, peer: Option<&str>, proxy_running: bool) -> Entry {
-    let remote = peer.is_some();
-    let enabled = if remote {
-        app.remote_access
-    } else {
-        proxy_running
-    } && !matches!(app.health, Health::Stopped | Health::Unreachable);
-    let mut children = vec![
-        Entry::action(
-            "Open in browser",
-            Action::Open {
-                app: app.id.clone(),
-                peer: peer.map(str::to_owned),
+/// What a menu row shows for a URL: no scheme, no trailing slash.
+fn display_url(url: &str) -> &str {
+    url.split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .trim_end_matches('/')
+}
+/// One app as a single row: its URL, which opens it. The alternate copies it.
+/// `peer` is the paired machine the app lives on, `None` for this machine.
+fn app_entry(
+    app: &App,
+    peer: Option<&PeerCatalog>,
+    settings: &ProxySettings,
+    proxy_running: bool,
+) -> Entry {
+    let usable = !matches!(app.health, Health::Stopped | Health::Unreachable);
+    let (url, enabled, note) = match peer {
+        None => (
+            display_url(&app.local_url).to_owned(),
+            proxy_running && usable,
+            if !usable {
+                Some(health_label(&app.health))
+            } else {
+                None
             },
-            enabled,
         ),
-        Entry::action(
-            "Copy URL",
+        Some(peer) => {
+            // The same APP.MACHINE name `porch open --peer` serves through the
+            // local proxy. Path-routed apps get a relay instead, so name them.
+            let named = gateway::hostname_app(&app.name)
+                .filter(|_| !peer.slug.is_empty())
+                .map(|name| {
+                    display_url(&settings.url(&format!("{name}.{}", peer.slug))).to_owned()
+                });
+            let needs_proxy = named.is_some();
+            let url = named.unwrap_or_else(|| format!("{} on {}", app.name, peer.machine.name));
+            let note = if !app.remote_access {
+                Some("sharing off")
+            } else if !usable {
+                Some(health_label(&app.health))
+            } else {
+                None
+            };
+            (
+                url,
+                app.remote_access && usable && (proxy_running || !needs_proxy),
+                note,
+            )
+        }
+    };
+    let peer_id = peer.map(|peer| peer.machine.id.clone());
+    let label = match note {
+        Some(note) => format!("{url} — {note}"),
+        None => url.clone(),
+    };
+    Entry {
+        label: clean_label(&label),
+        enabled,
+        action: Some(Action::Open {
+            app: app.id.clone(),
+            peer: peer_id.clone(),
+        }),
+        children: vec![],
+        separator: false,
+        toggle: None,
+        alternate: Some((
+            clean_label(&format!("Copy {url}")),
             Action::Copy {
                 app: app.id.clone(),
-                peer: peer.map(str::to_owned),
+                peer: peer_id,
             },
-            enabled,
-        ),
-        Entry::separator(),
-        Entry::text(health_label(&app.health)),
-    ];
-    if remote && !app.remote_access {
-        children.push(Entry::text(
-            app.unavailable_reason
-                .as_deref()
-                .unwrap_or("App sharing is off on this machine"),
-        ));
-    } else if !remote && !proxy_running {
-        children.push(Entry::text("Start the proxy to open this app"));
-    } else if !remote && !app.remote_access {
-        children.push(Entry::text("Local only; app sharing is off"));
+        )),
     }
-    Entry::group(
-        format!("{} ({})", app.name, health_label(&app.health)),
-        children,
-    )
 }
 /// A pure model makes enabled states and action routing testable without a display.
 /// What the tray mark shows: solid or dimmed apps under the roof, plus a
@@ -303,6 +345,7 @@ fn light_taskbar() -> bool {
 
 pub fn menu_model(
     snapshot: Option<&Snapshot>,
+    settings: &ProxySettings,
     error: Option<&str>,
     notice: Option<&str>,
 ) -> Vec<Entry> {
@@ -317,62 +360,44 @@ pub fn menu_model(
     }
     entries.push(Entry::separator());
     if let Some(snapshot) = snapshot {
-        let mut local = vec![Entry::text(if snapshot.local.proxy_running {
-            "Proxy is running"
-        } else {
-            "Proxy is stopped"
-        })];
+        // Apps on this machine first, then one block per paired machine. No
+        // headings: each URL already names its machine.
+        let running = snapshot.local.proxy_running;
         if snapshot.local.apps.is_empty() {
-            local.push(Entry::text("No apps yet; run porch in a project"));
+            entries.push(Entry::text("No apps yet; run porch in a project"));
+        } else if !running {
+            entries.push(Entry::text("Turn on Porch to open these apps"));
         }
-        local.extend(
+        entries.extend(
             snapshot
                 .local
                 .apps
                 .iter()
                 .take(100)
-                .map(|app| app_entry(app, None, snapshot.local.proxy_running)),
+                .map(|app| app_entry(app, None, settings, running)),
         );
-        entries.push(Entry::group(
-            format!("This machine ({})", snapshot.local.machine.name),
-            local,
-        ));
-        if snapshot.peers.is_empty() {
-            entries.push(Entry::text("No paired machines yet; choose Pair a device…"));
-        }
         for peer in snapshot.peers.iter().take(50) {
-            let sources = peer
-                .sources
-                .iter()
-                .map(|source| match source {
-                    Source::Local => "local",
-                    Source::Lan => "LAN",
-                    Source::Tailscale => "Tailscale",
-                    Source::Explicit => "paired",
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mut apps = vec![Entry::text(format!("Via {sources}"))];
+            entries.push(Entry::separator());
+            let name = &peer.machine.name;
             if let Some(error) = &peer.error {
-                apps.push(Entry::text(format!("Unavailable: {error}")));
+                entries.push(Entry::text(format!("{name}: unavailable ({error})")));
             }
-            if let Some(catalog) = &peer.catalog {
-                if catalog.apps.is_empty() {
-                    apps.push(Entry::text("No apps on this machine"));
+            match &peer.catalog {
+                Some(catalog) if catalog.apps.is_empty() => {
+                    entries.push(Entry::text(format!("{name}: no apps")))
                 }
-                apps.extend(
+                Some(catalog) => entries.extend(
                     catalog
                         .apps
                         .iter()
                         .take(100)
-                        .map(|app| app_entry(app, Some(&peer.machine.id), catalog.proxy_running)),
-                );
-            } else {
-                apps.push(Entry::text("Reconnect to check this machine"));
+                        .map(|app| app_entry(app, Some(peer), settings, running)),
+                ),
+                None => entries.push(Entry::text(format!("{name}: reconnect to check"))),
             }
-            entries.push(Entry::group(peer.machine.name.clone(), apps));
         }
         if !snapshot.candidates.is_empty() {
+            entries.push(Entry::separator());
             let mut found = vec![Entry::text(
                 "Choose Pair a device… on one machine, then run porch pair CODE on the other",
             )];
@@ -727,6 +752,8 @@ mod native {
         toggles: HashMap<String, Toggle>,
         model: Vec<Entry>,
         snapshot: Option<Snapshot>,
+        /// The local proxy's naming, used to label paired machines' app URLs.
+        settings: ProxySettings,
         error: Option<String>,
         notice: Option<String>,
         /// Proxy starts/stops sent but not yet finished, and the state the user
@@ -778,6 +805,36 @@ mod native {
                     #[cfg(not(target_os = "macos"))]
                     built.toggles.insert(item.id().0.clone(), item.clone());
                     append(&item)?;
+                } else if let (Some(action), Some((alt_label, alt_action))) =
+                    (&entry.action, &entry.alternate)
+                {
+                    // macOS: the row, then its Option-key twin right after it
+                    // (made an alternate in `attach_alternates`).
+                    #[cfg(target_os = "macos")]
+                    {
+                        let item = MenuItem::new(&entry.label, entry.enabled, None);
+                        built.actions.insert(item.id().0.clone(), action.clone());
+                        append(&item)?;
+                        let alt = MenuItem::new(alt_label, entry.enabled, None);
+                        built.actions.insert(alt.id().0.clone(), alt_action.clone());
+                        append(&alt)?;
+                    }
+                    // Other menus have no modifier alternates: offer both in a
+                    // small submenu instead.
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let submenu = Submenu::new(&entry.label, true);
+                        append(&submenu)?;
+                        let open = MenuItem::new("Open in browser", entry.enabled, None);
+                        built.actions.insert(open.id().0.clone(), action.clone());
+                        submenu.append(&open)?;
+                        let copy = MenuItem::new("Copy URL", entry.enabled, None);
+                        built
+                            .actions
+                            .insert(copy.id().0.clone(), alt_action.clone());
+                        submenu.append(&copy)?;
+                        let _ = alt_label;
+                    }
                 } else {
                     let item = MenuItem::new(&entry.label, entry.enabled, None);
                     if let Some(action) = &entry.action {
@@ -796,7 +853,10 @@ mod native {
         };
         append_entries(entries, &|item| menu.append(item), &mut built)?;
         #[cfg(target_os = "macos")]
-        mac::attach_switches(menu, entries, offset, &mut built);
+        {
+            mac::attach_switches(menu, entries, offset, &mut built);
+            mac::attach_alternates(menu, entries, offset);
+        }
         #[cfg(not(target_os = "macos"))]
         let _ = offset;
         Ok(built)
@@ -811,8 +871,9 @@ mod native {
         };
         use objc2_app_kit::{
             NSAutoresizingMaskOptions, NSControlSize, NSControlStateValueOff,
-            NSControlStateValueOn, NSEvent, NSFont, NSMenu, NSProgressIndicator,
-            NSProgressIndicatorStyle, NSResponder, NSSwitch, NSTextField, NSView,
+            NSControlStateValueOn, NSEvent, NSEventModifierFlags, NSFont, NSMenu,
+            NSProgressIndicator, NSProgressIndicatorStyle, NSResponder, NSSwitch, NSTextField,
+            NSView,
         };
         use objc2_foundation::{
             NSDefaultRunLoopMode, NSObject, NSPoint, NSRect, NSRunLoop, NSSize, NSString,
@@ -904,6 +965,44 @@ mod native {
             }
         }
 
+        /// Each top-level entry with the NSMenu index of its row. A row with
+        /// an alternate takes two native items.
+        fn native_indices(entries: &[Entry], offset: usize) -> Vec<(usize, &Entry)> {
+            let mut index = offset;
+            entries
+                .iter()
+                .map(|entry| {
+                    let at = index;
+                    index += if entry.alternate.is_some() && entry.children.is_empty() {
+                        2
+                    } else {
+                        1
+                    };
+                    (at, entry)
+                })
+                .collect()
+        }
+
+        /// Turn each row's twin into its Option-key alternate: holding Option
+        /// swaps "web.localhost" for "Copy web.localhost" in place.
+        pub fn attach_alternates(menu: &Menu, entries: &[Entry], offset: usize) {
+            if MainThreadMarker::new().is_none() {
+                return;
+            }
+            // SAFETY: muda owns this NSMenu for the lifetime of `menu`, and we
+            // are on the main thread.
+            let ns_menu = unsafe { &*(menu.ns_menu() as *const NSMenu) };
+            for (index, entry) in native_indices(entries, offset) {
+                if entry.alternate.is_none() || !entry.children.is_empty() {
+                    continue;
+                }
+                if let Some(alt) = ns_menu.itemAtIndex(index as isize + 1) {
+                    alt.setKeyEquivalentModifierMask(NSEventModifierFlags::Option);
+                    alt.setAlternate(true);
+                }
+            }
+        }
+
         pub fn menu_is_open() -> bool {
             let run_loop = NSRunLoop::currentRunLoop();
             run_loop
@@ -926,10 +1025,10 @@ mod native {
             // are on the main thread.
             let ns_menu = unsafe { &*(menu.ns_menu() as *const NSMenu) };
             let mut ids = std::mem::take(&mut built.toggle_ids).into_iter();
-            for (index, entry) in entries.iter().enumerate() {
+            for (index, entry) in native_indices(entries, offset) {
                 let Some(on) = entry.toggle else { continue };
                 let Some(id) = ids.next() else { return };
-                let Some(item) = ns_menu.itemAtIndex((offset + index) as isize) else {
+                let Some(item) = ns_menu.itemAtIndex(index as isize) else {
                     continue;
                 };
                 let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, HEIGHT));
@@ -1000,7 +1099,8 @@ mod native {
     }
     impl Ui {
         pub fn new() -> Result<Self> {
-            let model = menu_model(None, None, None);
+            let settings = crate::state::proxy_settings().unwrap_or_default();
+            let model = menu_model(None, &settings, None, None);
             let menu = Menu::new();
             let Built {
                 actions, toggles, ..
@@ -1022,6 +1122,7 @@ mod native {
                 toggles,
                 model,
                 snapshot: None,
+                settings,
                 error: None,
                 notice: None,
                 pending: 0,
@@ -1035,6 +1136,9 @@ mod native {
                 match update {
                     Update::Snapshot(Ok(snapshot)) => {
                         self.snapshot = Some(snapshot);
+                        if let Ok(settings) = crate::state::proxy_settings() {
+                            self.settings = settings;
+                        }
                         self.error = None;
                     }
                     Update::Snapshot(Err(error)) => self.error = Some(error),
@@ -1067,6 +1171,7 @@ mod native {
                 }
                 let mut model = menu_model(
                     self.snapshot.as_ref(),
+                    &self.settings,
                     self.error.as_deref(),
                     self.notice.as_deref(),
                 );
@@ -1275,7 +1380,16 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::types::{Catalog, Machine, PeerCatalog, PROTOCOL_VERSION};
+    use crate::discovery::types::{Catalog, Machine, Source, PROTOCOL_VERSION};
+    fn model(snapshot: Option<&Snapshot>, error: Option<&str>, notice: Option<&str>) -> Vec<Entry> {
+        menu_model(snapshot, &ProxySettings::default(), error, notice)
+    }
+    fn row<'a>(entries: &'a [Entry], label: &str) -> &'a Entry {
+        entries
+            .iter()
+            .find(|entry| entry.label.starts_with(label))
+            .unwrap_or_else(|| panic!("no row {label:?} in {entries:#?}"))
+    }
     /// A per-process counter for fixture directories: the clock (microseconds
     /// on macOS) can give parallel tests the same name.
     #[cfg(unix)]
@@ -1326,48 +1440,62 @@ mod tests {
         }
     }
     #[test]
-    fn remote_actions_target_stable_machine_and_app_not_remote_localhost() {
-        let entries = menu_model(Some(&snapshot()), None, None);
-        let remote = entries
-            .iter()
-            .find(|entry| entry.label == "Workbench")
-            .unwrap();
-        let action = remote.children[1].children[0].action.as_ref().unwrap();
-        assert_eq!(
-            action.cli_args().unwrap(),
-            vec!["open", "app-stable-id", "--peer", "peer-stable-id"]
+    fn apps_are_flat_url_rows_that_open_and_copy_on_their_machine() {
+        let entries = model(Some(&snapshot()), None, None);
+        assert!(
+            entries.iter().all(|entry| entry.children.is_empty()),
+            "no machine submenus: {entries:#?}"
         );
-        assert!(remote.children[1].children[0].enabled);
-        let local = &entries[2].children[1];
+        let local = row(&entries, "web.localhost:7462");
         assert_eq!(
-            local.children[0]
-                .action
-                .as_ref()
-                .unwrap()
-                .cli_args()
-                .unwrap(),
+            local.action.as_ref().unwrap().cli_args().unwrap(),
             vec!["open", "app-stable-id"]
         );
+        let (copy_label, copy) = local.alternate.as_ref().unwrap();
+        assert_eq!(copy_label, "Copy web.localhost:7462");
+        assert_eq!(copy.cli_args().unwrap(), vec!["copy", "app-stable-id"]);
         assert!(
-            local.children[0].enabled,
+            local.enabled,
             "local app stays usable when remote sharing is off"
         );
+
+        // The paired machine's app is named the way `porch open --peer` serves it.
+        let remote = row(&entries, "web.workbench.localhost:");
+        assert_eq!(
+            remote.action.as_ref().unwrap().cli_args().unwrap(),
+            vec!["open", "app-stable-id", "--peer", "peer-stable-id"]
+        );
+        assert_eq!(
+            remote.alternate.as_ref().unwrap().1.cli_args().unwrap(),
+            vec!["copy", "app-stable-id", "--peer", "peer-stable-id"]
+        );
+        assert!(remote.enabled);
+        // Machines are told apart by a separator, not a heading.
+        let local_at = entries.iter().position(|e| e == local).unwrap();
+        let remote_at = entries.iter().position(|e| e == remote).unwrap();
+        assert!(entries[local_at..remote_at].iter().any(|e| e.separator));
+        assert!(!entries.iter().any(|e| e.label.contains("This machine")));
     }
     #[test]
     fn unavailable_remote_app_disables_open_and_copy() {
         let mut state = snapshot();
         state.peers[0].catalog.as_mut().unwrap().apps[0].remote_access = false;
-        let entries = menu_model(Some(&state), None, None);
-        let remote = entries
-            .iter()
-            .find(|entry| entry.label == "Workbench")
-            .unwrap();
-        assert!(!remote.children[1].children[0].enabled);
-        assert!(!remote.children[1].children[1].enabled);
-        assert!(remote.children[1]
-            .children
-            .iter()
-            .any(|entry| entry.label.contains("sharing is off")));
+        let entries = model(Some(&state), None, None);
+        let remote = row(&entries, "web.workbench.localhost");
+        assert!(!remote.enabled);
+        assert!(remote.label.ends_with("sharing off"));
+    }
+    #[test]
+    fn unreachable_peer_and_path_routed_app_are_labelled() {
+        let mut state = snapshot();
+        state.peers[0].catalog.as_mut().unwrap().apps[0].name = "web/admin".into();
+        let entries = model(Some(&state), None, None);
+        assert!(row(&entries, "web/admin on Workbench").enabled);
+        state.peers[0].catalog = None;
+        state.peers[0].error = Some("timed out".into());
+        let entries = model(Some(&state), None, None);
+        row(&entries, "Workbench: unavailable (timed out)");
+        row(&entries, "Workbench: reconnect to check");
     }
     #[test]
     fn icon_reflects_proxy_and_reachable_peers() {
@@ -1413,17 +1541,14 @@ mod tests {
         state.local.proxy_running = false;
         state.local.apps.clear();
         state.peers.clear();
-        let entries = menu_model(Some(&state), Some("peer timed out"), None);
+        let entries = model(Some(&state), Some("peer timed out"), None);
         assert!(entries
             .iter()
             .any(|entry| entry.label.contains("peer timed out")));
         assert!(entries
             .iter()
             .any(|entry| entry.action == Some(Action::StartProxy)));
-        assert!(entries[3]
-            .children
-            .iter()
-            .any(|entry| entry.label.contains("No apps yet")));
+        row(&entries, "No apps yet");
         assert_eq!(entries.last().unwrap().action, Some(Action::Quit));
         assert_eq!(Action::Quit.cli_args(), None);
         assert_eq!(Action::StopProxy.cli_args().unwrap(), vec!["proxy", "stop"]);
@@ -1491,7 +1616,7 @@ mod tests {
 
     #[test]
     fn pair_a_device_runs_host_side_and_shows_the_code() {
-        let entries = menu_model(Some(&snapshot()), None, None);
+        let entries = model(Some(&snapshot()), None, None);
         let pair = entries
             .iter()
             .find(|e| e.action == Some(Action::Pair))
@@ -1505,23 +1630,23 @@ mod tests {
         let notice = pairing_notice(br#"{"version":1,"code":"482913","expires":1}"#);
         assert!(notice.contains("482913") && notice.contains("porch pair 482913"));
         assert!(!pairing_notice(b"{}").contains("porch pair "));
-        let shown = menu_model(Some(&snapshot()), None, Some(&notice));
+        let shown = model(Some(&snapshot()), None, Some(&notice));
         assert!(shown.iter().any(|e| e.label.contains("482913")));
     }
     #[test]
     fn header_switch_tracks_and_flips_the_proxy() {
-        let loading = &menu_model(None, None, None)[0];
+        let loading = &model(None, None, None)[0];
         assert_eq!(loading.label, "Porch");
         assert_eq!(loading.toggle, Some(false));
         assert!(!loading.enabled, "unknown state cannot be toggled");
 
         let mut state = snapshot();
-        let on = &menu_model(Some(&state), None, None)[0];
+        let on = &model(Some(&state), None, None)[0];
         assert_eq!((on.toggle, on.enabled), (Some(true), true));
         assert_eq!(on.action, Some(Action::StopProxy));
 
         state.local.proxy_running = false;
-        let entries = menu_model(Some(&state), None, None);
+        let entries = model(Some(&state), None, None);
         assert_eq!(entries[0].toggle, Some(false));
         assert_eq!(entries[0].action, Some(Action::StartProxy));
         assert_eq!(
@@ -1537,17 +1662,16 @@ mod tests {
     #[test]
     fn flipping_the_switch_updates_in_place_but_other_changes_rebuild() {
         let mut state = snapshot();
-        let on = menu_model(Some(&state), None, None);
+        let on = model(Some(&state), None, None);
         state.local.proxy_running = false;
-        let off = menu_model(Some(&state), None, None);
-        // Only the header differs at the top level, but app rows inside
-        // "This machine" also change when the proxy stops, so that rebuilds.
+        let off = model(Some(&state), None, None);
+        // App rows are disabled when the proxy stops, so that rebuilds.
         assert!(!native::same_layout(&on, &off));
         let mut flipped = on.clone();
         flipped[0].toggle = Some(false);
         flipped[0].action = Some(Action::StartProxy);
         assert!(native::same_layout(&on, &flipped));
-        let noticed = menu_model(Some(&snapshot()), None, Some("URL copied"));
+        let noticed = model(Some(&snapshot()), None, Some("URL copied"));
         assert!(!native::same_layout(&on, &noticed));
     }
     #[cfg(unix)]
