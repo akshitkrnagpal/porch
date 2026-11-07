@@ -290,7 +290,38 @@ fn daemon_remembers_settings_and_rejects_bind_failure() {
     assert_eq!(v["tlds"], serde_json::json!(["localhost", "test"]));
     assert_eq!(v["wildcard"], true);
     s.ok(&["proxy", "stop"]);
-    let listener = std::net::TcpListener::bind(("127.0.0.1", s.port)).unwrap();
+    // Occupy the port with a live listener. The stopped proxy's connections can
+    // leave the port in TIME_WAIT, which blocks a plain bind but is not what
+    // this test is about.
+    let listener = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .unwrap();
+    let address: socket2::SockAddr = std::net::SocketAddr::from(([127, 0, 0, 1], s.port)).into();
+    // Unix: SO_REUSEADDR binds over TIME_WAIT, never over a live listener.
+    #[cfg(unix)]
+    {
+        listener.set_reuse_address(true).unwrap();
+        listener.bind(&address).unwrap();
+    }
+    // Windows: SO_REUSEADDR would also bind over a live listener, so wait for
+    // the port to be free instead. The bound is a watchdog (Windows keeps
+    // TIME_WAIT for at most 240s); a passing run binds at once or soon after.
+    #[cfg(windows)]
+    {
+        let deadline = Instant::now() + Duration::from_secs(240);
+        while let Err(e) = listener.bind(&address) {
+            assert!(
+                Instant::now() < deadline,
+                "port {} never freed: {e}",
+                s.port
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    listener.listen(16).unwrap();
     assert!(!s.run(&["proxy", "start"]).status.success());
     assert!(!s.root.join("state/proxy.ready").exists());
     drop(listener);

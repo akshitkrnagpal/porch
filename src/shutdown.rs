@@ -82,14 +82,110 @@ mod imp {
         }
     }
 
-    /// Windows treats a group id that names no process group on this console
-    /// like 0: the event then reaches every process sharing the console,
-    /// including this one, the user's shell and every other app in it. So
     /// `group` must be a process the caller started with
-    /// CREATE_NEW_PROCESS_GROUP (callers guarantee that), and it must still be
-    /// running: a child that has exited (even one whose handle is still open,
-    /// so its id is not reused) is never signaled. The handle held across the
-    /// check also keeps the id from naming a new process.
+    /// CREATE_NEW_PROCESS_GROUP (callers guarantee that). The event then
+    /// reaches only that group's members. Measured on Windows Server 2025: an
+    /// id whose group has no live member makes the call fail and reaches no
+    /// one, and the id of a live process that leads no group reaches no one
+    /// either; only group 0 reaches the whole console, so it is never passed.
+    /// A leader exiting between the check below and the call is therefore
+    /// harmless. The check skips a pointless call, and the handle held across
+    /// it keeps the id from naming a new process meanwhile.
+    pub fn kill_tree(root: u32) {
+        use windows_sys::Win32::{
+            Foundation::{FILETIME, INVALID_HANDLE_VALUE},
+            System::{
+                Diagnostics::ToolHelp::{
+                    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+                    TH32CS_SNAPPROCESS,
+                },
+                Threading::{
+                    GetProcessTimes, OpenProcess, TerminateProcess,
+                    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+                },
+            },
+        };
+        /// A handle to `pid` and its creation time.
+        fn open(pid: u32) -> Option<(HANDLE, u64)> {
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    0,
+                    pid,
+                )
+            };
+            if handle.is_null() {
+                return None;
+            }
+            let (mut created, mut exited, mut kernel, mut user) = (
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+            );
+            if unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) }
+                == 0
+            {
+                unsafe { CloseHandle(handle) };
+                return None;
+            }
+            let created = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+            Some((handle, created))
+        }
+        if root == 0 {
+            return;
+        }
+        // (pid, recorded parent pid) of every process.
+        let mut table = Vec::new();
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot != INVALID_HANDLE_VALUE {
+                let mut entry = PROCESSENTRY32W {
+                    dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                    ..Default::default()
+                };
+                let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+                while more {
+                    table.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                    more = Process32NextW(snapshot, &mut entry) != 0;
+                }
+                CloseHandle(snapshot);
+            }
+        }
+        let Some(first) = open(root) else {
+            return;
+        };
+        let mut members = vec![(root, first.0)];
+        let mut todo = vec![(root, first.1)];
+        while let Some((parent, parent_created)) = todo.pop() {
+            for &(pid, recorded_parent) in &table {
+                if recorded_parent != parent
+                    || pid == parent
+                    || pid == 0
+                    || members.iter().any(|(m, _)| *m == pid)
+                {
+                    continue;
+                }
+                let Some((handle, created)) = open(pid) else {
+                    continue;
+                };
+                if created < parent_created {
+                    // Its real parent exited long ago; the id was reused.
+                    unsafe { CloseHandle(handle) };
+                    continue;
+                }
+                members.push((pid, handle));
+                todo.push((pid, created));
+            }
+        }
+        for (_, handle) in members {
+            unsafe {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+
     pub fn interrupt_group(group: u32) -> bool {
         use windows_sys::Win32::System::Threading::{
             GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -145,11 +241,77 @@ pub fn interrupt_group(group: u32) -> bool {
 }
 
 /// End a process tree without asking.
+///
+/// Not `taskkill /T`: Windows never updates a process's recorded parent id
+/// when the parent exits, so `/T` also kills unrelated processes whose dead
+/// parent's id now belongs to the target. If one of those is the console
+/// host of the user's terminal (or of a CI job), the whole console closes.
+/// Here a child belongs to the tree only if it was created after the process
+/// it names as parent, which a reused id's "children" never are. Handles to
+/// every member are opened before any is terminated, so no id is reused
+/// meanwhile.
 #[cfg(windows)]
 pub fn kill_tree(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    imp::kill_tree(pid)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE, WAIT_OBJECT_0},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+                TH32CS_SNAPPROCESS,
+            },
+            Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
+        },
+    };
+
+    fn children_of(parent: u32) -> Vec<u32> {
+        let mut found = Vec::new();
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            assert_ne!(snapshot, INVALID_HANDLE_VALUE);
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+            while more {
+                if entry.th32ParentProcessID == parent {
+                    found.push(entry.th32ProcessID);
+                }
+                more = Process32NextW(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+        }
+        found
+    }
+
+    #[test]
+    fn kill_tree_ends_the_process_and_its_children() {
+        let mut shell = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 120 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let child = loop {
+            if let Some(&pid) = children_of(shell.id()).first() {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cmd never started ping"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        // Held before the kill, so the id cannot name another process later.
+        let watch = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, child) };
+        assert!(!watch.is_null());
+        super::kill_tree(shell.id());
+        shell.wait().unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(watch, 60_000) }, WAIT_OBJECT_0);
+        unsafe { CloseHandle(watch) };
+    }
 }
