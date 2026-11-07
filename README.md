@@ -133,7 +133,7 @@ The menu lists local apps and paired machines with their status. Click an app to
 - **Share outside your network:** add `--tailscale`, `--funnel`, `--ngrok` or `--cloudflare` to a launch for a public or tailnet URL. Porch cleans it up when the app exits.
 - **Docker Compose:** `porch compose up` gives each HTTP service a name and a stable port.
 - **Git worktrees:** a linked worktree on branch `fix/login` serves at `login.web.localhost`, so two checkouts of one app never collide.
-- **HTTPS:** `porch proxy start --https` serves on 443 with a local certificate authority. It asks for sudo once to bind the port and trust the certificate.
+- **HTTPS:** `porch proxy start --https` serves `https://web.localhost:7462` with HTTP/2 and a local certificate authority trusted for your user, with no sudo (macOS asks for your password or Touch ID once). Add `--port 443` to drop the port number; binding 443 asks for sudo. `porch trust --system` trusts the CA machine-wide for tools that ignore per-user stores.
 - **LAN devices:** `--lan` publishes `web.local` over mDNS for phones and tablets on the same network.
 - **Coding agents:** `porch mcp` is a stdio MCP server, so your agent can list routes and look up URLs.
 

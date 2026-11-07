@@ -28,8 +28,8 @@ Child exit codes are preserved. Unix children lead their own process groups; sig
 ```sh
 porch proxy start                         # HTTP, port 7462, no sudo (default)
 porch proxy start --port 8080             # HTTP, custom port, no sudo
-porch proxy start --https                 # opt-in HTTPS on 443 (sudo + local CA trust)
-porch proxy start --https --port 8443     # HTTPS on a high port, no sudo (run `porch trust` for browser trust)
+porch proxy start --https                 # opt-in HTTPS on 7462 with HTTP/2, per-user CA trust, no sudo
+porch proxy start --https --port 443      # HTTPS without a port in the URL (binding 443 asks for sudo)
 porch proxy start --foreground
 porch proxy start --tld localhost --tld test --wildcard
 porch proxy start --cert ./cert.pem --key ./key.pem
@@ -40,7 +40,7 @@ porch proxy status
 
 Proxy options are `--port`/`-p`, `--https`, `--no-tls`, `--foreground`, `--skip-trust`, `--unprivileged`, `--lan`, `--ip`, repeatable/comma-separated `--tld`, `--wildcard`, paired `--cert`/`--key`, and `--state-dir`. Porch also provides explicit `--bind` and `--redirect-port` overrides. A custom certificate implies TLS.
 
-Port and privilege mode are one setting. Ports ≥1024 imply unprivileged mode: no sudo, no hosts-file synchronization, no automatic trust changes. Browsers resolve `*.localhost` without hosts entries. Set `PORCH_SYNC_HOSTS=1` only if you explicitly want hosts entries on a high port. Ports below 1024 (HTTPS on 443) need administrator rights. Interactive startup runs `sudo -v` before detaching. Unattended startup uses cached sudo authorization or fails with `porch proxy start --no-tls --port 7462` as the no-sudo alternative. `--unprivileged` still forces no-sudo mode on a low port where the OS allows wildcard binding.
+Port and privilege mode are one setting. Ports ≥1024 imply unprivileged mode: no sudo and no hosts-file synchronization. HTTPS keeps the current high port; it moves to 7462 only when switching from port 80. CA trust is per user and needs no sudo, so interactive HTTPS starts on any port offer it; unattended no-sudo starts print a `porch trust` hint instead of failing. Browsers resolve `*.localhost` without hosts entries. Set `PORCH_SYNC_HOSTS=1` only if you explicitly want hosts entries on a high port. Ports below 1024 (HTTPS on 443) need administrator rights. Interactive startup runs `sudo -v` before detaching. Unattended startup uses cached sudo authorization or fails with `porch proxy start --no-tls --port 7462` as the no-sudo alternative. `--unprivileged` still forces no-sudo mode on a low port where the OS allows wildcard binding.
 
 Normal listeners bind IPv4 and IPv6 loopback. LAN mode, and unprivileged low ports, bind both wildcard addresses; the proxy rejects non-loopback peers unless LAN is enabled. Listeners and app reservations use exclusive non-reuse binds across IPv4/IPv6 wildcard interfaces.
 
@@ -100,12 +100,12 @@ Public `PORCH_*` settings take precedence over the corresponding `PORTLESS_*` co
 | `STATE_DIR` | State directory, default `~/.porch` |
 | `PORT` | Proxy port (default 7462); explicit, so a busy port fails rather than moves |
 | `APP_PORT` | App port; explicit CLI selection wins |
-| `HTTPS` | `1` opts in to HTTPS (port 443 unless `PORT` is set); plain HTTP by default |
+| `HTTPS` | `1` opts in to HTTPS on the same port (default 7462; set `PORT=443` for the standard port); plain HTTP by default |
 | `LAN`, `LAN_IP` | LAN mode and optional pinned address |
 | `TLD` | Comma-separated configured domains |
 | `PREFIX` | Worktree prefix; empty disables |
 | `WILDCARD` | Parent wildcard fallback |
-| `UNPRIVILEGED` | No elevation or automatic hosts/trust changes; implied for ports ≥1024 |
+| `UNPRIVILEGED` | No elevation or automatic hosts changes; implied for ports ≥1024 |
 | `SYNC_HOSTS` | `0` disables automatic hosts reconciliation; `1` requests it even on a high port |
 | `LISTEN_TIMEOUT` | Seconds to wait for a launched app to listen before warning (default 15, `0` disables) |
 | `TAILSCALE`, `FUNNEL`, `NGROK`, `CLOUDFLARE` | Sharing provider selection |
@@ -119,7 +119,7 @@ Child outputs include `PORT`, `HOST`, `PORCH_URL`, `NODE_EXTRA_CA_CERTS` for the
 
 `hosts sync` and `hosts clean` reconcile only Porch's managed hosts block, preserving other entries and validating file reads/writes. Automatic elevated sync uses a private token and loopback challenge/proof authentication; browser-origin requests are rejected. Tests override the hosts path and never touch the real file.
 
-`trust` installs the generated CA through macOS security, Linux CA tooling, Windows certutil, or WSL's combined stores. `clean` removes owned trust/service/hosts resources and known state, retaining certificate material when trust removal cannot be completed safely. CA generation and HTTPS client verification are exercised without adding test CAs to the host trust store. In unattended sessions, an untrusted CA produces a descriptive error rather than a prompt; `--skip-trust` or `PORCH_SKIP_TRUST=1` supports clients that explicitly load the generated CA.
+`trust` installs the generated CA for the current user without sudo: the macOS login keychain (one password or Touch ID dialog), the Linux NSS databases used by Chrome/Chromium (`~/.pki/nssdb`, created if missing) and every Firefox profile (needs NSS `certutil`), the Windows user Root store, and on WSL also the Windows user store. `trust --system` instead uses the macOS System keychain or the distribution's CA tooling, so command-line tools trust it too; it asks for sudo. Apps that Porch launches already get `NODE_EXTRA_CA_CERTS`. The record keeps the scope, so `clean` removes per-user trust as you and only elevates for system trust. `clean` removes owned trust/service/hosts resources and known state, retaining certificate material when trust removal cannot be completed safely. CA generation and HTTPS client verification are exercised without adding test CAs to the host trust store. In unattended sessions, an untrusted CA never prompts: no-sudo HTTPS starts continue with a `porch trust` hint, and privileged (port 443) starts fail with a descriptive error; `--skip-trust` or `PORCH_SKIP_TRUST=1` supports clients that explicitly load the generated CA.
 
 `service install`, `service status`, and `service uninstall` generate/manage launchd, systemd, or Windows Task Scheduler startup definitions. Install accepts the proxy configuration flags and state directory. Generated definitions persist explicit settings and logs. Their foreground daemon skips interactive trust setup so boot is unattended; the app launcher or `porch trust` installs browser trust. Native privileged startup/trust installation has not been exercised by ordinary acceptance tests.
 
@@ -135,8 +135,8 @@ LAN advertisement publishes route-specific `.local` names and refreshes route/IP
 
 `porch setup` walks through four choices and is safe to re-run. Each prompt defaults to the current value.
 
-1. HTTPS opt-in (default no): HTTPS on 443 needs sudo once and adds a local CA to the trust store.
-2. Proxy port (default 7462): a busy port is reported with its owner, and the next free port is offered.
+1. HTTPS opt-in (default no): keeps the proxy port and adds a local CA to your user's trust store, without sudo.
+2. Proxy port (default 7462, for HTTP and HTTPS): a busy port is reported with its owner, and the next free port is offered.
 3. Start at login (default: current): installs or uninstalls the `porch service` startup definition, which asks for sudo. When sharing is also on, discovery starts at login too (`porch discovery autostart`, per-user, no sudo).
 4. Share with your other machines (default: current): enables or disables discovery on this machine's private address through the discovery API, with app sharing granted. Peers still pair explicitly.
 

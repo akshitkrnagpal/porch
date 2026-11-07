@@ -577,3 +577,22 @@ with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn https_opt_in_keeps_the_no_sudo_port() {
+    let s = Sandbox::new();
+    let url = |extra: &[(&str, &str)]| {
+        let mut c = s.command(&["get", "web"]);
+        c.env_remove("PORCH_PORT").env("PORCH_HTTPS", "1");
+        for (k, v) in extra {
+            c.env(k, v);
+        }
+        let o = c.output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap().trim().to_owned()
+    };
+    // HTTPS no longer implies 443 (and sudo); it stays on the default high port.
+    assert_eq!(url(&[]), "https://web.localhost:7462");
+    // The standard port is still available when asked for explicitly.
+    assert_eq!(url(&[("PORCH_PORT", "443")]), "https://web.localhost");
+}

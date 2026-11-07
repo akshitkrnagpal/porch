@@ -23,6 +23,7 @@ impl Sandbox {
         ));
         fs::create_dir_all(dir.join("bin")).unwrap();
         fs::create_dir_all(dir.join("state")).unwrap();
+        fs::create_dir_all(dir.join("home")).unwrap();
         fs::write(dir.join("hosts"), "127.0.0.1 localhost\n# retain me\n").unwrap();
         let path = format!(
             "{}:{}",
@@ -48,6 +49,7 @@ impl Sandbox {
             .env("PORCH_HTTPS", "0")
             .env("PORCH_SERVICE_FILE", self.dir.join("service"))
             .env("PORCH_TRUST_DIR", self.dir.join("trust"))
+            .env("HOME", self.dir.join("home"))
             .env("PORCH_TEST_ROOT", &self.dir)
             .env("PORCH_TEST_LOG", self.dir.join("log"))
             .env("PATH", &self.path);
@@ -387,7 +389,13 @@ else:
 #[test]
 fn trust_install_and_cleanup_use_only_recorded_certificate() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    for platform in ["macos", "linux", "windows"] {
+    for (platform, system) in [
+        ("macos", true),
+        ("linux", true),
+        ("windows", false),
+        ("macos", false),
+        ("linux", false),
+    ] {
         let s = Sandbox::new();
         s.fake(
             "openssl",
@@ -396,24 +404,54 @@ fn trust_install_and_cleanup_use_only_recorded_certificate() {
         for tool in ["security", "update-ca-certificates", "certutil"] {
             s.fake(tool, "");
         }
+        // A Firefox profile alongside the shared Chrome NSS database.
+        let profile = s.dir.join("home/.mozilla/firefox/abc.default");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join("cert9.db"), "").unwrap();
         fs::write(s.dir.join("state/ca.pem"), "fixture certificate").unwrap();
         fs::write(s.dir.join("state/ca-key.pem"), "fixture key").unwrap();
+        let mut args = vec!["trust"];
+        if system {
+            args.push("--system");
+        }
         let out = s
             .cmd()
             .env("PORCH_TRUST_PLATFORM", platform)
-            .args(["trust"])
+            .args(&args)
             .output()
             .unwrap();
+        let label = format!("{platform} system={system}");
         assert!(
             out.status.success(),
-            "{platform}: {}",
+            "{label}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         let record: serde_json::Value =
             serde_json::from_slice(&fs::read(s.dir.join("state/trust.json")).unwrap()).unwrap();
         assert_eq!(record["platform"], platform);
-        if platform == "linux" {
-            assert!(s.dir.join("trust/porch-ABABABABABAB.crt").exists());
+        assert_eq!(
+            record["scope"],
+            if system { "system" } else { "user" },
+            "{label}"
+        );
+        let log = s.log();
+        match (platform, system) {
+            ("linux", true) => assert!(s.dir.join("trust/porch-ABABABABABAB.crt").exists()),
+            ("macos", true) => assert!(log.contains("/Library/Keychains/System.keychain")),
+            ("macos", false) => {
+                let keychain = s.dir.join("home/Library/Keychains/login.keychain-db");
+                assert!(log.contains(&*keychain.to_string_lossy()), "{log}");
+                assert!(!log.contains("System.keychain"), "{log}");
+            }
+            ("linux", false) => {
+                // No system CA tooling: the shared NSS db is created, and both dbs get the CA.
+                assert!(!log.contains("update-ca-certificates"), "{log}");
+                assert!(s.dir.join("home/.pki/nssdb").is_dir());
+                assert!(log.contains("--empty-password"), "{log}");
+                assert_eq!(log.matches("\"-A\"").count(), 2, "{log}");
+                assert!(log.contains(&*profile.to_string_lossy()), "{log}");
+            }
+            _ => {}
         }
         let out = s
             .cmd()
@@ -423,19 +461,45 @@ fn trust_install_and_cleanup_use_only_recorded_certificate() {
             .unwrap();
         assert!(
             out.status.success(),
-            "{platform}: {}",
+            "{label}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(!s.dir.join("state/trust.json").exists());
         let log = s.log();
-        assert!(log.contains(if platform == "macos" {
-            "delete-certificate"
-        } else if platform == "linux" {
-            "update-ca-certificates"
-        } else {
-            "-delstore"
-        }));
+        assert!(
+            log.contains(match (platform, system) {
+                ("macos", _) => "delete-certificate",
+                ("linux", true) => "update-ca-certificates",
+                ("linux", false) => "\"-D\"",
+                _ => "-delstore",
+            }),
+            "{label}: {log}"
+        );
     }
+}
+
+#[test]
+fn user_trust_never_requests_sudo() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = Sandbox::new();
+    s.fake("openssl","print('subject=CN=Porch Local CA' if '-subject' in a else 'sha1 Fingerprint=' + ':'.join(['AB']*20))");
+    s.fake("security", "");
+    s.fake("sudo", "sys.exit(97)");
+    fs::write(s.dir.join("state/ca.pem"), "fixture certificate").unwrap();
+    // Without PORCH_TRUST_DIR the system scope would elevate; per-user trust must not.
+    let out = s
+        .cmd()
+        .env_remove("PORCH_TRUST_DIR")
+        .env("PORCH_TRUST_PLATFORM", "macos")
+        .args(["trust"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!s.log().contains("[\"sudo\""), "{}", s.log());
 }
 
 #[test]
