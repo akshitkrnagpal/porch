@@ -16,42 +16,58 @@ use std::{
     name = "porch",
     version,
     about = "Stable named URLs for local development",
+    long_about = "Stable named URLs for local development.\n\nPorch runs your dev command on a free port and serves it at a name you choose, such as http://web.localhost:7462. Run `porch` in a package or workspace root to start its dev script.",
+    after_help = "Examples:\n  porch                         Run this package's dev script (every package at a workspace root)\n  porch run pnpm dev            Run a command, naming the app after the package\n  porch api node server.js      Run a command as api.localhost\n  porch alias db 5432           Route db.localhost to an existing port\n  porch list                    Show routes and their health\n  porch setup                   Guided first run (HTTPS, port, start at login)\n  porch doctor --fix            Find and fix common problems\n\nDocs: https://github.com/akshitkrnagpal/porch/blob/main/docs/reference.md",
     disable_version_flag = true
 )]
 struct Cli {
+    /// Print the version
     #[arg(short='v',short_alias='V',long,action=clap::ArgAction::Version)]
     version: (),
     #[command(flatten)]
     options: RunOptions,
-    #[arg(long)]
+    /// Directory for routes, certificates and settings (default ~/.porch)
+    #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 #[derive(Args, Debug, Default, Clone)]
 struct RunOptions {
+    /// App name; the URL becomes NAME.localhost
     #[arg(long)]
     name: Option<String>,
+    /// Package script to run instead of `dev`
     #[arg(long)]
     script: Option<String>,
+    /// Worktree prefix for the name; '' turns worktree naming off
     #[arg(long)]
     prefix: Option<String>,
-    #[arg(long,value_parser=clap::value_parser!(u16).range(1..))]
+    /// Give the app this fixed port instead of a free one
+    #[arg(long,value_name="PORT",value_parser=clap::value_parser!(u16).range(1..))]
     app_port: Option<u16>,
+    /// Take over the name if another app holds it, stopping that app
     #[arg(long)]
     force: bool,
+    /// Also share the app on your tailnet over Tailscale Serve
     #[arg(long)]
     tailscale: bool,
+    /// Also share the app publicly with Tailscale Funnel
     #[arg(long)]
     funnel: bool,
+    /// Also share the app publicly through an ngrok tunnel
     #[arg(long)]
     ngrok: bool,
+    /// Also share the app publicly through a Cloudflare quick tunnel
     #[arg(long)]
     cloudflare: bool,
+    /// Publish NAME.local over mDNS so phones and other devices on the LAN can open it
     #[arg(long)]
     lan: bool,
+    /// LAN address to advertise (default: detected automatically)
     #[arg(long)]
     ip: Option<String>,
+    /// Framework whose port and host flags to add (detected automatically)
     #[arg(long)]
     framework: Option<String>,
 }
@@ -59,61 +75,90 @@ struct RunOptions {
 struct App {
     #[command(flatten)]
     options: RunOptions,
+    /// Command to run and its arguments
     #[arg(trailing_var_arg=true,num_args=0..)]
     command: Vec<String>,
 }
 #[derive(Args, Debug, Default, Clone)]
 pub(crate) struct ProxyOptions {
+    /// Proxy port (default 7462; 80 or 443 drop the port from URLs but need sudo)
     #[arg(short='p',long,value_parser=clap::value_parser!(u16).range(1..))]
     pub(crate) port: Option<u16>,
+    /// Serve HTTPS and HTTP/2 with a local CA trusted for your user (no sudo)
     #[arg(long, conflicts_with = "no_tls")]
     pub(crate) https: bool,
+    /// Serve plain HTTP
     #[arg(long)]
     pub(crate) no_tls: bool,
+    /// Run in this terminal instead of in the background
     #[arg(long)]
     pub(crate) foreground: bool,
+    /// Don't offer to trust the local CA
     #[arg(long)]
     pub(crate) skip_trust: bool,
+    /// Never use sudo or edit the hosts file (implied for ports 1024 and up)
     #[arg(long)]
     pub(crate) unprivileged: bool,
+    /// Serve .local names to other devices on your network
     #[arg(long)]
     pub(crate) lan: bool,
+    /// LAN address to advertise (default: detected automatically)
     #[arg(long)]
     pub(crate) ip: Option<String>,
+    /// Domains to serve (repeatable or comma-separated, default localhost)
     #[arg(long, value_delimiter = ',')]
     pub(crate) tld: Vec<String>,
+    /// Send unknown subdomains to the closest registered parent
     #[arg(long)]
     pub(crate) wildcard: bool,
-    #[arg(long, requires = "key")]
+    /// Your own TLS certificate (PEM); turns on HTTPS
+    #[arg(long, requires = "key", value_name = "FILE")]
     pub(crate) cert: Option<PathBuf>,
-    #[arg(long, requires = "cert")]
+    /// Private key for --cert (PEM)
+    #[arg(long, requires = "cert", value_name = "FILE")]
     pub(crate) key: Option<PathBuf>,
-    #[arg(long)]
+    /// Address to listen on (default: loopback only)
+    #[arg(long, value_name = "IP")]
     pub(crate) bind: Option<String>,
-    #[arg(long,value_parser=clap::value_parser!(u16).range(1..))]
+    /// Extra plain-HTTP port that redirects to HTTPS
+    #[arg(long,value_name="PORT",value_parser=clap::value_parser!(u16).range(1..))]
     pub(crate) redirect_port: Option<u16>,
-    #[arg(long)]
+    /// Directory for routes, certificates and settings (default ~/.porch)
+    #[arg(long, value_name = "DIR")]
     pub(crate) state_dir: Option<PathBuf>,
 }
 #[derive(Subcommand, Debug)]
 enum ProxyCommand {
+    /// Start the proxy (it also starts on its own when you launch an app)
     Start(ProxyOptions),
+    /// Stop the proxy; running apps keep their routes
     Stop {
+        /// Only stop it if it is on this port
         #[arg(short = 'p', long)]
         port: Option<u16>,
     },
+    /// Print whether the proxy is running
     Status,
 }
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Run a command behind a named URL, naming it from package.json, Git or the directory
+    #[command(
+        after_help = "Examples:\n  porch run pnpm dev\n  porch run --name docs npx vitepress dev\n  porch run --app-port 4500 -- node server.js"
+    )]
     Run(App),
+    /// Print an app's URL (works before the app is running, for cross-app references)
     Get {
+        /// App name
         name: String,
+        /// Ignore the Git worktree prefix
         #[arg(long)]
         no_worktree: bool,
     },
+    /// List routes with their health and sharing URLs
     #[command(alias = "routes")]
     List {
+        /// Machine-readable output
         #[arg(long)]
         json: bool,
         /// Include paired LAN and tailnet machines in the versioned shared catalog.
@@ -124,81 +169,116 @@ enum Commands {
     Pair(crate::discovery::commands::PairArgs),
     /// Forget a paired machine on both sides.
     Unpair {
+        /// Machine name or ID
         machine: String,
+        /// Machine-readable output
         #[arg(long)]
         json: bool,
     },
+    /// List, refresh or add paired machines
     Peers(crate::discovery::commands::Peers),
+    /// Manage the discovery agent that shares apps with paired machines
     Discovery {
         #[command(subcommand)]
         command: crate::discovery::commands::Command,
     },
     /// Open an app locally or through a paired machine's authenticated browser relay.
     Open {
+        /// App name
         app: String,
+        /// Paired machine that runs the app
         #[arg(long)]
         peer: Option<String>,
+        /// Print the URL instead of opening a browser
         #[arg(long)]
         url_only: bool,
     },
     /// Copy a local app URL or a paired machine's loopback relay URL.
     Copy {
+        /// App name
         app: String,
+        /// Paired machine that runs the app
         #[arg(long)]
         peer: Option<String>,
     },
     /// Launch the optional native menu bar / tray companion.
     Tray,
+    /// Route a name to something Porch didn't start (a port, Docker container or URL)
+    #[command(
+        after_help = "Examples:\n  porch alias db 5432\n  porch alias grafana http://127.0.0.1:3001\n  porch alias --remove db"
+    )]
     Alias {
+        /// Name for the route
         name: Option<String>,
+        /// Port (3000) or HTTP(S) URL to send requests to
         target: Option<String>,
-        #[arg(long)]
+        /// Remove the alias with this name
+        #[arg(long, value_name = "NAME")]
         remove: Option<String>,
+        /// Replace an existing route with this name
         #[arg(long)]
         force: bool,
+        /// Only register under these domains
         #[arg(long, value_delimiter = ',')]
         tld: Vec<String>,
     },
+    /// Remove an alias
     #[command(alias = "rm")]
     Remove {
+        /// Alias name
         name: String,
+        /// Only remove it from these domains
         #[arg(long, value_delimiter = ',')]
         tld: Vec<String>,
     },
+    /// Remove routes whose apps are gone
     Prune {
+        /// Also stop processes left behind by those routes
         #[arg(long)]
         force: bool,
     },
+    /// Remove everything Porch installed: trust, services, hosts entries and state
     Clean {
+        /// Don't ask for confirmation
         #[arg(long)]
         force: bool,
     },
+    /// Start, stop or check the proxy
     Proxy {
         #[command(subcommand)]
         command: Option<ProxyCommand>,
     },
+    /// Run an MCP server over stdio so coding agents can find and manage your apps
     Mcp {
+        /// Tool profiles: core, proxy, diagnostics or all
         #[arg(long, alias = "tools-profiles")]
         tools: Option<String>,
+        /// Same as --tools
         profile: Option<String>,
     },
+    /// Sync or clean Porch's block in the hosts file (`porch hosts sync|clean`)
     Hosts {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Start the proxy at login (`porch service install|status|uninstall`)
     Service {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run `docker compose` and give each HTTP service a named URL (`porch compose up`)
     Compose {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Manage Tailscale, ngrok and Cloudflare sharing for running apps
     Share {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Show LAN mode status and addresses
     Lan,
+    /// Check the proxy, routes, name resolution and trust, and suggest fixes
     Doctor {
         /// Apply safe fixes; terminating stopped or orphaned launches still asks first.
         #[arg(long)]
@@ -215,6 +295,7 @@ enum Commands {
         #[arg(long)]
         system: bool,
     },
+    /// Show the packages Porch would start at this workspace root
     Workspace,
     /// Update porch to the latest release (or run `brew upgrade` for Homebrew installs).
     SelfUpdate(crate::update::SelfUpdateArgs),
@@ -415,7 +496,16 @@ pub async fn run() -> Result<i32> {
                 if port.is_some_and(|p| state::proxy_settings().is_ok_and(|s| s.port != p)) {
                     bail!("no proxy at requested port in this state directory")
                 }
+                let was_running = proxy_running();
                 stop_proxy().await?;
+                println!(
+                    "{}",
+                    if was_running {
+                        "Proxy stopped"
+                    } else {
+                        "Proxy was not running"
+                    }
+                );
             }
             ProxyCommand::Status => println!(
                 "{}",
@@ -462,7 +552,24 @@ pub async fn run() -> Result<i32> {
         Some(Commands::Workspace) => {
             let cwd = std::env::current_dir()?;
             let root = crate::config::find_workspace_root(&cwd).unwrap_or(cwd);
-            println!("{:#?}", crate::config::discover_workspace_packages(&root));
+            let packages = crate::config::discover_workspace_packages(&root);
+            if packages.is_empty() {
+                println!("No workspace packages found under {}", root.display());
+            }
+            for p in packages {
+                let rel = p.dir.strip_prefix(&root).unwrap_or(&p.dir);
+                let script = if p.scripts.get("dev").is_some() {
+                    "dev"
+                } else {
+                    "-"
+                };
+                println!(
+                    "{:<32} {:<6} {}",
+                    p.name.as_deref().unwrap_or("(unnamed)"),
+                    script,
+                    rel.display()
+                );
+            }
         }
     }
     Ok(0)
@@ -1260,8 +1367,12 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
             bail!("port must be nonzero")
         }
         format!("http://127.0.0.1:{p}")
+    } else if !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("port {target} is out of range; use 1-65535")
     } else {
-        let u = url::Url::parse(target)?;
+        let u = url::Url::parse(target).with_context(|| {
+            format!("target {target:?} must be a port (3000) or a URL (http://127.0.0.1:3000)")
+        })?;
         if !["http", "https"].contains(&u.scheme()) || u.host_str().is_none() {
             bail!("target must be an HTTP URL or TCP port")
         }
@@ -1299,16 +1410,20 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
                 }
             }
         }
-        for n in names {
-            state::remove_route(s, &n);
+        for n in &names {
+            state::remove_route(s, n);
             s.routes.push(Route {
-                name: n,
+                name: n.clone(),
                 target: target.clone(),
                 pid: None,
             });
         }
         Ok(())
-    })
+    })?;
+    for n in &names {
+        println!("{} -> {target}", p.url(n));
+    }
+    Ok(())
 }
 fn remove_alias(name: &str, selected: &[String]) -> Result<()> {
     let names = alias_names(name, selected)?;

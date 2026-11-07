@@ -31,9 +31,37 @@ fn escape(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
+const PAGE_CSS: &str = ":root{color-scheme:light dark;--bg:#faf8f2;--fg:#242421;--muted:#6b675e;--card:#fff;--line:#e6e1d6;--accent:#b4532a;--code:#efeadf}@media (prefers-color-scheme:dark){:root{--bg:#161513;--fg:#ece9e1;--muted:#a19c90;--card:#1f1e1b;--line:#33312c;--accent:#f08a5d;--code:#2a2925}}*{box-sizing:border-box}body{margin:0;font:16px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg)}main{max-width:46rem;margin:0 auto;padding:12vh 1rem 4rem}.status{font:600 .8rem ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}h1{font-size:1.75rem;line-height:1.2;margin:.4rem 0 1rem}p{margin:.6rem 0}code{font:.9em ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--code);padding:.1rem .35rem;border-radius:4px}.muted{color:var(--muted)}h2{font-size:.95rem;margin:2.5rem 0 .75rem;color:var(--muted);font-weight:600}ul.apps{list-style:none;padding:0;margin:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}ul.apps li{border-top:1px solid var(--line)}ul.apps li:first-child{border-top:0}ul.apps a{display:flex;justify-content:space-between;gap:1rem;padding:.75rem 1rem;color:inherit;text-decoration:none}ul.apps a:hover,ul.apps a:focus-visible{background:var(--code);outline:none}.name{font-weight:600}.target{color:var(--muted);font:.85em ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}input[type=search]{width:100%;font:inherit;padding:.55rem .75rem;margin:0 0 .75rem;border:1px solid var(--line);border-radius:8px;background:var(--card);color:inherit}.spinner{display:inline-block;width:.8em;height:.8em;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;vertical-align:-.05em;margin-right:.4rem}@keyframes spin{to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.spinner{animation:none}}footer{margin-top:3rem;font-size:.85rem;color:var(--muted)}";
+fn page(code: StatusCode, title: &str, body: &str, head: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{head}<title>{} · Porch</title><style>{PAGE_CSS}</style></head><body><main><div class=\"status\">{} {}</div><h1>{}</h1>{body}<footer>Served by Porch · run <code>porch list</code> or <code>porch doctor</code></footer></main></body></html>",
+        escape(title),
+        code.as_u16(),
+        escape(code.canonical_reason().unwrap_or("Proxy error")),
+        escape(title),
+    )
+}
 fn error(code: StatusCode, kind: &str, message: &str, host: &str, html: bool) -> Response<Body> {
     let body = if html {
-        format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>{} · Porch</title><style>body{{font:16px system-ui;background:#faf8f2;color:#242421;max-width:52rem;margin:12vh auto;padding:2rem}}h1{{font-size:2rem}}code{{background:#eee9df;padding:.2rem}}</style><h1>{} {}</h1><p>{}</p><p>Host: <code>{}</code></p><p>Run <code>porch list</code> to inspect registered apps.</p></html>", code.as_u16(),code.as_u16(),escape(code.canonical_reason().unwrap_or("Proxy error")), escape(message),escape(host))
+        // An app that isn't listening yet is usually still starting: retry on
+        // our own so the tab comes up as soon as the dev server does.
+        let starting = kind == "upstream_unavailable";
+        let title = if starting {
+            "Waiting for the app to start"
+        } else {
+            message
+        };
+        let detail = if starting {
+            format!("<p><span class=\"spinner\" aria-hidden=\"true\"></span><strong>{}</strong> is registered, but nothing is answering on its port yet. This page reloads by itself.</p><p class=\"muted\">{}</p>", escape(host), escape(message))
+        } else {
+            format!("<p class=\"muted\">Host: <code>{}</code></p>", escape(host))
+        };
+        let head = if starting {
+            "<meta http-equiv=\"refresh\" content=\"2\">"
+        } else {
+            ""
+        };
+        page(code, title, &detail, head)
     } else {
         serde_json::json!({"error":kind,"upstream":host,"message":message}).to_string()
     };
@@ -364,7 +392,7 @@ async fn forward(
     if hops >= 5 {
         return Ok(error(StatusCode::LOOP_DETECTED,"loop_detected","Request passed through Porch too many times. Add changeOrigin: true to your dev server proxy config.",&host,html));
     }
-    let state = match crate::state::load() {
+    let state = match crate::state::live_routes() {
         Ok(s) => s,
         Err(_) => {
             return Ok(error(
@@ -379,7 +407,6 @@ async fn forward(
     let route = state
         .routes
         .iter()
-        .filter(|r| crate::state::route_alive(&state, r))
         .filter_map(|r| score(&r.name, &hostname, req.uri().path(), &settings).map(|s| (s, r)))
         .max_by_key(|(s, _)| *s)
         .map(|(_, r)| r)
@@ -393,7 +420,6 @@ async fn forward(
                 .routes
                 .iter()
                 .rev()
-                .filter(|r| crate::state::route_alive(&state, r))
                 .filter_map(|r| {
                     let score = state
                         .shares
@@ -450,21 +476,39 @@ async fn forward(
             html,
         );
         if html {
+            // Other devices (LAN mode) see names only; upstream targets stay private.
+            let show_targets = peer.ip().is_loopback();
             let links = state
                 .routes
                 .iter()
-                .filter(|r| crate::state::route_alive(&state, r))
                 .map(|r| {
                     format!(
-                        "<li><a href=\"{}\">{}</a> → <code>{}</code></li>",
+                        "<li><a href=\"{}\"><span class=\"name\">{}</span>{}</a></li>",
                         escape(&settings.url(&r.name)),
                         escape(&settings.hostname(&r.name)),
-                        escape(&r.target)
+                        if show_targets {
+                            format!("<span class=\"target\">{}</span>", escape(&r.target))
+                        } else {
+                            String::new()
+                        }
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("");
-            let page=format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>404 · Porch</title><style>body{{font:16px system-ui;max-width:52rem;margin:10vh auto;padding:2rem;background:#faf8f2;color:#242421}}li{{margin:1rem 0}}</style><h1>404 Not Found</h1><p>No app registered for <strong>{}</strong>.</p><h2>Active apps</h2><ul>{}</ul><p>Start an app with <code>porch &lt;name&gt; &lt;command&gt;</code>.</p></html>",escape(&hostname),links);
+                .collect::<Vec<_>>();
+            let list = if links.is_empty() {
+                "<p class=\"muted\">No apps are running. Start one with <code>porch run pnpm dev</code> or <code>porch NAME COMMAND</code>.</p>".to_owned()
+            } else {
+                let filter = if links.len() > 5 {
+                    "<input type=\"search\" placeholder=\"Filter apps\" aria-label=\"Filter apps\" oninput=\"for(const li of document.querySelectorAll('ul.apps li'))li.hidden=!li.textContent.toLowerCase().includes(this.value.toLowerCase())\" autofocus>"
+                } else {
+                    ""
+                };
+                format!("{filter}<ul class=\"apps\">{}</ul>", links.join(""))
+            };
+            let body = format!(
+                "<p>No app is registered for <code>{}</code>.</p><h2>Running apps</h2>{list}",
+                escape(&hostname)
+            );
+            let page = page(StatusCode::NOT_FOUND, "No app at this address", &body, "");
             *response.body_mut() = Full::new(Bytes::from(page))
                 .map_err(|e: Infallible| match e {})
                 .boxed_unsync();
@@ -542,6 +586,21 @@ async fn forward(
             header::CONNECTION,
             header::HeaderValue::from_static("upgrade"),
         );
+    }
+    // Only a client on this machine (another proxy, a tunnel) may set its own
+    // forwarding headers. Anyone else on the LAN could otherwise spoof the
+    // scheme or host the app sees.
+    let trust_forwarded = peer.ip().is_loopback();
+    if !trust_forwarded {
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "forwarded",
+        ] {
+            req.headers_mut().remove(name);
+        }
     }
     let forwarded_for = req
         .headers()

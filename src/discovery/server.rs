@@ -834,7 +834,10 @@ fn catalog(dir: &Path, machine: Machine, share: bool) -> Result<Catalog> {
                 } else if !share {
                     Some("Local only; remote app transport is disabled on this machine".into())
                 } else if !supported {
-                    Some("Route target is not a supported HTTP URL".into())
+                    Some(
+                        "Only apps on this machine can be shared; this route points elsewhere"
+                            .into(),
+                    )
                 } else {
                     None
                 },
@@ -897,6 +900,17 @@ fn route_target(route: &Route) -> Result<url::Url> {
     {
         bail!("unsupported route target")
     };
+    // Paired machines may only reach apps on this machine. An alias to another
+    // host (a LAN service, a cloud metadata address) must not become a relay.
+    let local = match target.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if !local {
+        bail!("route target is not on this machine")
+    }
     Ok(target)
 }
 fn strip(headers: &mut header::HeaderMap) {

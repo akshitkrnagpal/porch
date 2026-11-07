@@ -445,3 +445,66 @@ pub fn group_matches(group: u32, started: Option<&str>) -> bool {
         identity(group).is_some_and(|i| Some(i.started.as_str()) == started)
     }
 }
+
+/// Routes the proxy can serve, cached between requests.
+///
+/// The proxy used to re-read `state.json` and re-check every route's process on
+/// each request. This keeps the parsed state until the file changes and keeps
+/// the liveness answers for a short window, so a request costs one `stat`.
+pub fn live_routes() -> Result<std::sync::Arc<State>> {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant, SystemTime};
+    #[derive(PartialEq, Clone)]
+    struct Stamp {
+        path: PathBuf,
+        modified: Option<SystemTime>,
+        len: u64,
+        #[cfg(unix)]
+        ino: u64,
+    }
+    struct Cached {
+        stamp: Option<Stamp>,
+        at: Instant,
+        state: Arc<State>,
+    }
+    static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
+    const LIVENESS_TTL: Duration = Duration::from_millis(750);
+    let path = dir().join("state.json");
+    let stamp = match fs::metadata(&path) {
+        Ok(m) => Some(Stamp {
+            path: path.clone(),
+            modified: m.modified().ok(),
+            len: m.len(),
+            #[cfg(unix)]
+            ino: std::os::unix::fs::MetadataExt::ino(&m),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = cache.as_ref() {
+        let same_file = match (&c.stamp, &stamp) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => c.state.routes.is_empty(),
+            _ => false,
+        };
+        if same_file && c.at.elapsed() < LIVENESS_TTL {
+            return Ok(c.state.clone());
+        }
+    }
+    let mut state = load()?;
+    let alive: Vec<Route> = state
+        .routes
+        .iter()
+        .filter(|r| route_alive(&state, r))
+        .cloned()
+        .collect();
+    state.routes = alive;
+    let state = Arc::new(state);
+    *cache = Some(Cached {
+        stamp,
+        at: Instant::now(),
+        state: state.clone(),
+    });
+    Ok(state)
+}

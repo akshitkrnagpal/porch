@@ -29,7 +29,9 @@ pub enum Command {
     },
     /// Stop only the discovery agent and remove its exposure configuration.
     Disable,
+    /// Show whether the agent is running, where it listens and who is paired
     Status {
+        /// Machine-readable output
         #[arg(long)]
         json: bool,
     },
@@ -53,8 +55,11 @@ pub enum Command {
 }
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 pub enum AutostartAction {
+    /// Start discovery at login
     Enable,
+    /// Stop starting discovery at login
     Disable,
+    /// Show whether discovery starts at login
     Status,
 }
 /// Pair two machines. Run `porch pair` on one to show a code, then
@@ -78,6 +83,7 @@ pub struct PairArgs {
     /// Show a code and return immediately instead of waiting (for scripts and the tray).
     #[arg(long)]
     pub no_wait: bool,
+    /// Machine-readable output
     #[arg(long)]
     pub json: bool,
 }
@@ -86,13 +92,17 @@ pub enum PairCommand {
     /// Report a code shown with `porch pair --no-wait`: waiting, accepted, paired,
     /// expired, cancelled or replaced.
     Status {
+        /// Pairing ID printed by `porch pair --no-wait`
         id: String,
+        /// Machine-readable output
         #[arg(long)]
         json: bool,
     },
     /// Stop a code from working. Harmless if it already closed.
     Cancel {
+        /// Pairing ID printed by `porch pair --no-wait`
         id: String,
+        /// Machine-readable output
         #[arg(long)]
         json: bool,
     },
@@ -243,6 +253,7 @@ pub async fn unpair(machine: &str, json: bool) -> Result<()> {
 }
 #[derive(Args, Debug)]
 pub struct Peers {
+    /// Machine-readable output
     #[arg(long)]
     pub json: bool,
     #[command(subcommand)]
@@ -250,11 +261,15 @@ pub struct Peers {
 }
 #[derive(Subcommand, Debug)]
 pub enum PeerCommand {
+    /// List paired machines and their apps
     List {
+        /// Machine-readable output
         #[arg(long)]
         json: bool,
     },
+    /// Fetch the latest app lists from paired machines now
     Refresh {
+        /// Machine-readable output
         #[arg(long)]
         json: bool,
     },
