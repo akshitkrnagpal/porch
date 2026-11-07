@@ -489,9 +489,11 @@ mod tests {
         let rotated = fs::read_to_string(path.join("ca.pem")).unwrap();
         assert_ne!(rotated, cert);
         assert!(uncovered_tlds(&rotated, &other).is_empty());
-        assert!(fs::read_dir(&path)
+        assert!(fs::read_dir(&path).unwrap().any(|e| e
             .unwrap()
-            .any(|e| e.unwrap().file_name().to_string_lossy().starts_with("ca.pem.retired-")));
+            .file_name()
+            .to_string_lossy()
+            .starts_with("ca.pem.retired-")));
         // Back to the defaults for the legacy-profile checks below.
         config_in_dir(&settings, &path).unwrap();
         // Install an old profile only in this temporary fixture; no system trust.
