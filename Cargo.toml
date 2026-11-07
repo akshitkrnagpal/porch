@@ -1,6 +1,6 @@
 [package]
 name = "porch"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Stable named URLs for local dev servers, across your machines"
 license = "MIT"
