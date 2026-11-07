@@ -107,10 +107,10 @@ Any client that launches stdio servers works. Use command `porch` and arguments 
 
 | Profile | Tools |
 | --- | --- |
-| `core` (also `default`) | `list`, `get`, `alias_add`, `alias_remove`, `tools_profiles` |
+| `core` (also `default`) | `list`, `get`, `machines`, `alias_add`, `alias_remove`, `tools_profiles` |
 | `proxy` | `proxy_start`, `proxy_stop` |
 | `diagnostics` | `doctor`, `prune`, `version`, `doctor_fix` |
-| `readonly` | `list`, `get`, `tools_profiles`, `doctor`, `version`: nothing that changes routes, the proxy or processes |
+| `readonly` | `list`, `get`, `machines`, `tools_profiles`, `doctor`, `version`: nothing that changes routes, the proxy or processes |
 | `all` (also `full`) | Everything above |
 
 Example: `porch mcp --tools core,diagnostics`. Calling a tool outside the active profiles returns "Tool is disabled; restart porch mcp --tools all".
@@ -123,7 +123,8 @@ Except `tools_profiles`, every tool accepts `cwd` (directory to run in), `extraA
 | --- | --- | --- | --- |
 | `list` | none | `porch list --json` | Routes with name, URL, target, pid, health, `private` and sharing URLs, plus proxy settings. `extraArgs: ["--all"]` includes paired machines. Read-only |
 | `get` | `name` (required), `noWorktree` | `porch get NAME` | Pass `cwd` as the project directory so the worktree prefix matches. Read-only |
-| `alias_add` | `name`, `port` (required), `force`, `tld` | `porch alias NAME http://127.0.0.1:PORT` | Routes a name to a local port |
+| `alias_add` | `name`, `port` (required), `force`, `tld`, `private`, `upstream` | `porch alias NAME PORT` | Routes a name to a local port; `upstream` takes `https`, `https://HOST` or `http://HOST` |
+| `machines` | none | `porch list --all --json` | This computer's and every paired machine's apps, with the local URL for each remote app. Read-only |
 | `alias_remove` | `name` (required), `tld` | `porch remove NAME` | Removes an alias; app routes aren't touched |
 | `tools_profiles` | none | — | Active and available profiles. Read-only |
 | `proxy_start` | `port`, `noTls`, `lan`, `tld`, `wildcard`, `unprivileged` | `porch proxy start` | `--foreground` is refused over MCP |

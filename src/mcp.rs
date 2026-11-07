@@ -16,13 +16,14 @@ const NAMES: &[&str] = &[
     "prune",
     "version",
     "doctor_fix",
+    "machines",
 ];
 /// What each tool does, for agents choosing between them.
 fn description(n: &str) -> &'static str {
     match n {
         "list" => "List the apps Porch is serving on this computer: name, URL, upstream target, owning pid, health (ok, not listening, stopped, dead) and any sharing URLs. Use this to find the URL of a running dev server instead of guessing a localhost port.",
         "get" => "Print the stable URL for an app name, applying the current Git worktree prefix unless noWorktree is set. Works before the app runs, so it is safe for wiring one app's URL into another's config.",
-        "alias_add" => "Route NAME.localhost to an existing local port that Porch did not start (a database UI, a Docker container). Fails if the name is taken unless force is set.",
+        "alias_add" => "Route NAME.localhost to an existing local port that Porch did not start (a database UI, a Docker container). Fails if the name is taken unless force is set. private keeps it off paired machines; upstream (https, https://HOST or http://HOST) sets TLS and the Host sent to the port.",
         "alias_remove" => "Remove a static alias created with alias_add. Never stops a process.",
         "tools_profiles" => "Report which tool profiles are active and which exist (core, proxy, diagnostics, all).",
         "proxy_start" => "Start the Porch proxy in the background if it is not running. Apps start it automatically, so this is rarely needed.",
@@ -30,6 +31,7 @@ fn description(n: &str) -> &'static str {
         "doctor" => "Read-only health check: proxy listeners, routes, name resolution, HTTPS trust and optional tools. Returns a non-zero exit code when it finds problems. Never changes anything; use doctor_fix to apply fixes.",
         "prune" => "Remove routes whose apps have exited. With force, also stop processes those routes left behind.",
         "version" => "Print the Porch version.",
+        "machines" => "List this computer's apps and every paired machine's apps, with the URL that opens each remote app through the local proxy (APP.MACHINE.localhost). Use this to reach a dev server running on another computer.",
         "doctor_fix" => "Apply doctor's safe fixes: move a stopped proxy off a busy port, prune dead routes, restart an outdated proxy. With yes, also terminate stopped or orphaned launches without asking.",
         _ => "",
     }
@@ -40,7 +42,7 @@ fn allowed_extra(n: &str) -> Option<&'static [&'static str]> {
     match n {
         "list" => Some(&["--all", "--json"]),
         "get" => Some(&["--no-worktree"]),
-        "doctor" | "version" | "tools_profiles" => Some(&[]),
+        "doctor" | "version" | "tools_profiles" | "machines" => Some(&[]),
         "doctor_fix" => Some(&[]),
         _ => None,
     }
@@ -69,11 +71,19 @@ fn enabled(p: &[String], n: &str) -> bool {
     p.iter().any(|p| {
         p == "all"
             || match p.as_str() {
-                "core" => NAMES[..5].contains(&n),
+                "core" => NAMES[..5].contains(&n) || n == "machines",
                 "proxy" => NAMES[5..7].contains(&n),
-                "diagnostics" => NAMES[7..].contains(&n),
+                "diagnostics" => NAMES[7..].contains(&n) && n != "machines",
                 // Inspection only: nothing that changes routes, the proxy or processes.
-                "readonly" => ["list", "get", "tools_profiles", "doctor", "version"].contains(&n),
+                "readonly" => [
+                    "list",
+                    "get",
+                    "tools_profiles",
+                    "doctor",
+                    "version",
+                    "machines",
+                ]
+                .contains(&n),
                 _ => false,
             }
     })
@@ -85,7 +95,7 @@ fn definition(n: &str) -> Value {
     }
     let fields: &[&str] = match n {
         "get" => &["name", "noWorktree"],
-        "alias_add" => &["name", "port", "force", "tld"],
+        "alias_add" => &["name", "port", "force", "tld", "private", "upstream"],
         "alias_remove" => &["name", "tld"],
         "proxy_start" => &["port", "noTls", "lan", "tld", "wildcard", "unprivileged"],
         "proxy_stop" => &["port"],
@@ -95,7 +105,7 @@ fn definition(n: &str) -> Value {
     };
     for f in fields {
         properties[*f] = match *f {
-            "name" => json!({"type":"string","minLength":1}),
+            "name" | "upstream" => json!({"type":"string","minLength":1}),
             "port" => json!({"type":"integer","minimum":1,"maximum":65535}),
             "tld" => json!({"type":"array","minItems":1,"items":{"type":"string"}}),
             _ => json!({"type":"boolean"}),
@@ -106,7 +116,15 @@ fn definition(n: &str) -> Value {
         "alias_add" => vec!["name", "port"],
         _ => vec![],
     };
-    let read = ["list", "get", "tools_profiles", "doctor", "version"].contains(&n);
+    let read = [
+        "list",
+        "get",
+        "tools_profiles",
+        "doctor",
+        "version",
+        "machines",
+    ]
+    .contains(&n);
     json!({"name":n,"description":description(n),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read,"destructiveHint":(["alias_add","alias_remove","proxy_stop","prune","doctor_fix"].contains(&n)),"idempotentHint":n!="alias_add","openWorldHint":n=="proxy_start"}})
 }
 fn validate(n: &str, a: &Value) -> Result<()> {
@@ -168,7 +186,7 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
         "alias_add" => vec![
             "alias".into(),
             a["name"].as_str().unwrap().into(),
-            format!("http://127.0.0.1:{}", a["port"]),
+            a["port"].to_string(),
         ],
         "alias_remove" => vec!["remove".into(), a["name"].as_str().unwrap().into()],
         "get" => vec!["get".into(), a["name"].as_str().unwrap().into()],
@@ -176,6 +194,7 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
         "proxy_stop" => vec!["proxy".into(), "stop".into()],
         "version" => vec!["--version".into()],
         "doctor_fix" => vec!["doctor".into(), "--fix".into()],
+        "machines" => vec!["list".into(), "--all".into(), "--json".into()],
         _ => vec![n.into()],
     };
     if n.starts_with("proxy_") {
@@ -191,10 +210,14 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
         ("wildcard", "--wildcard"),
         ("unprivileged", "--unprivileged"),
         ("yes", "--yes"),
+        ("private", "--private"),
     ] {
         if a[key] == true {
             argv.push(flag.into());
         }
+    }
+    if let Some(up) = a["upstream"].as_str() {
+        argv.extend(["--upstream".into(), up.into()]);
     }
     if let Some(tlds) = a["tld"].as_array() {
         for tld in tlds {
@@ -461,7 +484,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            5
+            6
         );
         let tools = s
             .handle(r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#)
