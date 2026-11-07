@@ -1,0 +1,7 @@
+{
+  "$schema": "https://raw.githubusercontent.com/akshitkrnagpal/porch/main/schema/porch.schema.json",
+  "apps": {
+    "apps/web": { "name": "shop" },
+    "apps/api": { "name": "api.shop" }
+  }
+}
