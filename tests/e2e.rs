@@ -1,7 +1,7 @@
-//! Real-framework acceptance: installs Vite from npm, runs `porch run vite`
-//! and checks the page and Vite's HMR WebSocket through the proxy, the way a
-//! browser uses them. Needs Node.js, npm and network access, so it runs only
-//! with `PORCH_E2E=1` (CI sets it); otherwise it is skipped.
+//! Real-framework acceptance: real dev servers (Vite, Next.js, Python's
+//! http.server) run under `porch run`, and their pages and HMR sockets are
+//! checked through the proxy the way a browser uses them. The npm-based tests
+//! need network access, so they run only with `PORCH_E2E=1` (CI sets it).
 mod common;
 use std::{
     path::PathBuf,
@@ -189,6 +189,179 @@ fn vite_page_and_hmr_websocket_work_through_porch() {
                 }
             }
         }
+    });
+    drop(launch);
+}
+
+/// Start `porch run` in `dir` with isolated state on its own proxy port.
+fn porch_run(root: &std::path::Path, dir: &std::path::Path, port: u16, args: &[&str]) -> Launch {
+    let state = root.join("state");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_porch"));
+    command
+        .args(args)
+        .current_dir(dir)
+        .env("PORCH_STATE_DIR", &state)
+        .env("PORCH_PORT", port.to_string())
+        .env("PORCH_APP_PORTS", common::app_ports(port))
+        .env("PORCH_CLEAN_URLS", "0")
+        .env("PORCH_HTTPS", "0")
+        .env("PORCH_SYNC_HOSTS", "0")
+        .env("PORCH_SKIP_TRUST", "1")
+        .env("NEXT_TELEMETRY_DISABLED", "1")
+        .env("CI", "1")
+        .stdin(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    Launch {
+        child: command.spawn().unwrap(),
+        root: root.to_path_buf(),
+        state,
+    }
+}
+
+/// GET `path` on `host` through the proxy until the body contains `needle`.
+async fn wait_for_page(port: u16, host: &str, needle: &str, within: Duration) -> String {
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let deadline = Instant::now() + within;
+    loop {
+        if let Ok(r) = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .header("host", host)
+            .header("accept", "text/html")
+            .send()
+            .await
+        {
+            if r.status().is_success() {
+                let text = r.text().await.unwrap_or_default();
+                if text.contains(needle) {
+                    return text;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{host} never served {needle:?} through Porch"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// A non-JavaScript server that ignores PORT: Porch adds the port and bind
+/// address to `python3 -m http.server` itself. Needs only Python, so it
+/// always runs.
+#[test]
+fn python_http_server_gets_its_port_from_porch() {
+    let root = std::env::temp_dir().join(format!("porch-e2e-py-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let site = root.join("site");
+    std::fs::create_dir_all(&site).unwrap();
+    std::fs::write(
+        site.join("index.html"),
+        "<h1>served by python through porch</h1>",
+    )
+    .unwrap();
+    let port = common::free_port();
+    let launch = porch_run(
+        &root,
+        &site,
+        port,
+        &[
+            "run",
+            "--name",
+            "py",
+            "--prefix",
+            "",
+            "python3",
+            "-m",
+            "http.server",
+        ],
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(wait_for_page(
+        port,
+        "py.localhost",
+        "served by python through porch",
+        Duration::from_secs(30),
+    ));
+    drop(launch);
+}
+
+/// Next.js reads PORT on its own; its dev server and HMR socket must work
+/// under the Porch name.
+#[test]
+fn nextjs_page_and_hmr_socket_work_through_porch() {
+    if std::env::var("PORCH_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping: set PORCH_E2E=1 to install Next.js from npm and run it");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("porch-e2e-next-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app = root.join("app");
+    std::fs::create_dir_all(app.join("app")).unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        r#"{"name":"e2e-next","private":true,"scripts":{"dev":"next dev"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("app/layout.js"),
+        "export default function Layout({ children }) { return <html><body>{children}</body></html>; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("app/page.js"),
+        "export default function Page() { return <h1>next through porch</h1>; }\n",
+    )
+    .unwrap();
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let install = Command::new(npm)
+        .args([
+            "install",
+            "--no-audit",
+            "--no-fund",
+            "--silent",
+            "next@15",
+            "react@19",
+            "react-dom@19",
+        ])
+        .current_dir(&app)
+        .status()
+        .expect("npm is required for PORCH_E2E");
+    assert!(install.success(), "npm install next failed");
+    let port = common::free_port();
+    let launch = porch_run(
+        &root,
+        &app,
+        port,
+        &["run", "--name", "next", "--prefix", "", "npm", "run", "dev"],
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        // The first compile can be slow on a cold CI runner.
+        let page = wait_for_page(
+            port,
+            "next.localhost",
+            "next through porch",
+            Duration::from_secs(180),
+        )
+        .await;
+        assert!(page.contains("/_next/"), "{page}");
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://127.0.0.1:{port}/_next/webpack-hmr")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("host", "next.localhost".parse().unwrap());
+        request.headers_mut().insert(
+            "origin",
+            format!("http://next.localhost:{port}").parse().unwrap(),
+        );
+        let (_socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+        assert_eq!(response.status(), 101);
     });
     drop(launch);
 }

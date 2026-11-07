@@ -41,4 +41,4 @@ Tests never run real sudo or bind privileged ports; the sudo flow uses a fake pr
 
 ## Real frameworks (`tests/e2e.rs`)
 
-With `PORCH_E2E=1` (set in CI on Linux and macOS), the suite installs Vite 6 from npm, runs it with `porch run`, and checks through the proxy that the page and Vite's client module load under the Porch name, that Vite's HMR WebSocket connects with its token, and that editing a module sends an HMR update over that socket. Without the variable the test is skipped, so offline runs stay green.
+`python3 -m http.server`, which ignores `PORT`, always runs through Porch, which adds its port and bind address. With `PORCH_E2E=1` (set in CI on Linux and macOS), the suite also installs Next.js 15 (page and HMR socket) and Vite 6 from npm, runs it with `porch run`, and checks through the proxy that the page and Vite's client module load under the Porch name, that Vite's HMR WebSocket connects with its token, and that editing a module sends an HMR update over that socket. Without the variable the test is skipped, so offline runs stay green.

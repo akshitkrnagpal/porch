@@ -105,9 +105,19 @@ fn definition(n: &str) -> Value {
     }
     let fields: &[&str] = match n {
         "get" => &["name", "noWorktree"],
-        "alias_add" => &["name", "port", "force", "tld", "private", "upstream", "insecure"],
+        "alias_add" => &[
+            "name", "port", "force", "tld", "private", "upstream", "insecure",
+        ],
         "alias_remove" => &["name", "tld"],
-        "proxy_start" => &["port", "https", "noTls", "lan", "tld", "wildcard", "unprivileged"],
+        "proxy_start" => &[
+            "port",
+            "https",
+            "noTls",
+            "lan",
+            "tld",
+            "wildcard",
+            "unprivileged",
+        ],
         "proxy_stop" => &["port"],
         "prune" => &["force"],
         "doctor_fix" => &["yes"],
@@ -517,7 +527,17 @@ mod tests {
                 "proxy_start",
                 // Foreground can't work over MCP; the rest need files or are
                 // saved settings an agent shouldn't change behind the user.
-                vec!["foreground", "skip-trust", "ip", "cert", "key", "bind", "redirect-port", "state-dir", "help"],
+                vec![
+                    "foreground",
+                    "skip-trust",
+                    "ip",
+                    "cert",
+                    "key",
+                    "bind",
+                    "redirect-port",
+                    "state-dir",
+                    "help",
+                ],
             ),
             (vec!["get"], "get", vec!["help"]),
             (vec!["stop"], "stop", vec!["help"]),
