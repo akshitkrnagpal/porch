@@ -28,7 +28,7 @@ On Windows, each child gets its own console process group and receives Ctrl+Brea
 ## Proxy and routes
 
 ```sh
-porch proxy start                         # HTTP on port 7462, no sudo (default)
+porch proxy start                         # HTTP on port 80 where no sudo is needed, else 7462 (default)
 porch proxy start --port 8080             # HTTP on another port, no sudo
 porch proxy start --https                 # HTTPS with HTTP/2 on the same port, per-user CA trust, no sudo
 porch proxy start --https --port 443      # HTTPS without a port in URLs (binding 443 needs sudo)
@@ -41,6 +41,8 @@ porch proxy status
 ```
 
 Proxy options: `--port`/`-p`, `--https`, `--no-tls`, `--foreground`, `--skip-trust`, `--unprivileged`, `--lan`, `--ip`, `--tld` (repeatable or comma-separated), `--wildcard`, `--cert` with `--key`, `--state-dir`, `--bind` and `--redirect-port`. Passing a certificate turns on TLS.
+
+**URLs without a port.** On a fresh install, Porch checks whether this user can bind the standard port (80, or 443 with HTTPS) without sudo. macOS 10.14+ and Windows allow it; Linux does when `net.ipv4.ip_unprivileged_port_start` is 80 or lower. If so, and the port is free, Porch uses it, so URLs read `http://web.localhost`. The proxy then binds the wildcard address (the only way macOS allows it) and refuses every non-loopback client unless LAN mode is on. Otherwise Porch uses port 7462. If something takes the standard port later, Porch moves to 7462 and says so. `PORCH_CLEAN_URLS=0` turns this off, and `porch setup` asks.
 
 **Ports and sudo.** The port decides whether Porch needs administrator rights. On ports 1024 and up, Porch never uses sudo and doesn't edit the hosts file, since browsers resolve `*.localhost` on their own. Set `PORCH_SYNC_HOSTS=1` if you want hosts entries anyway. Turning on HTTPS keeps the current port, except that a proxy on port 80 moves to 7462. Trusting the local CA is per user and needs no sudo, so an interactive HTTPS start offers to do it on any port. An unattended start skips the prompt and prints a `porch trust` hint. Ports below 1024 (such as HTTPS on 443) need administrator rights: an interactive start runs `sudo -v` before detaching, and an unattended start uses cached sudo credentials or fails and suggests `porch proxy start --no-tls --port 7462`. `--unprivileged` forces no-sudo mode on a low port where the OS allows it.
 
@@ -109,7 +111,9 @@ Each `PORCH_*` setting overrides its `PORTLESS_*` equivalent.
 | Variable (`PORCH_` + …) | Meaning |
 | --- | --- |
 | `STATE_DIR` | State directory, default `~/.porch` |
-| `PORT` | Proxy port (default 7462). Counts as an explicit choice, so a busy port fails instead of moving |
+| `PORT` | Proxy port (default 80 when no sudo is needed, else 7462). Counts as an explicit choice, so a busy port fails instead of moving |
+| `CLEAN_URLS` | `0` keeps new installs on port 7462 instead of the standard port |
+| `PRIVATE` | `1` keeps launched apps and aliases off paired machines |
 | `APP_PORT` | App port; a CLI option overrides it |
 | `HTTPS` | `1` turns on HTTPS on the same port (default 7462; set `PORCH_PORT=443` for the standard port) |
 | `LAN`, `LAN_IP` | LAN mode and an optional fixed address |
@@ -159,7 +163,7 @@ Porch issues certificates only for configured TLDs, registered route names and, 
 `porch setup` asks four questions. Each defaults to your current setting, so running it again only changes what you change.
 
 1. **HTTPS** (default no). Keeps the proxy port and adds a local CA to your user's trust store, without sudo.
-2. **Proxy port** (default 7462, for HTTP and HTTPS). If the port is busy, Porch names the process using it and offers the next free port.
+2. **URLs without a port** (offered when this OS allows port 80/443 without sudo), otherwise the **proxy port** (default 7462, for HTTP and HTTPS). If the port is busy, Porch names the process using it and offers the next free port.
 3. **Start at login.** Installs or removes the `porch service` entry, which asks for sudo. If sharing is also on, discovery starts at login too (`porch discovery autostart`, per user, no sudo).
 4. **Share with your other machines.** Turns sharing on or off on this machine's private address. Other machines still have to pair.
 
