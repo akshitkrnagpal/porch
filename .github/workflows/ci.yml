@@ -92,8 +92,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # rust-cache never re-saves a key it restored exactly, and the key only
+      # follows Cargo.lock and the toolchain. Change `key` when this job starts
+      # building different artifacts, so main saves a cache that has them.
       - uses: Swatinem/rust-cache@v2
         with:
+          key: debug-builds
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-python@v7
         with:
