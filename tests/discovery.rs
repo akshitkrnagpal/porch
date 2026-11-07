@@ -1,5 +1,6 @@
 //! Two isolated Porch installations on loopback, using the actual CLI and TLS agent.
 //! This proves machine targeting; it does not claim physical LAN/tailnet reachability.
+mod common;
 use porch::discovery::types::{Snapshot, PROTOCOL_VERSION};
 use serde_json::Value;
 use std::{
@@ -69,13 +70,7 @@ async fn ok(dir: &Path, args: &[&str]) -> String {
     );
     String::from_utf8(output.stdout).unwrap()
 }
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+use common::free_port;
 async fn upstream(label: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -814,11 +809,24 @@ async fn autostart_hands_sharing_to_a_login_agent_and_disable_keeps_it_running()
 
     // Enable: the hand-started agent is replaced by the launchd-run one.
     let (ok, out) = run(&["discovery", "autostart", "enable"]);
-    assert!(ok && out.contains("now starts at login"), "{out}");
+    let supervised = pid();
+    // On failure, show why the launchd-started agent never became ready.
+    let evidence = || {
+        format!(
+            "enable: {out}\nmanual pid {manual}, ready pid {supervised:?}\nlaunchctl calls:\n{}\ndiscovery.log:\n{}",
+            std::fs::read_to_string(root.join("launchctl.log")).unwrap_or_default(),
+            std::fs::read_to_string(node.join("discovery.log")).unwrap_or_default()
+        )
+    };
+    assert!(ok && out.contains("now starts at login."), "{}", evidence());
+    assert!(!out.contains("not ready yet"), "{}", evidence());
     let body = std::fs::read_to_string(&plist).unwrap();
     assert!(body.contains("<string>serve</string><string>--autostart</string>"));
-    let supervised = pid();
-    assert!(!supervised.is_empty() && supervised != manual);
+    assert!(
+        !supervised.is_empty() && supervised != manual,
+        "{}",
+        evidence()
+    );
     let (_, status) = run(&["discovery", "status"]);
     assert!(
         status.contains("running") && status.contains("Start at login: on"),
@@ -863,4 +871,166 @@ async fn autostart_hands_sharing_to_a_login_agent_and_disable_keeps_it_running()
     let (ok, out) = run(&["discovery", "serve", "--autostart"]);
     assert!(ok && out.contains("disabled"), "{out}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A machine on the network that advertises an open pairing window without
+/// knowing the code. `legacy` speaks only the old version 1 exchange.
+struct Rogue {
+    addr: std::net::SocketAddr,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+async fn rogue(legacy: bool) -> Rogue {
+    use http_body_util::{BodyExt, Full};
+    use hyper::{body::Incoming, Request, Response};
+    use std::sync::{Arc, Mutex};
+    let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert.cert.der().clone()], key)
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let log = seen.clone();
+    let hex = |b: &[u8]| b.iter().map(|v| format!("{v:02x}")).collect::<String>();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            let log = log.clone();
+            tokio::spawn(async move {
+                let Ok(stream) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                    let log = log.clone();
+                    async move {
+                        let path = req.uri().path().to_owned();
+                        let body = req.into_body().collect().await?.to_bytes();
+                        log.lock()
+                            .unwrap()
+                            .push((path.clone(), String::from_utf8_lossy(&body).into_owned()));
+                        let reply = match (legacy, path.as_str()) {
+                            (true, "/v1/pairing") => r#"{"version":1,"open":true}"#.to_owned(),
+                            (false, "/v1/pairing") => format!(
+                                r#"{{"version":1,"open":true,"pairing":2,"salt":"{}"}}"#,
+                                "5a".repeat(32)
+                            ),
+                            // A real SPAKE2 reply for a guessed code.
+                            (false, "/v1/pair-code/start") => {
+                                let (_, msg) = spake2::Spake2::<spake2::Ed25519Group>::start_b(
+                                    &spake2::Password::new(b"guess"),
+                                    &spake2::Identity::new(b"porch-pair-v2-joiner"),
+                                    &spake2::Identity::new(b"porch-pair-v2-host"),
+                                );
+                                format!(r#"{{"session":"s","msg":"{}"}}"#, hex(&msg))
+                            }
+                            (false, "/v1/pair-code/confirm") => {
+                                format!(r#"{{"confirm":"{}"}}"#, "ab".repeat(32))
+                            }
+                            // What a successful impersonation would return.
+                            _ => format!(
+                                r#"{{"version":1,"machine":{{"id":"rogue","name":"rogue"}},"token":"{}","mac":"{}"}}"#,
+                                "t".repeat(64),
+                                "00".repeat(32)
+                            ),
+                        };
+                        Ok::<_, hyper::Error>(Response::new(Full::new(bytes::Bytes::from(reply))))
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    Rogue { addr, seen, task }
+}
+async fn join_rogue(legacy: bool) -> (String, Vec<(String, String)>, PathBuf) {
+    let root = std::env::temp_dir().join(format!(
+        "porch-rogue-{}-{}",
+        if legacy { "v1" } else { "v2" },
+        std::process::id()
+    ));
+    let node = root.join("node-a");
+    let _nodes = Nodes(vec![node.clone()]);
+    let r = rogue(legacy).await;
+    let out = command(
+        &node,
+        &[
+            "pair",
+            "482913",
+            "--host",
+            &r.addr.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            &free_port().to_string(),
+        ],
+        None,
+    )
+    .await;
+    assert!(!out.status.success(), "joined a rogue machine");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    // Nothing that grants access was created: no sharing, no credential, no peer.
+    assert!(
+        !node.join("discovery-config.json").exists(),
+        "sharing was turned on"
+    );
+    let auth = std::fs::read_to_string(node.join("discovery-auth.json")).unwrap_or_default();
+    assert!(
+        !auth.contains("\"clients\":[\""),
+        "a credential was minted: {auth}"
+    );
+    let peers = command(&node, &["list", "--all", "--json"], None).await;
+    let peers: Snapshot = serde_json::from_slice(&peers.stdout).unwrap();
+    assert!(peers.peers.is_empty());
+    r.task.abort();
+    let seen = r.seen.lock().unwrap().clone();
+    (stderr, seen, node)
+}
+#[tokio::test]
+async fn a_rogue_machine_claiming_open_pairing_gets_neither_code_nor_credentials() {
+    let (stderr, seen, _) = join_rogue(false).await;
+    assert!(
+        stderr.contains("did not prove it knows the pairing code"),
+        "{stderr}"
+    );
+    let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/v1/pairing",
+            "/v1/pair-code/start",
+            "/v1/pair-code/confirm"
+        ],
+        "the joiner stops before sending credentials"
+    );
+    for (path, body) in &seen {
+        assert!(!body.contains("482913"), "{path} carried the code: {body}");
+        assert!(
+            !body.contains("token"),
+            "{path} carried a credential: {body}"
+        );
+    }
+}
+#[tokio::test]
+async fn joiners_refuse_to_downgrade_to_the_insecure_exchange() {
+    let (stderr, seen, _) = join_rogue(true).await;
+    assert!(stderr.contains("older Porch"), "{stderr}");
+    let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["/v1/pairing"],
+        "nothing is sent to an old-protocol agent"
+    );
 }

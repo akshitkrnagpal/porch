@@ -1,5 +1,6 @@
 //! Fake executable acceptance tests: never mutate machine hosts, trust, services or tunnels.
 #![cfg(unix)]
+mod common;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -30,8 +31,7 @@ impl Sandbox {
             dir.join("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let port = common::free_port();
         Self { dir, path, port }
     }
     fn fake(&self, name: &str, script: &str) {

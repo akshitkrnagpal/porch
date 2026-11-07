@@ -231,6 +231,7 @@ async fn fixture(label: &'static str) -> Fixture {
         client: upstream(&dir).unwrap(),
         tunnels: Arc::new(tokio::sync::Semaphore::new(64)),
         attempts: Arc::default(),
+        sessions: Arc::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -473,6 +474,31 @@ fn progress(dir: &Path, id: &str) -> String {
         ),
     }
 }
+/// What the key exchange does with a joiner's `code`: a wrong one fails the
+/// key confirmation (counted), a right one enrolls through `code_accepted`.
+enum Tried {
+    Accepted(String),
+    Wrong,
+    Closed,
+    Full,
+}
+fn try_code(dir: &Path, code: &str, peer: &Machine) -> Tried {
+    let window = read::<Auth>(&dir.join("discovery-auth.json"))
+        .unwrap()
+        .and_then(|a| a.pairing);
+    let Some(w) = window else {
+        return Tried::Closed;
+    };
+    if open_window(dir).is_some() && super::super::pake::password(&w.salt, code) != w.hash {
+        code_failed(dir, &w.salt).unwrap();
+        return Tried::Wrong;
+    }
+    match code_accepted(dir, &w.salt, peer).unwrap() {
+        CodeOutcome::Accepted(b) => Tried::Accepted(b),
+        CodeOutcome::Closed => Tried::Closed,
+        CodeOutcome::Full => Tried::Full,
+    }
+}
 #[test]
 fn pairing_code_is_single_use_and_labels_the_new_credential() {
     let dir = temp();
@@ -486,8 +512,7 @@ fn pairing_code_is_single_use_and_labels_the_new_credential() {
         !raw.contains(&format!("\"{}\"", opened.code)),
         "code stored in clear"
     );
-    let CodeOutcome::Accepted(bearer) = try_code(&dir, &opened.code, &joiner("laptop")).unwrap()
-    else {
+    let Tried::Accepted(bearer) = try_code(&dir, &opened.code, &joiner("laptop")) else {
         panic!("correct code rejected")
     };
     assert!(paired(&dir, &bearer).unwrap());
@@ -499,13 +524,12 @@ fn pairing_code_is_single_use_and_labels_the_new_credential() {
     assert!(authorize(&dir, &bearer).unwrap());
     assert_eq!(progress(&dir, &opened.id), "paired:laptop");
     assert!(matches!(
-        try_code(&dir, &opened.code, &joiner("laptop")).unwrap(),
-        CodeOutcome::Closed
+        try_code(&dir, &opened.code, &joiner("laptop")),
+        Tried::Closed
     ));
     // Re-pairing the same machine replaces its old credential.
     let again = open_pairing_in(&dir, PAIR_CODE_LIFETIME).unwrap();
-    let CodeOutcome::Accepted(second) = try_code(&dir, &again.code, &joiner("laptop")).unwrap()
-    else {
+    let Tried::Accepted(second) = try_code(&dir, &again.code, &joiner("laptop")) else {
         panic!("re-pair rejected")
     };
     assert!(!paired(&dir, &bearer).unwrap());
@@ -525,17 +549,14 @@ fn five_wrong_codes_close_the_window_even_for_the_right_code() {
     };
     for attempt in 1..=PAIR_CODE_MAX_FAILURES {
         assert!(
-            matches!(
-                try_code(&dir, wrong, &joiner("attacker")).unwrap(),
-                CodeOutcome::Wrong
-            ),
+            matches!(try_code(&dir, wrong, &joiner("attacker")), Tried::Wrong),
             "attempt {attempt}"
         );
         assert_eq!(pairing_open(&dir), attempt < PAIR_CODE_MAX_FAILURES);
     }
     assert!(matches!(
-        try_code(&dir, &opened.code, &joiner("laptop")).unwrap(),
-        CodeOutcome::Closed
+        try_code(&dir, &opened.code, &joiner("laptop")),
+        Tried::Closed
     ));
     assert_eq!(progress(&dir, &opened.id), "cancelled:too_many_failures");
     let auth: Auth = read(&dir.join("discovery-auth.json")).unwrap().unwrap();
@@ -548,8 +569,8 @@ fn expired_code_is_refused() {
     let opened = open_pairing_in(&dir, 0).unwrap();
     assert!(!pairing_open(&dir));
     assert!(matches!(
-        try_code(&dir, &opened.code, &joiner("laptop")).unwrap(),
-        CodeOutcome::Closed
+        try_code(&dir, &opened.code, &joiner("laptop")),
+        Tried::Closed
     ));
     assert_eq!(progress(&dir, &opened.id), "expired:");
     let _ = fs::remove_dir_all(dir);
@@ -573,8 +594,7 @@ fn replacing_and_cancelling_codes_are_reported_and_idempotent() {
     );
     // Cancelling a code that already paired keeps the pairing.
     let third = open_pairing_in(&dir, PAIR_CODE_LIFETIME).unwrap();
-    let CodeOutcome::Accepted(bearer) = try_code(&dir, &third.code, &joiner("laptop")).unwrap()
-    else {
+    let Tried::Accepted(bearer) = try_code(&dir, &third.code, &joiner("laptop")) else {
         panic!("correct code rejected")
     };
     assert_eq!(
@@ -617,8 +637,8 @@ fn a_full_host_cancels_the_code_without_enrolling() {
     .unwrap();
     let opened = open_pairing_in(&dir, PAIR_CODE_LIFETIME).unwrap();
     assert!(matches!(
-        try_code(&dir, &opened.code, &joiner("laptop")).unwrap(),
-        CodeOutcome::Full
+        try_code(&dir, &opened.code, &joiner("laptop")),
+        Tried::Full
     ));
     assert_eq!(progress(&dir, &opened.id), "cancelled:host_full");
     let auth: Auth = read(&dir.join("discovery-auth.json")).unwrap().unwrap();
@@ -626,8 +646,7 @@ fn a_full_host_cancels_the_code_without_enrolling() {
     // Storing the joiner can also fail after acceptance; that takes it back.
     auth_reset(&dir);
     let opened = open_pairing_in(&dir, PAIR_CODE_LIFETIME).unwrap();
-    let CodeOutcome::Accepted(bearer) = try_code(&dir, &opened.code, &joiner("laptop")).unwrap()
-    else {
+    let Tried::Accepted(bearer) = try_code(&dir, &opened.code, &joiner("laptop")) else {
         panic!("correct code rejected")
     };
     reject_accepted(&dir, &bearer).unwrap();
@@ -638,79 +657,201 @@ fn a_full_host_cancels_the_code_without_enrolling() {
 fn auth_reset(dir: &Path) {
     fs::write(dir.join("discovery-auth.json"), b"{}").unwrap();
 }
+fn window(dir: &Path) -> PairingWindow {
+    read::<Auth>(&dir.join("discovery-auth.json"))
+        .unwrap()
+        .unwrap()
+        .pairing
+        .unwrap()
+}
+#[test]
+fn a_proof_for_an_old_window_does_not_open_a_new_one() {
+    let dir = temp();
+    let first = open_pairing_in(&dir, PAIR_CODE_LIFETIME).unwrap();
+    let old = window(&dir);
+    assert_ne!(
+        old.salt, first.id,
+        "the public salt is not the private window id"
+    );
+    assert_eq!(
+        old.hash,
+        super::super::pake::password(&old.salt, &first.code)
+    );
+    open_pairing_in(&dir, PAIR_CODE_LIFETIME).unwrap();
+    assert!(matches!(
+        code_accepted(&dir, &old.salt, &joiner("laptop")).unwrap(),
+        CodeOutcome::Closed
+    ));
+    code_failed(&dir, &old.salt).unwrap();
+    assert_eq!(window(&dir).failures, 0);
+    assert!(pairing_open(&dir));
+    let _ = fs::remove_dir_all(dir);
+}
+#[test]
+fn windows_from_the_old_protocol_are_closed() {
+    let dir = temp();
+    open_pairing_in(&dir, PAIR_CODE_LIFETIME).unwrap();
+    let mut auth: Auth = read(&dir.join("discovery-auth.json")).unwrap().unwrap();
+    auth.pairing.as_mut().unwrap().salt = String::new();
+    write(
+        &dir,
+        "discovery-auth.json",
+        &serde_json::to_vec(&auth).unwrap(),
+    )
+    .unwrap();
+    assert!(!pairing_open(&dir));
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// A joiner (honest or not) driving the three-step exchange over real TLS.
+struct Exchange {
+    session: String,
+    key: super::super::pake::Key,
+    host_msg: String,
+}
+async fn start(f: &Fixture, code: &str) -> (StatusCode, Option<Exchange>) {
+    use super::super::pake;
+    let salt = read::<Auth>(&f.dir.join("discovery-auth.json"))
+        .unwrap()
+        .and_then(|a| a.pairing)
+        .map(|w| w.salt)
+        .unwrap_or_default();
+    let (state, msg) = pake::joiner_start(&pake::password(&salt, code));
+    let (status, body) = call(
+        f,
+        Method::POST,
+        "/v1/pair-code/start",
+        None,
+        None,
+        serde_json::to_string(&PairStart {
+            pairing: PAIRING_VERSION,
+            salt,
+            msg,
+        })
+        .unwrap(),
+    )
+    .await;
+    if status != StatusCode::OK {
+        return (status, None);
+    }
+    let started: PairStarted = serde_json::from_slice(&body).unwrap();
+    let key = pake::joiner_finish(state, &started.msg).unwrap();
+    (
+        status,
+        Some(Exchange {
+            session: started.session,
+            key,
+            host_msg: started.msg,
+        }),
+    )
+}
+async fn confirm(f: &Fixture, x: &Exchange, pin: &[u8; 32]) -> (StatusCode, Bytes) {
+    call(
+        f,
+        Method::POST,
+        "/v1/pair-code/confirm",
+        None,
+        None,
+        serde_json::to_string(&PairConfirm {
+            session: x.session.clone(),
+            confirm: x.key.joiner_confirm(pin),
+        })
+        .unwrap(),
+    )
+    .await
+}
+fn finish_body(x: &Exchange, token: &str, mac: Option<String>) -> String {
+    let machine = joiner("laptop");
+    let endpoint = "https://127.0.0.1:7463/";
+    let fingerprint = "ab".repeat(32);
+    serde_json::to_string(&PairFinish {
+        session: x.session.clone(),
+        mac: mac.unwrap_or_else(|| {
+            x.key
+                .joiner_payload(&machine, endpoint, &fingerprint, token)
+        }),
+        machine,
+        endpoint: endpoint.into(),
+        fingerprint,
+        token: token.into(),
+    })
+    .unwrap()
+}
+async fn finish(f: &Fixture, x: &Exchange, mac: Option<String>) -> (StatusCode, Bytes) {
+    call(
+        f,
+        Method::POST,
+        "/v1/pair-code/finish",
+        None,
+        None,
+        finish_body(x, &"c".repeat(64), mac),
+    )
+    .await
+}
+fn host_pin(f: &Fixture) -> [u8; 32] {
+    super::super::client::normalize_pin(&fingerprint_in(&f.dir).unwrap()).unwrap()
+}
+fn error_code(body: &Bytes) -> String {
+    serde_json::from_slice::<PairCodeError>(body)
+        .unwrap()
+        .error
+        .code
+}
+fn no_clients(f: &Fixture) -> bool {
+    read::<Auth>(&f.dir.join("discovery-auth.json"))
+        .unwrap()
+        .unwrap_or_default()
+        .clients
+        .is_empty()
+}
+
 #[tokio::test]
-async fn real_tls_pair_code_binds_certificate_rate_limits_and_stores_joiner() {
+async fn real_tls_code_exchange_is_mutual_single_use_and_stores_joiner() {
     let f = fixture("host").await;
-    let status = |body: Bytes| serde_json::from_slice::<PairingStatus>(&body).unwrap().open;
+    let status = |body: Bytes| serde_json::from_slice::<PairingStatus>(&body).unwrap();
     let (code, body) = call(&f, Method::GET, "/v1/pairing", None, None, String::new()).await;
     assert_eq!(code, StatusCode::OK);
-    assert!(!status(body));
+    let closed = status(body);
+    assert!(!closed.open && closed.salt.is_none());
+    assert_eq!(closed.pairing, PAIRING_VERSION);
     let opened = open_pairing_in(&f.dir, PAIR_CODE_LIFETIME).unwrap();
     let (_, body) = call(&f, Method::GET, "/v1/pairing", None, None, String::new()).await;
-    assert!(status(body));
-    let own = fingerprint_in(&f.dir).unwrap();
-    let request = |code: &str, seen: &str| {
-        serde_json::to_string(&PairCodeRequest {
-            version: PROTOCOL_VERSION,
-            code: code.into(),
-            host_fingerprint: seen.into(),
-            machine: joiner("laptop"),
-            endpoint: "https://127.0.0.1:7463/".into(),
-            fingerprint: "ab".repeat(32),
-            token: "c".repeat(64),
-        })
-        .unwrap()
-    };
-    // An interceptor presenting another certificate never gets the code checked.
-    let (code, _) = call(
-        &f,
-        Method::POST,
-        "/v1/pair-code",
-        None,
-        None,
-        request(&opened.code, &"0".repeat(64)),
-    )
-    .await;
-    assert_eq!(code, StatusCode::CONFLICT);
-    assert!(pairing_open(&f.dir));
-    let error_code = |body: &Bytes| {
-        serde_json::from_slice::<PairCodeError>(body)
-            .unwrap()
-            .error
-            .code
-    };
-    let wrong = if opened.code == "000000" {
-        "111111"
-    } else {
-        "000000"
-    };
-    let (code, body) = call(
-        &f,
-        Method::POST,
-        "/v1/pair-code",
-        None,
-        None,
-        request(wrong, &own),
-    )
-    .await;
-    assert_eq!(code, StatusCode::UNAUTHORIZED);
-    assert_eq!(error_code(&body), "wrong_code");
-    let (code, body) = call(
-        &f,
-        Method::POST,
-        "/v1/pair-code",
-        None,
-        None,
-        request(&opened.code, &own),
-    )
-    .await;
+    let shown = status(body);
+    assert!(shown.open);
+    assert_eq!(shown.salt.as_deref(), Some(window(&f.dir).salt.as_str()));
+    let pin = host_pin(&f);
+
+    let (code, x) = start(&f, &opened.code).await;
+    assert_eq!(code, StatusCode::OK);
+    let x = x.unwrap();
+    assert!(!x.host_msg.contains(&opened.code));
+    // Credentials cannot skip the joiner's proof.
+    let (code, _) = finish(&f, &x, None).await;
+    assert_eq!(code, StatusCode::GONE, "finish before confirm");
+    let (code, x) = start(&f, &opened.code).await;
+    assert_eq!(code, StatusCode::OK);
+    let x = x.unwrap();
+    let (code, body) = confirm(&f, &x, &pin).await;
     assert_eq!(code, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let response: PairResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(response.machine.id, f.machine.id);
-    assert_eq!(
-        pairing_progress_in(&f.dir, &opened.id).unwrap().state,
-        PairState::Accepted
+    assert_eq!(progress(&f.dir, &opened.id), "waiting");
+    let confirmed: PairConfirmed = serde_json::from_slice(&body).unwrap();
+    assert!(
+        x.key.check_host_confirm(&pin, &confirmed.confirm),
+        "host proves the code"
     );
+    assert!(
+        no_clients(&f),
+        "nothing enrolled before the joiner's credentials arrive"
+    );
+    let (code, body) = finish(&f, &x, None).await;
+    assert_eq!(code, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let response: PairFinished = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response.machine.id, f.machine.id);
+    // Accepted is not paired until the joiner's first authenticated request.
+    assert_eq!(progress(&f.dir, &opened.id), "accepted:laptop");
+    assert!(x
+        .key
+        .check_host_payload(&response.machine, &response.token, &response.mac));
     let (code, _) = call(
         &f,
         Method::GET,
@@ -721,38 +862,151 @@ async fn real_tls_pair_code_binds_certificate_rate_limits_and_stores_joiner() {
     )
     .await;
     assert_eq!(code, StatusCode::OK);
-    // The new peer's first authenticated request completes the pairing.
-    assert_eq!(
-        pairing_progress_in(&f.dir, &opened.id).unwrap().state,
-        PairState::Paired
-    );
     // Mutual: the host stored the joiner with the credentials it supplied.
     let stored = super::super::client::peers_in(&f.dir).unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].machine.name, "laptop");
     assert_eq!(stored[0].token, "c".repeat(64));
     assert_eq!(stored[0].slug, "laptop");
+    assert_eq!(progress(&f.dir, &opened.id), "paired:laptop");
+    // Single use: the session and the window are gone.
+    let (code, _) = finish(&f, &x, None).await;
+    assert_eq!(code, StatusCode::GONE, "session replay");
+    let (code, _) = start(&f, &opened.code).await;
+    assert_eq!(code, StatusCode::GONE, "code is single-use");
+    let (code, body) = call(
+        &f,
+        Method::POST,
+        "/v1/pair-code/start",
+        None,
+        None,
+        serde_json::to_string(&PairStart {
+            pairing: PAIRING_VERSION,
+            salt: "x".repeat(64),
+            msg: "00".repeat(33),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::GONE);
+    assert_eq!(error_code(&body), "not_waiting");
+}
+
+#[tokio::test]
+async fn real_tls_wrong_code_interceptor_and_tampering_never_release_credentials() {
+    let f = fixture("host").await;
+    let opened = open_pairing_in(&f.dir, PAIR_CODE_LIFETIME).unwrap();
+    let wrong = if opened.code == "000000" {
+        "111111"
+    } else {
+        "000000"
+    };
+    let pin = host_pin(&f);
+    // The version 1 endpoint is refused without reading the code or the window.
     let (code, body) = call(
         &f,
         Method::POST,
         "/v1/pair-code",
         None,
         None,
-        request(&opened.code, &own),
+        format!(r#"{{"version":1,"code":"{}","host_fingerprint":"{}","machine":{{"id":"x","name":"x"}},"endpoint":"https://127.0.0.1:1/","fingerprint":"{}","token":"{}"}}"#,
+            opened.code, hex(&pin), "ab".repeat(32), "c".repeat(64)),
     )
     .await;
-    assert_eq!(code, StatusCode::GONE, "code is single-use");
-    assert_eq!(error_code(&body), "not_waiting");
-    // Per-source rate limit (10/minute) applies on top of the 5-failure cap.
+    assert_eq!(code, StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(error_code(&body), "protocol");
+    assert_eq!(window(&f.dir).failures, 0);
+
+    // Wrong code: the host answers the exchange but never proves anything and
+    // counts the failure.
+    let (_, x) = start(&f, wrong).await;
+    let x = x.unwrap();
+    let (code, body) = confirm(&f, &x, &pin).await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED);
+    assert_eq!(error_code(&body), "wrong_code");
+    assert_eq!(window(&f.dir).failures, 1);
+    let (code, _) = finish(&f, &x, None).await;
+    assert_eq!(code, StatusCode::GONE);
+
+    // Right code, but bound to another certificate (a relaying TLS interceptor).
+    let (_, x) = start(&f, &opened.code).await;
+    let (code, _) = confirm(&f, &x.unwrap(), &[0u8; 32]).await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED);
+    assert_eq!(window(&f.dir).failures, 2);
+
+    // A replayed confirmation ends the session.
+    let (_, x) = start(&f, &opened.code).await;
+    let x = x.unwrap();
+    assert_eq!(confirm(&f, &x, &pin).await.0, StatusCode::OK);
+    assert_eq!(confirm(&f, &x, &pin).await.0, StatusCode::GONE);
+    assert_eq!(finish(&f, &x, None).await.0, StatusCode::GONE);
+    // A tampered payload (here: a MAC from another key) is refused without
+    // enrolling anyone.
+    let (_, x) = start(&f, &opened.code).await;
+    let x = x.unwrap();
+    assert_eq!(confirm(&f, &x, &pin).await.0, StatusCode::OK);
+    let (_, other) = start(&f, &opened.code).await;
+    let forged = other.unwrap().key.joiner_payload(
+        &joiner("laptop"),
+        "https://127.0.0.1:7463/",
+        &"ab".repeat(32),
+        &"c".repeat(64),
+    );
+    let (code, _) = finish(&f, &x, Some(forged)).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert!(no_clients(&f));
+    assert!(super::super::client::peers_in(&f.dir).unwrap().is_empty());
+    assert!(pairing_open(&f.dir));
+
+    // Three more failures close the window for everyone (5 in total).
+    for _ in 0..3 {
+        let (_, x) = start(&f, wrong).await;
+        assert_eq!(
+            confirm(&f, &x.unwrap(), &pin).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert!(!pairing_open(&f.dir));
+    assert_eq!(progress(&f.dir, &opened.id), "cancelled:too_many_failures");
+    let (code, _) = call(
+        &f,
+        Method::POST,
+        "/v1/pair-code/start",
+        None,
+        None,
+        serde_json::to_string(&PairStart {
+            pairing: PAIRING_VERSION,
+            salt: String::new(),
+            msg: "00".repeat(33),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        code == StatusCode::GONE || code == StatusCode::TOO_MANY_REQUESTS,
+        "{code}"
+    );
+    assert!(no_clients(&f));
+}
+
+#[tokio::test]
+async fn real_tls_pairing_is_rate_limited_per_source() {
+    let f = fixture("host").await;
+    open_pairing_in(&f.dir, PAIR_CODE_LIFETIME).unwrap();
     let mut limited = false;
     for _ in 0..12 {
         let (code, body) = call(
             &f,
             Method::POST,
-            "/v1/pair-code",
+            "/v1/pair-code/start",
             None,
             None,
-            request("123456", &own),
+            serde_json::to_string(&PairStart {
+                pairing: PAIRING_VERSION,
+                salt: window(&f.dir).salt,
+                msg: "00".repeat(33),
+            })
+            .unwrap(),
         )
         .await;
         if code == StatusCode::TOO_MANY_REQUESTS {
@@ -761,4 +1015,48 @@ async fn real_tls_pair_code_binds_certificate_rate_limits_and_stores_joiner() {
         }
     }
     assert!(limited);
+}
+
+#[tokio::test]
+async fn real_tls_window_changes_mid_exchange_and_racing_finishes_enroll_at_most_once() {
+    let f = fixture("host").await;
+    let pin = host_pin(&f);
+    // Replaced between start and confirm: the old code's proof opens nothing.
+    let first = open_pairing_in(&f.dir, PAIR_CODE_LIFETIME).unwrap();
+    let (_, x) = start(&f, &first.code).await;
+    let second = open_pairing_in(&f.dir, PAIR_CODE_LIFETIME).unwrap();
+    assert_eq!(confirm(&f, &x.unwrap(), &pin).await.0, StatusCode::GONE);
+    assert_eq!(
+        window(&f.dir).failures,
+        0,
+        "a stale proof is not a wrong guess"
+    );
+    // Expired between confirm and finish: no credential is issued.
+    let (_, x) = start(&f, &second.code).await;
+    let x = x.unwrap();
+    assert_eq!(confirm(&f, &x, &pin).await.0, StatusCode::OK);
+    let mut auth: Auth = read(&f.dir.join("discovery-auth.json")).unwrap().unwrap();
+    auth.pairing.as_mut().unwrap().expires = now() - 1;
+    write(
+        &f.dir,
+        "discovery-auth.json",
+        &serde_json::to_vec(&auth).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(finish(&f, &x, None).await.0, StatusCode::GONE);
+    assert!(no_clients(&f));
+    assert!(progress(&f.dir, &second.id).contains("expired"));
+    // Two confirmed exchanges racing to finish: exactly one enrolls.
+    let third = open_pairing_in(&f.dir, PAIR_CODE_LIFETIME).unwrap();
+    let (_, a) = start(&f, &third.code).await;
+    let (_, b) = start(&f, &third.code).await;
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(confirm(&f, &a, &pin).await.0, StatusCode::OK);
+    assert_eq!(confirm(&f, &b, &pin).await.0, StatusCode::OK);
+    let (ra, rb) = tokio::join!(finish(&f, &a, None), finish(&f, &b, None));
+    let mut codes = [ra.0, rb.0];
+    codes.sort();
+    assert_eq!(codes, [StatusCode::OK, StatusCode::GONE]);
+    let auth: Auth = read(&f.dir.join("discovery-auth.json")).unwrap().unwrap();
+    assert_eq!(auth.clients.len(), 1);
 }

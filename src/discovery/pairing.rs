@@ -1,7 +1,9 @@
 //! Code pairing. `porch pair` shows a six-digit code; `porch pair CODE` on the
-//! other machine finds it, pins its certificate (trust on first use, bound to
-//! the code) and both machines enroll each other in one exchange.
-use super::{client, server, types::*};
+//! other machine finds it and runs a SPAKE2 key exchange keyed by the code and
+//! bound to the certificate it pinned. Only after the other machine proves it
+//! knows the code does this machine turn on sharing, mint a credential for it
+//! and pin its certificate; then both enroll each other.
+use super::{client, pake, server, types::*};
 use anyhow::{bail, Context, Result};
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -69,8 +71,18 @@ impl ServerCertVerifier for Capture {
     }
 }
 
-/// Returns the agent's certificate fingerprint when it is showing a pairing code.
-async fn probe(endpoint: &str) -> Result<Option<String>> {
+enum Probe {
+    Open {
+        pin: String,
+        salt: String,
+    },
+    /// Showing a code but speaking only the insecure version 1 exchange.
+    Outdated,
+    Closed,
+}
+/// Is the agent showing a pairing code? Returns its certificate fingerprint
+/// and window salt (both unauthenticated until the key exchange succeeds).
+async fn probe(endpoint: &str) -> Result<Probe> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let capture = Arc::new(Capture {
         seen: Mutex::new(None),
@@ -92,15 +104,27 @@ async fn probe(endpoint: &str) -> Result<Option<String>> {
     let response = http.get(format!("{endpoint}v1/pairing")).send().await?;
     let status: PairingStatus = client::bounded_json(response).await?;
     if status.version != PROTOCOL_VERSION || !status.open {
-        return Ok(None);
+        return Ok(Probe::Closed);
     }
+    // Never fall back to the version 1 exchange: that is the downgrade an
+    // impersonator would ask for.
+    let Some(salt) = status.salt.filter(|s| {
+        status.pairing == PAIRING_VERSION
+            && (16..=128).contains(&s.len())
+            && s.bytes().all(|b| b.is_ascii_alphanumeric())
+    }) else {
+        return Ok(Probe::Outdated);
+    };
     let seen = capture
         .seen
         .lock()
         .ok()
         .and_then(|s| *s)
         .context("no certificate observed")?;
-    Ok(Some(client::hex_pin(&seen)))
+    Ok(Probe::Open {
+        pin: client::hex_pin(&seen),
+        salt,
+    })
 }
 
 fn endpoint_ip(endpoint: &str) -> Option<IpAddr> {
@@ -444,13 +468,23 @@ pub async fn join(code: &str, host: Option<&str>, bind: Option<&str>, port: u16)
             .map(|c| async move { probe(&c.endpoint).await.map_err(|e| format!("{e:#}")) }),
     )
     .await;
-    let (target, pin) = select_target(
+    let (target, pin, salt) = choose(
         candidates.into_iter().zip(probes).collect(),
         own.as_deref(),
         host,
     )?;
     let before = Sharing::capture();
-    match join_one(&code, &target.endpoint, target.source, &pin, bind, port).await {
+    match join_one(
+        &code,
+        &salt,
+        &target.endpoint,
+        target.source,
+        &pin,
+        bind,
+        port,
+    )
+    .await
+    {
         Ok(peer) => Ok(peer),
         Err(e) => {
             // A failed join must not leave app sharing on as a side effect.
@@ -460,6 +494,51 @@ pub async fn join(code: &str, host: Option<&str>, bind: Option<&str>, port: u16)
             Err(e)
         }
     }
+}
+
+/// Turn probe results into the one machine to run the key exchange with, its
+/// pin and window salt. Agents that only speak the insecure version 1
+/// exchange are never chosen; if they are the only ones showing a code, that
+/// is a `protocol` failure asking to update them.
+fn choose(
+    probed: Vec<(JoinCandidate, std::result::Result<Probe, String>)>,
+    own: Option<&str>,
+    host: Option<&str>,
+) -> Result<(JoinCandidate, String, String)> {
+    let mut salts = std::collections::HashMap::new();
+    let mut outdated = Vec::new();
+    let mut open = false;
+    let probed: Vec<_> = probed
+        .into_iter()
+        .map(|(candidate, probe)| {
+            let result = match probe {
+                Ok(Probe::Open { pin, salt }) => {
+                    open = true;
+                    salts.insert(pin.clone(), salt);
+                    Ok(Some(pin))
+                }
+                Ok(Probe::Outdated) => {
+                    outdated.push(candidate.endpoint.trim_end_matches('/').to_owned());
+                    Ok(None)
+                }
+                Ok(Probe::Closed) => Ok(None),
+                Err(e) => Err(e),
+            };
+            (candidate, result)
+        })
+        .collect();
+    if !open && !outdated.is_empty() {
+        return Err(fail(
+            "protocol",
+            format!(
+                "{} runs an older Porch with an insecure pairing protocol; update Porch on it and show a new code",
+                outdated.join(", ")
+            ),
+        ));
+    }
+    let (target, pin) = select_target(probed, own, host)?;
+    let salt = salts.remove(&pin).unwrap_or_default();
+    Ok((target, pin, salt))
 }
 
 /// Choose the one machine to send the code to from probe results (its
@@ -549,14 +628,64 @@ async fn refused(response: reqwest::Response) -> anyhow::Error {
     )
 }
 
+/// Read a successful JSON reply from a pairing step, or map the refusal.
+async fn step<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+) -> std::result::Result<T, anyhow::Error> {
+    let response = request
+        .send()
+        .await
+        .map_err(|e| fail("unreachable", format!("pairing connection failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(refused(response).await);
+    }
+    client::bounded_json(response)
+        .await
+        .map_err(|e| fail("protocol", format!("{e:#}")))
+}
+
+/// Run the key exchange with the chosen machine. Nothing that grants access to
+/// this machine (sharing, a bearer, a pinned peer) exists until it proved it
+/// knows the code for the certificate pinned here.
 async fn join_one(
     code: &str,
+    salt: &str,
     endpoint: &str,
     source: Source,
     pin: &str,
     bind: Option<&str>,
     port: u16,
 ) -> Result<Peer> {
+    let pin_bytes = client::normalize_pin(pin).map_err(|e| fail("protocol", format!("{e:#}")))?;
+    let http = client::http_client(pin).map_err(|e| fail("local", format!("{e:#}")))?;
+    let (state, msg) = pake::joiner_start(&pake::password(salt, code));
+    let started: PairStarted = step(http.post(format!("{endpoint}v1/pair-code/start")).json(
+        &PairStart {
+            pairing: PAIRING_VERSION,
+            salt: salt.into(),
+            msg,
+        },
+    ))
+    .await?;
+    let key =
+        pake::joiner_finish(state, &started.msg).map_err(|e| fail("protocol", format!("{e:#}")))?;
+    let confirmed: PairConfirmed = step(http.post(format!("{endpoint}v1/pair-code/confirm")).json(
+        &PairConfirm {
+            session: started.session.clone(),
+            confirm: key.joiner_confirm(&pin_bytes),
+        },
+    ))
+    .await?;
+    if !key.check_host_confirm(&pin_bytes, &confirmed.confirm) {
+        return Err(fail(
+            "certificate_mismatch",
+            format!(
+                "{} did not prove it knows the pairing code; it may be impersonating the machine showing it. Nothing was shared",
+                endpoint.trim_end_matches('/')
+            ),
+        ));
+    }
+    // Authenticated: only now start sharing and issue a credential.
     let config = ensure_agent(bind, port, endpoint_ip(endpoint))
         .await
         .map_err(|e| fail("local", format!("{e:#}")))?;
@@ -564,33 +693,28 @@ async fn join_one(
         let ip: IpAddr = config.bind.parse()?;
         let own_endpoint =
             client::endpoint(ip, config.port).context("invalid local agent address")?;
+        let machine = server::identity()?;
+        let fingerprint = server::fingerprint()?;
         let bearer = server::mint_client("pending")?;
-        anyhow::Ok((own_endpoint, bearer))
+        anyhow::Ok((own_endpoint, machine, fingerprint, bearer))
     }
     .await;
-    let (own_endpoint, bearer) = prepared.map_err(|e| fail("local", format!("{e:#}")))?;
+    let (own_endpoint, machine, fingerprint, bearer) =
+        prepared.map_err(|e| fail("local", format!("{e:#}")))?;
     let result = async {
-        let request = PairCodeRequest {
-            version: PROTOCOL_VERSION,
-            code: code.into(),
-            host_fingerprint: pin.into(),
-            machine: server::identity().map_err(|e| fail("local", format!("{e:#}")))?,
+        let request = PairFinish {
+            session: started.session,
+            mac: key.joiner_payload(&machine, &own_endpoint, &fingerprint, &bearer),
+            machine,
             endpoint: own_endpoint,
-            fingerprint: server::fingerprint().map_err(|e| fail("local", format!("{e:#}")))?,
+            fingerprint,
             token: bearer.clone(),
         };
-        let response = client::http_client(pin)?
-            .post(format!("{endpoint}v1/pair-code"))
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| fail("unreachable", format!("pairing connection failed: {e}")))?;
-        if !response.status().is_success() {
-            return Err(refused(response).await);
-        }
-        let response: PairResponse = client::bounded_json(response)
-            .await
-            .map_err(|e| fail("protocol", format!("{e:#}")))?;
+        let response: PairFinished = step(
+            http.post(format!("{endpoint}v1/pair-code/finish"))
+                .json(&request),
+        )
+        .await?;
         if response.version != PROTOCOL_VERSION {
             return Err(fail("protocol", "unsupported peer protocol version"));
         }
@@ -603,6 +727,9 @@ async fn join_one(
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
         {
             return Err(fail("protocol", "invalid enrollment response token"));
+        }
+        if !key.check_host_payload(&response.machine, &response.token, &response.mac) {
+            return Err(fail("protocol", "pairing response failed authentication"));
         }
         // The host accepted the code: from here on, store both sides.
         server::label_client(&bearer, &response.machine.id)?;
@@ -685,6 +812,65 @@ mod tests {
     }
     fn code_of(e: anyhow::Error) -> JoinFailure {
         e.downcast::<JoinFailure>().expect("structured failure")
+    }
+    fn open(pin: char) -> std::result::Result<Probe, String> {
+        Ok(Probe::Open {
+            pin: pin.to_string().repeat(64),
+            salt: format!("salt{pin}"),
+        })
+    }
+    #[test]
+    fn outdated_agents_are_never_chosen_and_alone_are_a_protocol_failure() {
+        let e = choose(
+            vec![
+                (at("old", "10.0.0.2"), Ok(Probe::Outdated)),
+                (at("idle", "10.0.0.3"), Ok(Probe::Closed)),
+            ],
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
+        let e = code_of(e);
+        assert_eq!(e.code, "protocol");
+        assert!(e.detail.unwrap().contains("https://10.0.0.2:7463"));
+        // Mixed versions: the current agent is chosen with its own salt.
+        let (target, pin, salt) = choose(
+            vec![
+                (at("old", "10.0.0.2"), Ok(Probe::Outdated)),
+                (at("new", "10.0.0.4"), open('b')),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(target.name, "new");
+        assert_eq!(pin, "b".repeat(64));
+        assert_eq!(salt, "saltb");
+        // Two current agents stay ambiguous, outdated ones aside.
+        let e = choose(
+            vec![
+                (at("old", "10.0.0.2"), Ok(Probe::Outdated)),
+                (at("one", "10.0.0.4"), open('b')),
+                (at("two", "10.0.0.5"), open('c')),
+            ],
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
+        let e = code_of(e);
+        assert_eq!(e.code, "multiple_hosts");
+        assert_eq!(e.candidates.len(), 2);
+        // This machine's own agent is never a target.
+        let e = choose(
+            vec![(at("me", "10.0.0.4"), open('b'))],
+            Some(&"b".repeat(64)),
+            Some("10.0.0.4"),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(code_of(e).code, "not_waiting");
     }
     #[test]
     fn the_code_goes_to_exactly_one_waiting_machine() {

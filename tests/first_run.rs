@@ -2,6 +2,7 @@
 //! proxy upgrades, setup and doctor --fix. Every case uses isolated state and
 //! never binds the real default port 7462.
 #![cfg(unix)]
+mod common;
 use std::{
     path::PathBuf,
     process::{Command, Output, Stdio},
@@ -94,22 +95,15 @@ impl Drop for Sandbox {
 /// A port whose next few neighbors are free too, outside the ephemeral range
 /// that concurrently running tests allocate from.
 fn quiet_port() -> u16 {
-    // macOS clocks have microsecond granularity; mix in a per-test counter so
-    // parallel tests probe different blocks.
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let micros = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as u32;
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let seed = micros
-        .wrapping_mul(2_654_435_761)
-        .wrapping_add(n.wrapping_mul(1_009))
-        .wrapping_add(std::process::id());
-    (0..2000u32)
-        .map(|i| 21000 + (seed.wrapping_add(i * 7) % 8000) as u16 / 8 * 8)
-        .find(|p| (*p..*p + 6).all(|q| q != 7462 && q != 7463 && porch::ports::available(q)))
-        .unwrap()
+    // A private slot from the shared allocator, so neither concurrent test
+    // binaries nor Porch's next-free-port probes from other tests reach it.
+    // Tests here occupy a few ports above it, so those must be free too.
+    loop {
+        let p = common::free_port();
+        if (p..p + 6).all(|q| q != 7462 && q != 7463 && porch::ports::available(q)) {
+            return p;
+        }
+    }
 }
 fn try_hold(port: u16) -> std::io::Result<socket2::Socket> {
     let socket = socket2::Socket::new(
@@ -205,20 +199,52 @@ fn explicit_busy_port_fails_with_owner_and_command() {
 
 #[test]
 fn app_that_ignores_port_produces_listen_warning() {
+    use std::io::BufRead;
     let s = Sandbox::new();
     s.save_port(quiet_port(), serde_json::json!({}));
     let other = quiet_port();
+    // The app stays up until the warning is observed; its lifetime must not
+    // race the diagnosis, which inspects the app's listeners after the timeout.
     std::fs::write(
         s.root.join("wrong.py"),
-        format!("import socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',{other}))\ns.listen()\ntime.sleep(4)\n"),
+        format!("import socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',{other}))\ns.listen()\ntime.sleep(60)\n"),
     )
     .unwrap();
-    let o = s
+    let mut porch = s
         .command(&["wrong", "python3", "wrong.py"])
         .env("PORCH_LISTEN_TIMEOUT", "1.5")
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    let err = String::from_utf8_lossy(&o.stderr);
+    let (lines, received) = std::sync::mpsc::channel();
+    let stderr = porch.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut err = String::new();
+    while !err.contains("`porch run --app-port") {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match received.recv_timeout(left) {
+            Ok(line) => {
+                err.push_str(&line);
+                err.push('\n');
+            }
+            Err(_) => break,
+        }
+    }
+    unsafe {
+        libc::kill(porch.id() as i32, libc::SIGTERM);
+    }
+    let _ = porch.wait();
     assert!(err.contains("nothing is listening on port"), "{err}");
     assert!(
         err.contains(&format!("listening on {other} instead")),

@@ -643,3 +643,112 @@ fn paired_machines_are_not_listed_again_as_discovered() {
         ["https://100.92.2.3:7463/", "https://192.168.1.20:7463/"]
     );
 }
+#[test]
+fn rewrite_location_rejects_every_loopback_spelling() {
+    let local_app = Url::parse("http://web.localhost:7462").unwrap();
+    let relay_url = Url::parse("http://app-machine-b.localhost:9000").unwrap();
+    for location in [
+        "http://[::1]:9999/",
+        "http://[0:0:0:0:0:0:0:1]:9999/admin",
+        "https://[::1]/",
+        "//[::1]:9999/x",
+        "http://[::ffff:127.0.0.1]:9999/",
+        "http://[::ffff:7f00:1]/",
+        "http://[::]:9999/",
+        "http://127.0.0.1:9999/",
+        "http://127.8.9.10/",
+        "http://0x7f.1:9999/",
+        "http://2130706433:9999/",
+        "http://0.0.0.0:9999/",
+        "http://localhost:9999/",
+        "http://LOCALHOST:9999/",
+        "http://localhost.:9999/",
+        "http://other.localhost:7462/",
+        "http://Other.LocalHost.:7462/",
+        "http://web.localhost:7463/",
+        "https://web.localhost:7462/",
+        "//localhost:9999/",
+        "http://[::127.0.0.1]:9999/",
+        "http://[::ffff:0.0.0.0]:9999/",
+        "\\\\[::1]:9999/",
+        "/\\localhost:9999/",
+        "\\/127.0.0.1:9999/",
+        " //[::1]:9999/",
+        "\t//localhost:9999/",
+        "http:\\\\[::1]:9999/",
+        "https:/localhost:9999/",
+    ] {
+        assert!(
+            rewrite_location(location, &local_app, &relay_url).is_err(),
+            "{location} should be rejected"
+        );
+    }
+}
+#[test]
+fn rewrite_location_keeps_same_app_relative_and_external_redirects() {
+    let local_app = Url::parse("http://web.localhost:7462").unwrap();
+    let relay_url = Url::parse("http://app-machine-b.localhost:9000").unwrap();
+    let rewrite = |v: &str| rewrite_location(v, &local_app, &relay_url).unwrap();
+    assert_eq!(
+        rewrite("http://web.localhost:7462/done?q=1"),
+        "http://app-machine-b.localhost:9000/done?q=1"
+    );
+    assert_eq!(
+        rewrite("http://WEB.localhost:7462/a"),
+        "http://app-machine-b.localhost:9000/a"
+    );
+    for location in [
+        "//web.localhost:7462/b",
+        "\\\\web.localhost:7462/b",
+        "/\\web.localhost:7462/b",
+    ] {
+        assert_eq!(rewrite(location), "http://app-machine-b.localhost:9000/b");
+    }
+    for location in [
+        "/relative?x=1",
+        "relative/path",
+        "?q=only",
+        "https://example.com/login",
+        "https://[2001:db8::1]/",
+        "http://192.168.1.10:8080/",
+        "https://localhost.example.com/",
+        "https://notlocalhost/",
+        "http://app-machine-b.localhost:9000/self",
+        "mailto:someone@example.com",
+    ] {
+        assert_eq!(rewrite(location), location);
+    }
+}
+#[test]
+fn rewrite_location_with_https_relay_only_rewrites_explicit_app_authority() {
+    let local_app = Url::parse("http://web.localhost:7462").unwrap();
+    let relay_url = Url::parse("https://app-machine-b.localhost:9443").unwrap();
+    let rewrite = |v: &str| rewrite_location(v, &local_app, &relay_url);
+    for location in [
+        "http:example.com/login",
+        "http:/example.com/login",
+        "/relative",
+        "https://example.com/",
+    ] {
+        assert_eq!(rewrite(location).unwrap(), location);
+    }
+    for location in [
+        "//web.localhost:7462/path",
+        "http://web.localhost:7462/path",
+        "http:\\\\web.localhost:7462/path",
+        "http:web.localhost:7462/path",
+        "http:/web.localhost:7462/path",
+    ] {
+        assert_eq!(
+            rewrite(location).unwrap(),
+            "https://app-machine-b.localhost:9443/path"
+        );
+    }
+    for location in [
+        "http:localhost:9999/",
+        "http:/[::1]:9999/",
+        "//localhost:9999/",
+    ] {
+        assert!(rewrite(location).is_err(), "{location} should be rejected");
+    }
+}

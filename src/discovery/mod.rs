@@ -4,6 +4,7 @@ pub mod client;
 pub mod commands;
 pub mod gateway;
 pub mod pairing;
+mod pake;
 pub mod server;
 pub mod types;
 

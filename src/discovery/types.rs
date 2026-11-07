@@ -113,24 +113,63 @@ pub struct PairResponse {
     pub machine: Machine,
     pub token: String,
 }
+/// Version of the code-pairing exchange. 1 sent the code in the clear to
+/// whichever machine answered; 2 is a SPAKE2 password-authenticated exchange.
+pub const PAIRING_VERSION: u32 = 2;
 /// Unauthenticated probe: is this agent currently showing a pairing code?
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PairingStatus {
     pub version: u32,
     pub open: bool,
+    /// Missing (0) on agents that only speak the insecure version 1 exchange.
+    #[serde(default)]
+    pub pairing: u32,
+    /// Public per-window salt mixed into the code before the key exchange.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salt: Option<String>,
 }
-/// Code pairing is mutual: the joining machine sends the credentials the host
-/// needs to reach it back, bound to the certificate it observed (TOFU).
+/// Code pairing, step 1: the joiner's SPAKE2 message.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PairCodeRequest {
-    pub version: u32,
-    pub code: String,
-    /// SHA-256 of the host certificate as seen by the joiner.
-    pub host_fingerprint: String,
+pub struct PairStart {
+    pub pairing: u32,
+    pub salt: String,
+    pub msg: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairStarted {
+    pub session: String,
+    pub msg: String,
+}
+/// Step 2: the joiner proves it derived the key (knows the code) for the host
+/// certificate it pinned. The host counts a wrong proof as a wrong code.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairConfirm {
+    pub session: String,
+    pub confirm: String,
+}
+/// The host proves the key in return; the joiner checks it before it turns
+/// on sharing or mints a credential.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairConfirmed {
+    pub confirm: String,
+}
+/// Step 3: the joiner's identity, agent endpoint, certificate fingerprint and a
+/// bearer the host will use to call back, authenticated with the pairing key.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairFinish {
+    pub session: String,
     pub machine: Machine,
     pub endpoint: String,
     pub fingerprint: String,
     pub token: String,
+    pub mac: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairFinished {
+    pub version: u32,
+    pub machine: Machine,
+    pub token: String,
+    pub mac: String,
 }
 /// Lifecycle of one pairing code on the machine showing it. `accepted` means the
 /// code was right; `paired` means the new peer has since authenticated.
