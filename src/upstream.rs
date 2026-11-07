@@ -125,6 +125,30 @@ pub fn rewrite_location(location: &str, origins: &[String], public_origin: &str)
     })
 }
 
+/// Make a cookie the backend scoped to its own domain (`Domain=example.com`)
+/// host-only, so the browser keeps it for the Porch name it's actually on.
+/// Returns `None` when the cookie needs no change.
+pub fn host_only_cookie(set_cookie: &str, backend_host: &str) -> Option<String> {
+    let backend = backend_host.trim_matches(['[', ']']).to_ascii_lowercase();
+    let mut changed = false;
+    let parts: Vec<&str> = set_cookie
+        .split(';')
+        .filter(|part| {
+            let Some((key, value)) = part.trim().split_once('=') else {
+                return true;
+            };
+            if !key.trim().eq_ignore_ascii_case("domain") {
+                return true;
+            }
+            let domain = value.trim().trim_start_matches('.').to_ascii_lowercase();
+            let ours = backend == domain || backend.ends_with(&format!(".{domain}"));
+            changed |= ours;
+            !ours
+        })
+        .collect();
+    changed.then(|| parts.join(";"))
+}
+
 #[derive(Debug)]
 struct NoVerify;
 impl rustls::client::danger::ServerCertVerifier for NoVerify {
@@ -209,6 +233,29 @@ mod tests {
         };
         assert_eq!(request(&keep, 9, "/").0, "https://127.0.0.1:9/");
         assert!(origins(&keep).is_empty());
+    }
+    #[test]
+    fn backend_scoped_cookies_become_host_only() {
+        assert_eq!(
+            host_only_cookie(
+                "sid=1; Domain=.example.com; Path=/; Secure",
+                "staging.example.com"
+            ),
+            Some("sid=1; Path=/; Secure".into())
+        );
+        assert_eq!(
+            host_only_cookie("sid=1; domain=staging.example.com", "staging.example.com"),
+            Some("sid=1".into())
+        );
+        assert_eq!(
+            host_only_cookie("sid=1; Path=/", "staging.example.com"),
+            None
+        );
+        // Another site's domain is left for the browser to reject as usual.
+        assert_eq!(
+            host_only_cookie("sid=1; Domain=other.com", "staging.example.com"),
+            None
+        );
     }
 
     #[tokio::test]

@@ -50,7 +50,7 @@ async fn dashboard_json(settings: &ProxySettings, peers: bool) -> serde_json::Va
     let health = tokio::task::spawn_blocking(move || {
         routes
             .iter()
-            .map(|r| crate::health::target_listening(&r.target))
+            .map(|r| crate::health::target_listening_cached(&r.target))
             .collect::<Vec<_>>()
     })
     .await
@@ -553,7 +553,7 @@ async fn forward(
                 .parse::<hyper::http::uri::Authority>()
                 .ok()
                 .and_then(|a| a.port_u16())
-                .unwrap_or(443);
+                .unwrap_or(if secure { 443 } else { 80 });
             state
                 .routes
                 .iter()
@@ -637,7 +637,7 @@ async fn forward(
             let health = tokio::task::spawn_blocking(move || {
                 targets
                     .iter()
-                    .map(|t| crate::health::target_listening(t))
+                    .map(|t| crate::health::target_listening_cached(t))
                     .collect::<Vec<_>>()
             })
             .await
@@ -925,9 +925,41 @@ async fn forward(
                 // Porch URL: remote aliases and `--upstream` authorities.
                 let origins: Vec<String> = match (&upstream_spec, &remote_origin) {
                     (Some(up), _) => crate::upstream::origins(up),
-                    (None, Some(origin)) => vec![origin.clone()],
+                    (None, Some(_)) => crate::upstream::origins(&crate::state::Upstream {
+                        tls: target.scheme_str() == Some("https"),
+                        authority: target.authority().map(|a| a.to_string()),
+                        insecure: false,
+                    }),
                     (None, None) => vec![],
                 };
+                // Cookies a real backend scopes to its own domain would never
+                // come back to the Porch name; keep them host-only instead.
+                let backend_host = upstream_spec
+                    .as_ref()
+                    .and_then(|u| u.authority.as_deref())
+                    .and_then(|a| a.parse::<hyper::http::uri::Authority>().ok())
+                    .map(|a| a.host().to_owned())
+                    .or_else(|| remote_origin.as_ref().and(target.host().map(str::to_owned)));
+                if let Some(backend) = backend_host {
+                    let cookies: Vec<_> = response
+                        .headers()
+                        .get_all(header::SET_COOKIE)
+                        .iter()
+                        .map(|v| {
+                            v.to_str()
+                                .ok()
+                                .and_then(|c| crate::upstream::host_only_cookie(c, &backend))
+                                .and_then(|c| header::HeaderValue::from_str(&c).ok())
+                                .unwrap_or_else(|| v.clone())
+                        })
+                        .collect();
+                    if !cookies.is_empty() {
+                        response.headers_mut().remove(header::SET_COOKIE);
+                        for c in cookies {
+                            response.headers_mut().append(header::SET_COOKIE, c);
+                        }
+                    }
+                }
                 let rewritten = response
                     .headers()
                     .get(header::LOCATION)

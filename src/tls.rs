@@ -176,6 +176,7 @@ fn allowed_name(
         || settings
             .tlds
             .iter()
+            .filter(|tld| signable_domain(tld))
             .any(|tld| in_domain(tld.trim_start_matches('.')))
         || (settings.lan && in_domain("local"))
 }
@@ -188,14 +189,23 @@ fn set_validity(params: &mut CertificateParams, days: u64) {
 /// Domains a new local CA may ever sign for: reserved, never-public names plus
 /// the TLDs configured when it is created. Browsers enforce these X.509 name
 /// constraints, so even a leaked CA key can't impersonate a real website.
+const RESERVED: [&str; 5] = ["localhost", "local", "test", "internal", "home.arpa"];
+/// Can the local CA ever sign names under `tld`? Reserved, never-public names
+/// can, and so can a domain with at least two labels (one you control, such as
+/// `local.example.com`). A bare TLD like `com`, `dev` or `app` never can: a CA
+/// allowed to sign all of `.com` could impersonate real sites.
+pub fn signable_domain(tld: &str) -> bool {
+    let t = tld.trim_start_matches('.').to_ascii_lowercase();
+    RESERVED
+        .iter()
+        .any(|r| t == *r || t.ends_with(&format!(".{r}")))
+        || t.contains('.')
+}
 fn ca_permitted(settings: &crate::state::ProxySettings) -> Vec<String> {
-    let mut out: Vec<String> = ["localhost", "local", "test", "internal", "home.arpa"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let mut out: Vec<String> = RESERVED.into_iter().map(str::to_owned).collect();
     for t in &settings.tlds {
         let t = t.trim_start_matches('.').to_ascii_lowercase();
-        if !out.iter().any(|p| t == *p || t.ends_with(&format!(".{p}"))) {
+        if signable_domain(&t) && !out.iter().any(|p| t == *p || t.ends_with(&format!(".{p}"))) {
             out.push(t);
         }
     }
@@ -225,6 +235,7 @@ pub fn uncovered_tlds(ca_pem: &str, settings: &crate::state::ProxySettings) -> V
         .iter()
         .chain(settings.lan.then(|| "local".to_owned()).iter())
         .map(|t| t.trim_start_matches('.').to_ascii_lowercase())
+        .filter(|t| signable_domain(t))
         .filter(|t| {
             !permitted
                 .iter()
@@ -239,7 +250,11 @@ fn ca_params(settings: &crate::state::ProxySettings) -> Result<CertificateParams
             .into_iter()
             .map(rcgen::GeneralSubtree::DnsName)
             .collect(),
-        excluded_subtrees: vec![],
+        // No IP addresses at all: Porch only ever signs DNS names.
+        excluded_subtrees: vec![
+            rcgen::GeneralSubtree::IpAddress(rcgen::CidrSubnet::V4([0; 4], [0; 4])),
+            rcgen::GeneralSubtree::IpAddress(rcgen::CidrSubnet::V6([0; 16], [0; 16])),
+        ],
     });
     set_validity(&mut params, 3650);
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -478,6 +493,17 @@ mod tests {
             .collect();
         assert!(permitted.contains(&"localhost") && permitted.contains(&"local"));
         assert!(!permitted.iter().any(|p| *p == "com" || p.is_empty()));
+        let excluded = &params.name_constraints.as_ref().unwrap().excluded_subtrees;
+        assert_eq!(excluded.len(), 2, "IPv4 and IPv6 are excluded");
+        // A bare public TLD is never added to the CA, nor issued for.
+        let risky = crate::state::ProxySettings {
+            tlds: vec!["com".into(), "dev.example.com".into()],
+            ..Default::default()
+        };
+        assert!(!ca_permitted(&risky).contains(&"com".to_owned()));
+        assert!(ca_permitted(&risky).contains(&"dev.example.com".to_owned()));
+        assert!(!allowed_name("github.com", &risky, &[]));
+        assert!(allowed_name("web.dev.example.com", &risky, &[]));
         assert!(uncovered_tlds(&cert, &settings).is_empty());
         let other = crate::state::ProxySettings {
             tlds: vec!["dev.example.com".into()],

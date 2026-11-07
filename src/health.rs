@@ -122,6 +122,33 @@ fn listening(r: &Route) -> bool {
     target_listening(&r.target)
 }
 
+/// [`target_listening`], remembered for two seconds per target, for pages
+/// that many tabs refresh (the dashboard) so views don't probe every app.
+pub fn target_listening_cached(target: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<HashMap<String, (bool, Instant)>>> = Mutex::new(None);
+    if let Ok(mut cache) = CACHE.lock() {
+        let map = cache.get_or_insert_with(HashMap::new);
+        if let Some((up, at)) = map.get(target) {
+            if at.elapsed() < Duration::from_secs(2) {
+                return *up;
+            }
+        }
+        if map.len() > 1024 {
+            map.clear();
+        }
+    }
+    let up = target_listening(target);
+    if let Ok(mut cache) = CACHE.lock() {
+        cache
+            .get_or_insert_with(HashMap::new)
+            .insert(target.to_owned(), (up, Instant::now()));
+    }
+    up
+}
+
 /// Does the route's target accept connections the way the proxy dials it?
 ///
 /// The proxy dials plain-HTTP loopback targets as `localhost`, which reaches an

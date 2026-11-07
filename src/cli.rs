@@ -712,7 +712,29 @@ fn tlds(values: &[String]) -> Result<Vec<String>> {
     if out.is_empty() {
         bail!("at least one TLD required")
     }
+    for t in &out {
+        if let Some(why) = risky_tld(t) {
+            eprintln!("porch: warning: .{t} {why}. Prefer .localhost, .test, or a domain you own such as local.example.com.");
+        }
+    }
     Ok(out)
+}
+/// Why a TLD is a poor choice for local apps, if it is (same list as Portless).
+fn risky_tld(tld: &str) -> Option<&'static str> {
+    let reason = |t: &str| {
+        match t {
+        "local" => Some("conflicts with mDNS/Bonjour on macOS (use --lan for .local names)"),
+        "dev" | "app" => Some("is Google-owned and browsers force HTTPS on it (HSTS preload); Porch won't sign certificates for it"),
+        "com" | "org" | "net" | "io" | "edu" | "gov" | "mil" | "int" => Some("is a public TLD: lookups leak to the internet, and Porch won't sign certificates for it"),
+        _ => None,
+    }
+    };
+    reason(tld).or_else(|| {
+        ["dev", "app"]
+            .iter()
+            .find(|r| tld.ends_with(&format!(".{r}")))
+            .and_then(|r| reason(r))
+    })
 }
 /// Did the caller choose the proxy port (flag or PORCH_PORT)? Explicit ports never move.
 pub(crate) fn port_explicit(o: &ProxyOptions) -> bool {
@@ -1854,6 +1876,7 @@ pub(crate) async fn prune(force: bool) -> Result<()> {
         .filter(|r| r.pid.is_some() && !state::route_alive(&old, r))
         .map(|r| r.name.clone())
         .collect();
+    let mut pruned = 0;
     for n in names {
         kill_route(&old, &n, if force { 9 } else { 15 })?;
         if let Some(owner) = old.owners.get(&n) {
@@ -1877,6 +1900,18 @@ pub(crate) async fn prune(force: bool) -> Result<()> {
                 state::remove_route(s, &n);
             }
         })?;
+        pruned += 1;
+        println!(
+            "Removed {n}{}",
+            if force {
+                " and stopped what it left running"
+            } else {
+                ""
+            }
+        );
+    }
+    if pruned == 0 {
+        println!("Nothing to prune");
     }
     Ok(())
 }

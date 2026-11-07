@@ -44,13 +44,13 @@ fn description(n: &str) -> &'static str {
 }
 /// Extra CLI arguments each tool may pass through. Read-only tools accept only
 /// read-only flags, so `extraArgs` can never turn an inspection into a repair.
-fn allowed_extra(n: &str) -> Option<&'static [&'static str]> {
+/// The only `extraArgs` each tool passes through. Every other option is a
+/// typed argument, so an agent can't reach CLI flags the schema doesn't show.
+fn allowed_extra(n: &str) -> &'static [&'static str] {
     match n {
-        "list" => Some(&["--all", "--json"]),
-        "get" => Some(&["--no-worktree"]),
-        "doctor" | "version" | "tools_profiles" | "machines" | "logs" => Some(&[]),
-        "doctor_fix" => Some(&[]),
-        _ => None,
+        "list" => &["--all", "--json"],
+        "get" => &["--no-worktree"],
+        _ => &[],
     }
 }
 /// Tools that never change routes, the proxy or processes.
@@ -101,7 +101,11 @@ fn enabled(p: &[String], n: &str) -> bool {
 fn definition(n: &str) -> Value {
     let mut properties = json!({});
     if n != "tools_profiles" {
-        properties = json!({"cwd":{"type":"string","minLength":1},"extraArgs":{"type":"array","items":{"type":"string"}},"timeoutMs":{"type":"integer","minimum":1,"maximum":2147483647,"default":120000}});
+        properties = json!({"cwd":{"type":"string","minLength":1},"timeoutMs":{"type":"integer","minimum":1,"maximum":2147483647,"default":120000}});
+        if !allowed_extra(n).is_empty() {
+            properties["extraArgs"] =
+                json!({"type":"array","items":{"type":"string","enum":allowed_extra(n)}});
+        }
     }
     let fields: &[&str] = match n {
         "get" => &["name", "noWorktree"],
@@ -143,7 +147,7 @@ fn definition(n: &str) -> Value {
         _ => vec![],
     };
     let read = READ_ONLY.contains(&n);
-    json!({"name":n,"description":description(n),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read,"destructiveHint":(["alias_add","alias_remove","proxy_stop","prune","doctor_fix","stop"].contains(&n)),"idempotentHint":n!="alias_add","openWorldHint":n=="proxy_start"}})
+    json!({"name":n,"description":description(n),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read,"destructiveHint":(["alias_add","alias_remove","proxy_stop","prune","doctor_fix","stop","run"].contains(&n)),"idempotentHint":n!="alias_add","openWorldHint":(n=="proxy_start"||n=="run")}})
 }
 fn validate(n: &str, a: &Value) -> Result<()> {
     let d = definition(n);
@@ -190,7 +194,8 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
             false,
         ));
     }
-    if let (Some(allowed), Some(extra)) = (allowed_extra(n), a["extraArgs"].as_array()) {
+    if let Some(extra) = a["extraArgs"].as_array() {
+        let allowed = allowed_extra(n);
         for arg in extra {
             let s = arg.as_str().unwrap_or_default();
             let flag = s.split('=').next().unwrap_or(s);
@@ -466,12 +471,7 @@ mod tests {
     }
     #[tokio::test]
     async fn read_only_tools_reject_repair_arguments() {
-        for (tool, extra) in [
-            ("doctor", "--fix"),
-            ("doctor", "--yes"),
-            ("list", "--force"),
-            ("get", "--force"),
-        ] {
+        for (tool, extra) in [("list", "--force"), ("get", "--force")] {
             let err = call(
                 tool,
                 &json!({"extraArgs":[extra]})
@@ -491,6 +491,17 @@ mod tests {
             assert!(
                 err.to_string().contains("does not accept"),
                 "{tool} {extra}: {err}"
+            );
+        }
+        // Tools that change things take no extraArgs at all.
+        for tool in ["doctor", "alias_add", "proxy_start", "run", "stop", "prune"] {
+            assert!(
+                validate(
+                    tool,
+                    &json!({"extraArgs":["--upstream","https://example.com"]})
+                )
+                .is_err(),
+                "{tool}"
             );
         }
         let doctor = definition("doctor");

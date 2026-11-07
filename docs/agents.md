@@ -118,7 +118,7 @@ Example: `porch mcp --tools core,diagnostics`. Calling a tool outside the active
 
 ## Tools
 
-Except `tools_profiles`, every tool accepts `cwd` (directory to run in), `extraArgs` (extra CLI arguments) and `timeoutMs` (default 120000). Read-only tools accept only read-only `extraArgs` (`list`: `--all`, `--json`; `get`: `--no-worktree`; `doctor` and `version`: none), so an agent can't turn an inspection into a change. Each runs the matching `porch` command and returns its exit code, stdout and stderr; the call is marked as an error when the command fails.
+Except `tools_profiles`, every tool accepts `cwd` (directory to run in) and `timeoutMs` (default 120000). Every option is a typed argument. Only `list` (`--all`, `--json`) and `get` (`--no-worktree`) also take `extraArgs`, limited to those flags, so an agent can't reach CLI options the schema doesn't show. `run` is marked destructive and open-world, because it runs a command you choose.
 
 | Tool | Arguments | Runs | Notes |
 | --- | --- | --- | --- |

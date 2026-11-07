@@ -949,10 +949,25 @@ pub fn launch_plans(
     let command = match command {
         Some(c) if !c.is_empty() => c,
         _ => resolve_script_command(script, &cwd).with_context(|| {
-            format!(
-                "no \"{script}\" script in {}/package.json; provide a command",
-                cwd.display()
-            )
+            let scripts: Vec<String> = read_json(&cwd.join("package.json"))
+                .and_then(|p| p["scripts"].as_object().map(|o| o.keys().cloned().collect()))
+                .unwrap_or_default();
+            let hint = match scripts.iter().find(|s| ["start", "serve", "develop", "preview"].contains(&s.as_str())) {
+                Some(s) => format!("; try `porch --script {s}`"),
+                None => String::new(),
+            };
+            if scripts.is_empty() {
+                format!(
+                    "no \"{script}\" script in {}/package.json; give a command instead, e.g. `porch run node server.js`",
+                    cwd.display()
+                )
+            } else {
+                format!(
+                    "no \"{script}\" script in {}/package.json (it has: {}){hint}, or give a command: `porch run <command>`",
+                    cwd.display(),
+                    scripts.join(", ")
+                )
+            }
         })?,
     };
     if root.as_deref() == Some(cwd.as_path())
