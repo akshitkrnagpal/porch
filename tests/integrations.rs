@@ -840,3 +840,54 @@ fn doctor_does_not_call_a_foreign_listener_ready() {
     assert!(stdout.contains("foreign/unverified listener"), "{stdout}");
     assert!(!stdout.contains("proxy listener: reachable"), "{stdout}");
 }
+
+#[test]
+fn trust_records_from_before_scopes_stay_system_wide() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = Sandbox::new();
+    s.fake("openssl","print('subject=CN=Porch Local CA' if '-subject' in a else 'sha1 Fingerprint=' + ':'.join(['AB']*20))");
+    for tool in ["update-ca-certificates", "certutil"] {
+        s.fake(tool, "");
+    }
+    fs::write(s.dir.join("state/ca.pem"), "fixture certificate").unwrap();
+    fs::create_dir_all(s.dir.join("trust")).unwrap();
+    let installed = s.dir.join("trust/porch-ABABABABABAB.crt");
+    fs::write(&installed, "fixture certificate").unwrap();
+    // A record written by Porch 0.3.x: no scope, keychain or NSS fields.
+    fs::write(
+        s.dir.join("state/trust.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "platform": "linux",
+            "fingerprint": "AB".repeat(20),
+            "installed": installed,
+            "update": "update-ca-certificates",
+            "windows": false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // Re-running trust keeps the existing system-wide install instead of adding per-user trust.
+    let out = s
+        .cmd()
+        .env("PORCH_TRUST_PLATFORM", "linux")
+        .args(["trust"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("already trusted system-wide"));
+    assert!(!s.log().contains("certutil"), "{}", s.log());
+    // Clean removes it through the system CA tooling.
+    let out = s.run(&["clean"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!installed.exists());
+    assert!(s.log().contains("update-ca-certificates"));
+    assert!(!s.dir.join("state/trust.json").exists());
+}
