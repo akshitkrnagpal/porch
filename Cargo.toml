@@ -56,7 +56,10 @@ tray-icon = { version = "0.26", optional = true }
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 tao = { version = "0.37", optional = true }
-objc2 = { version = "0.6", optional = true }
+
+# Apple-only crates; they fail to compile anywhere else.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 ={ version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSGeometry", "NSObject", "NSRunLoop", "NSString"] }
 objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "objc2-core-foundation", "NSCell", "NSControl", "NSFont", "NSMenu", "NSEvent", "NSMenuItem", "NSProgressIndicator", "NSResponder", "NSSwitch", "NSText", "NSTextField", "NSView"] }
 
