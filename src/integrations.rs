@@ -2399,17 +2399,54 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     }
 }
 async fn doctor() -> Result<()> {
+    use crate::style::{self, Stream::Stdout};
+    let good = |label: &str, detail: &str| {
+        println!(
+            "  {} {label}  {}",
+            style::green(Stdout, "✓"),
+            style::dim(Stdout, detail)
+        )
+    };
+    let bad =
+        |label: &str, detail: &str| println!("  {} {label}  {detail}", style::red(Stdout, "✗"));
+    let info = |label: &str, detail: &str| {
+        println!(
+            "  {} {label}  {}",
+            style::dim(Stdout, "·"),
+            style::dim(Stdout, detail)
+        )
+    };
+    let section = |title: &str| println!("\n{}", style::bold(Stdout, title));
     let settings = crate::state::proxy_settings()?;
     let state = crate::state::load()?;
     println!(
-        "state: {}\nproxy: {}\nHTTPS: {}\nTLDs: {}\nLAN: {}\nunprivileged: {}",
-        crate::state::dir().display(),
-        settings.port,
-        settings.tls,
-        settings.tlds.join(","),
-        settings.lan,
-        settings.unprivileged
+        "{}",
+        style::bold(Stdout, &format!("Porch {}", env!("CARGO_PKG_VERSION")))
     );
+    section("Settings");
+    info("state", &crate::state::dir().display().to_string());
+    info(
+        "proxy",
+        &format!(
+            "{} · {} · port {}{}",
+            settings.url("<app>"),
+            if settings.tls { "HTTPS" } else { "HTTP" },
+            settings.port,
+            if settings.unprivileged {
+                " · no sudo"
+            } else {
+                " · uses sudo"
+            }
+        ),
+    );
+    info("domains", &settings.tlds.join(", "));
+    if settings.lan {
+        info(
+            "LAN mode",
+            settings.lan_ip.as_deref().unwrap_or("automatic address"),
+        );
+    }
+    section("Proxy");
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -2426,6 +2463,7 @@ async fn doctor() -> Result<()> {
         fs::read_to_string(crate::state::dir().join("proxy.hosts-sync-token")).unwrap_or_default();
     let challenge = "ab".repeat(32);
     for address in ["127.0.0.1", "[::1]"] {
+        let label = format!("listener {address}");
         let response = client
             .head(format!(
                 "http://{address}:{}/_porch/hosts-sync",
@@ -2447,33 +2485,37 @@ async fn doctor() -> Result<()> {
                     && response.status() == reqwest::StatusCode::CONFLICT
                     && response.headers().contains_key("x-porch");
                 if owned_ready && (authenticated || disabled) {
-                    println!("proxy listener {address}: Porch ready (identity verified)");
+                    good(&label, "Porch is ready (identity verified)");
                 } else {
-                    println!("proxy listener {address}: foreign/unverified listener; port collision or stale daemon state");
+                    let who = crate::ports::describe_owner(settings.port);
+                    bad(
+                        &label,
+                        &format!("foreign/unverified listener ({who}); port collision or stale daemon state"),
+                    );
                 }
             }
-            Err(e) => {
-                println!("proxy listener {address}: unavailable ({e}); run porch proxy start")
+            Err(e) if e.is_connect() => {
+                bad(&label, "nothing is listening; run `porch proxy start`")
             }
+            Err(e) => bad(
+                &label,
+                &format!("unavailable ({e}); run `porch proxy start`"),
+            ),
         }
     }
-    #[cfg(unix)]
-    if let Ok(output) = Command::new("lsof")
-        .args(["-nP", &format!("-iTCP:{}", settings.port), "-sTCP:LISTEN"])
-        .output()
-    {
-        if output.status.success() {
-            println!(
-                "listeners on proxy port:\n{}",
-                String::from_utf8_lossy(&output.stdout).trim()
-            );
-        }
+    section("Routes");
+    if state.routes.is_empty() {
+        info("none", "start an app with `porch run <command>`");
     }
     for r in state.routes {
         let owner = state.owners.get(&r.name).map(crate::state::matches);
-        println!(
-            "route: {} -> {}{}",
-            settings.url(&r.name),
+        let host = settings.hostname(&r.name);
+        let resolves = tokio::net::lookup_host((host.as_str(), settings.port))
+            .await
+            .is_ok_and(|mut a| a.next().is_some());
+        let label = settings.url(&r.name);
+        let detail = format!(
+            "-> {}{}",
             r.target,
             if owner == Some(false) {
                 " (stale launcher)"
@@ -2481,46 +2523,71 @@ async fn doctor() -> Result<()> {
                 ""
             }
         );
-        let host = settings.hostname(&r.name);
-        match tokio::net::lookup_host((host.as_str(), settings.port)).await {
-            Ok(mut addresses) => {
-                if addresses.next().is_some() {
-                    println!("DNS {host}: resolves");
-                } else {
-                    println!("DNS {host}: unavailable; run porch hosts sync");
-                }
-            }
-            _ => println!("DNS {host}: unavailable; run porch hosts sync"),
-        };
-    }
-    println!(
-        "CA: {}",
-        if crate::state::dir().join("ca.pem").is_file() {
-            "present"
+        let target = if r.target.contains("://") {
+            r.target.clone()
         } else {
-            "missing"
+            format!("http://{}", r.target)
+        };
+        let listening = match url::Url::parse(&target) {
+            Ok(u) => match (u.host_str(), u.port_or_known_default()) {
+                (Some(h), Some(p)) => tokio::time::timeout(
+                    Duration::from_millis(500),
+                    tokio::net::TcpStream::connect((h.trim_matches(['[', ']']), p)),
+                )
+                .await
+                .is_ok_and(|c| c.is_ok()),
+                _ => false,
+            },
+            Err(_) => false,
+        };
+        if !resolves {
+            bad(
+                &label,
+                &format!("{host} does not resolve on this computer; run `porch hosts sync`"),
+            );
+        } else if !listening {
+            println!(
+                "  {} {label}  {} {}",
+                style::yellow(Stdout, "!"),
+                style::dim(Stdout, &detail),
+                style::yellow(Stdout, "(not listening)")
+            );
+        } else if owner == Some(false) {
+            bad(&label, &detail);
+        } else {
+            good(&label, &detail);
         }
-    );
-    println!(
-        "CA trust: {}",
-        match trust_scope().as_deref() {
-            Some("user") => "installed for this user by Porch (recorded)",
-            Some(_) => "installed system-wide by Porch (recorded)",
-            None => "not recorded; run porch trust",
-        }
-    );
-    for (tool, flag) in [
-        ("node", "--version"),
-        ("docker", "--version"),
-        ("tailscale", "version"),
-        ("ngrok", "version"),
-        ("cloudflared", "--version"),
+    }
+    section("HTTPS");
+    let ca = crate::state::dir().join("ca.pem").is_file();
+    let trust = trust_scope();
+    match (settings.tls, ca, trust.as_deref()) {
+        (false, _, _) => info(
+            "off",
+            "turn it on with `porch setup` or `porch proxy start --https`",
+        ),
+        (true, false, _) => bad(
+            "local CA",
+            "missing; it is created when the proxy starts with --https",
+        ),
+        (true, true, Some("user")) => good("local CA", "trusted for this user"),
+        (true, true, Some(_)) => good("local CA", "trusted system-wide"),
+        (true, true, None) => bad("local CA", "not trusted yet; run `porch trust`"),
+    }
+    section("Tools");
+    for (tool, flag, why) in [
+        ("node", "--version", "Turborepo and Node apps"),
+        ("docker", "--version", "porch compose"),
+        ("tailscale", "version", "--tailscale and --funnel"),
+        ("ngrok", "version", "--ngrok"),
+        ("cloudflared", "--version", "--cloudflare"),
     ] {
         match exec(tool, &[flag]) {
-            Ok(out) => println!("{tool}: {}", out.trim()),
-            Err(e) => println!("{tool}: {e}"),
+            Ok(out) => good(tool, out.lines().next().unwrap_or("").trim()),
+            Err(_) => info(tool, &format!("not installed (only needed for {why})")),
         }
     }
+    println!();
     Ok(())
 }
 

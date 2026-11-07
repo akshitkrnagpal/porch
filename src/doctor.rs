@@ -12,11 +12,12 @@ struct Report {
 }
 impl Report {
     fn issue(&mut self, problem: impl std::fmt::Display, outcome: impl std::fmt::Display) {
+        use crate::style::{self, Stream::Stdout};
         if self.count == 0 {
-            println!("\nIssues:");
+            println!("{}", style::bold(Stdout, "Issues"));
         }
         self.count += 1;
-        println!("- {problem} → {outcome}");
+        println!("  {} {problem} → {outcome}", style::yellow(Stdout, "!"));
     }
     fn hint(&self) -> &'static str {
         if self.fix {

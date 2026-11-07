@@ -33,11 +33,18 @@ fn escape(s: &str) -> String {
 }
 const PAGE_CSS: &str = ":root{color-scheme:light dark;--bg:#faf8f2;--fg:#242421;--muted:#6b675e;--card:#fff;--line:#e6e1d6;--accent:#b4532a;--code:#efeadf}@media (prefers-color-scheme:dark){:root{--bg:#161513;--fg:#ece9e1;--muted:#a19c90;--card:#1f1e1b;--line:#33312c;--accent:#f08a5d;--code:#2a2925}}*{box-sizing:border-box}body{margin:0;font:16px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg)}main{max-width:46rem;margin:0 auto;padding:12vh 1rem 4rem}.status{font:600 .8rem ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}h1{font-size:1.75rem;line-height:1.2;margin:.4rem 0 1rem}p{margin:.6rem 0}code{font:.9em ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--code);padding:.1rem .35rem;border-radius:4px}.muted{color:var(--muted)}h2{font-size:.95rem;margin:2.5rem 0 .75rem;color:var(--muted);font-weight:600}ul.apps{list-style:none;padding:0;margin:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}ul.apps li{border-top:1px solid var(--line)}ul.apps li:first-child{border-top:0}ul.apps a{display:flex;justify-content:space-between;gap:1rem;padding:.75rem 1rem;color:inherit;text-decoration:none}ul.apps a:hover,ul.apps a:focus-visible{background:var(--code);outline:none}.name{font-weight:600}.target{color:var(--muted);font:.85em ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}input[type=search]{width:100%;font:inherit;padding:.55rem .75rem;margin:0 0 .75rem;border:1px solid var(--line);border-radius:8px;background:var(--card);color:inherit}.spinner{display:inline-block;width:.8em;height:.8em;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;vertical-align:-.05em;margin-right:.4rem}@keyframes spin{to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.spinner{animation:none}}footer{margin-top:3rem;font-size:.85rem;color:var(--muted)}";
 fn page(code: StatusCode, title: &str, body: &str, head: &str) -> String {
+    let status = if code.is_success() {
+        "<div class=\"status\">Porch</div>".to_owned()
+    } else {
+        format!(
+            "<div class=\"status\">{} {}</div>",
+            code.as_u16(),
+            escape(code.canonical_reason().unwrap_or("Proxy error"))
+        )
+    };
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{head}<title>{} · Porch</title><style>{PAGE_CSS}</style></head><body><main><div class=\"status\">{} {}</div><h1>{}</h1>{body}<footer>Served by Porch · run <code>porch list</code> or <code>porch doctor</code></footer></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{head}<title>{} · Porch</title><style>{PAGE_CSS}</style></head><body><main>{status}<h1>{}</h1>{body}<footer>Served by Porch · run <code>porch list</code> or <code>porch doctor</code></footer></main></body></html>",
         escape(title),
-        code.as_u16(),
-        escape(code.canonical_reason().unwrap_or("Proxy error")),
         escape(title),
     )
 }
@@ -504,11 +511,27 @@ async fn forward(
                 };
                 format!("{filter}<ul class=\"apps\">{}</ul>", links.join(""))
             };
-            let body = format!(
-                "<p>No app is registered for <code>{}</code>.</p><h2>Running apps</h2>{list}",
-                escape(&hostname)
-            );
-            let page = page(StatusCode::NOT_FOUND, "No app at this address", &body, "");
+            // The bare domain (http://localhost) is Porch's dashboard: a 200
+            // page listing every app, rather than an error.
+            let dashboard =
+                settings.tlds.iter().any(|t| hostname == *t) || hostname == "porch.localhost";
+            let page = if dashboard {
+                *response.status_mut() = StatusCode::OK;
+                page(
+                    StatusCode::OK,
+                    "Your apps",
+                    &format!(
+                        "<p class=\"muted\">Every app Porch is serving on this computer.</p>{list}"
+                    ),
+                    "",
+                )
+            } else {
+                let body = format!(
+                    "<p>No app is registered for <code>{}</code>.</p><h2>Running apps</h2>{list}",
+                    escape(&hostname)
+                );
+                page(StatusCode::NOT_FOUND, "No app at this address", &body, "")
+            };
             *response.body_mut() = Full::new(Bytes::from(page))
                 .map_err(|e: Infallible| match e {})
                 .boxed_unsync();
