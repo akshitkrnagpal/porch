@@ -16,7 +16,7 @@ use std::{
     name = "porch",
     version,
     about = "Stable named URLs for local development",
-    long_about = "Stable named URLs for local development.\n\nPorch runs your dev command on a free port and serves it at a name you choose, such as http://web.localhost:7462. Run `porch` in a package or workspace root to start its dev script.",
+    long_about = "Stable named URLs for local development.\n\nPorch runs your dev command on a free port and serves it at a name you choose, such as http://web.localhost. Run `porch` in a package or workspace root to start its dev script.",
     after_help = "Examples:\n  porch                         Run this package's dev script (every package at a workspace root)\n  porch run pnpm dev            Run a command, naming the app after the package\n  porch api node server.js      Run a command as api.localhost\n  porch alias db 5432           Route db.localhost to an existing port\n  porch list                    Show routes and their health\n  porch setup                   Guided first run (HTTPS, port, start at login)\n  porch doctor --fix            Find and fix common problems\n\nDocs: https://github.com/akshitkrnagpal/porch/blob/main/docs/reference.md",
     disable_version_flag = true
 )]
@@ -87,7 +87,7 @@ struct App {
 }
 #[derive(Args, Debug, Default, Clone)]
 pub(crate) struct ProxyOptions {
-    /// Proxy port (default 7462; 80 or 443 drop the port from URLs but need sudo)
+    /// Proxy port (default 80, or 443 with HTTPS, when no sudo is needed; otherwise 7462)
     #[arg(short='p',long,value_parser=clap::value_parser!(u16).range(1..))]
     pub(crate) port: Option<u16>,
     /// Serve HTTPS and HTTP/2 with a local CA trusted for your user (no sudo)
@@ -1009,6 +1009,8 @@ pub(crate) async fn start_proxy(
     skip_trust: bool,
     port_explicit: bool,
 ) -> Result<()> {
+    // Starting clears a deliberate stop, so launchers watch over it again.
+    let _ = fs::remove_file(state::dir().join("proxy.stopped"));
     if restart_outdated_proxy().await? {
         return Ok(());
     }
@@ -1199,7 +1201,10 @@ pub(crate) async fn start_proxy(
         "{}",
         crate::style::dim(
             crate::style::Stream::Stderr,
-            &format!("Porch proxy ready on {}", s.url("app"))
+            &format!(
+                "Porch proxy ready on {}",
+                s.url("<name>").replace("<name>.", "*.")
+            )
         )
     );
     trust_if_needed(&s, skip_trust).await?;
@@ -1234,6 +1239,8 @@ async fn ensure_proxy() -> Result<ProxySettings> {
 }
 pub(crate) async fn stop_proxy() -> Result<()> {
     let _startup = startup_lock().await?;
+    // Tell running launchers this stop is deliberate, so they don't restart it.
+    let _ = state::atomic_write("proxy.stopped", b"1\n");
     if let Some(i) = proxy_identity() {
         if state::matches(&i) {
             #[cfg(unix)]
@@ -1411,6 +1418,16 @@ fn list(json: bool) -> Result<()> {
         println!("No active routes")
     } else {
         use crate::style::{self, Stream::Stdout};
+        if !proxy_running() {
+            println!(
+                "{} {}",
+                style::yellow(Stdout, "!"),
+                style::yellow(
+                    Stdout,
+                    "The proxy isn't running, so these URLs won't answer. Start it with `porch proxy start` (or launch an app)."
+                )
+            );
+        }
         let width = routes
             .iter()
             .map(|r| r["url"].as_str().unwrap_or("").len())
@@ -1993,11 +2010,55 @@ async fn spawn_prepared(
             );
         }
     }
+    // Keep the proxy up while this app runs: if it dies without a deliberate
+    // `porch proxy stop`, start it again with the saved settings.
+    let supervisor = p.lease.is_some().then(|| {
+        tokio::spawn(async {
+            let mut was_running = proxy_running();
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let running = proxy_running();
+                if was_running && !running && !state::dir().join("proxy.stopped").exists() {
+                    eprintln!("porch: the proxy stopped unexpectedly; restarting it");
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = tokio::process::Command::new(exe)
+                            .args(["proxy", "start"])
+                            .env("PORCH_SKIP_TRUST", "1")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .status()
+                            .await;
+                    }
+                }
+                was_running = proxy_running();
+            }
+        })
+    });
     let listen_check = p.port.filter(|_| p.lease.is_some()).map(|port| {
+        // The suggested rerun keeps this exact name (worktree prefix included).
+        let quote = |a: &str| {
+            if !a.is_empty()
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c))
+            {
+                a.to_owned()
+            } else {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            }
+        };
         tokio::spawn(crate::health::listen_check(
             port,
             id,
-            p.plan.command.join(" "),
+            format!(
+                "--name {} --prefix '' {}",
+                quote(&p.plan.name),
+                p.plan
+                    .command
+                    .iter()
+                    .map(|a| quote(a))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
         ))
     });
     // The child is reaped only at the end (see `process::wait_exit`): until
@@ -2005,6 +2066,9 @@ async fn spawn_prepared(
     // signals.
     let code = tokio::select! {status=crate::process::wait_exit(&mut child)=>child_status(status?),failure=share_failure(&mut p.shares)=>{signal_group(id,15);let _=tokio::time::timeout(Duration::from_secs(3),crate::process::wait_exit(&mut child)).await;failure?;bail!("sharing tunnel stopped")},changed=shutdown.changed()=>{changed?;let sig=(*shutdown.borrow()).unwrap_or(15);signal_group(id,sig);match tokio::time::timeout(Duration::from_secs(3),crate::process::wait_exit(&mut child)).await{Ok(r)=>{r?;},Err(_)=>{signal_group(id,9);crate::process::wait_exit(&mut child).await?;}}128+sig}};
     if let Some(task) = listen_check {
+        task.abort();
+    }
+    if let Some(task) = supervisor {
         task.abort();
     }
     let mut transferred = false;
