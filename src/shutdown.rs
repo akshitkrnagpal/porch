@@ -101,7 +101,7 @@ mod imp {
                 },
                 Threading::{
                     GetProcessTimes, OpenProcess, TerminateProcess,
-                    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+                    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
                 },
             },
         };
@@ -132,57 +132,83 @@ mod imp {
             let created = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
             Some((handle, created))
         }
+        /// (pid, recorded parent pid) of every process right now.
+        fn snapshot() -> Vec<(u32, u32)> {
+            let mut table = Vec::new();
+            unsafe {
+                let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                if snapshot != INVALID_HANDLE_VALUE {
+                    let mut entry = PROCESSENTRY32W {
+                        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                        ..Default::default()
+                    };
+                    let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+                    while more {
+                        table.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                        more = Process32NextW(snapshot, &mut entry) != 0;
+                    }
+                    CloseHandle(snapshot);
+                }
+            }
+            table
+        }
         if root == 0 {
             return;
         }
-        // (pid, recorded parent pid) of every process.
-        let mut table = Vec::new();
-        unsafe {
-            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snapshot != INVALID_HANDLE_VALUE {
-                let mut entry = PROCESSENTRY32W {
-                    dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-                    ..Default::default()
-                };
-                let mut more = Process32FirstW(snapshot, &mut entry) != 0;
-                while more {
-                    table.push((entry.th32ProcessID, entry.th32ParentProcessID));
-                    more = Process32NextW(snapshot, &mut entry) != 0;
-                }
-                CloseHandle(snapshot);
-            }
-        }
-        let Some(first) = open(root) else {
+        let Some((handle, created)) = open(root) else {
             return;
         };
-        let mut members = vec![(root, first.0)];
-        let mut todo = vec![(root, first.1)];
-        while let Some((parent, parent_created)) = todo.pop() {
-            for &(pid, recorded_parent) in &table {
-                if recorded_parent != parent
-                    || pid == parent
-                    || pid == 0
-                    || members.iter().any(|(m, _)| *m == pid)
-                {
-                    continue;
+        // Every member found so far, with its handle (which keeps its id from
+        // being reused) and creation time. Members before `ended` are gone.
+        let mut members = vec![(root, handle, created)];
+        let mut ended = 0;
+        // Rounds end when a snapshot finds no new member. The cap only guards
+        // against a member that cannot be ended yet keeps starting children.
+        for _ in 0..64 {
+            // End the members found last round and wait for them: a process
+            // that has exited cannot start another.
+            for &(_, handle, _) in &members[ended..] {
+                unsafe { TerminateProcess(handle, 1) };
+            }
+            for &(_, handle, _) in &members[ended..] {
+                // A watchdog only: termination completes unless the process
+                // is stuck in the kernel.
+                unsafe { WaitForSingleObject(handle, 10_000) };
+            }
+            ended = members.len();
+            // Children any member started before it ended, including after
+            // the previous snapshot. A child must be created after the parent
+            // it names; an older process naming a member's id lost its real
+            // parent long ago.
+            let table = snapshot();
+            let mut next = 0;
+            while next < members.len() {
+                let (parent, _, parent_created) = members[next];
+                next += 1;
+                for &(pid, recorded_parent) in &table {
+                    if recorded_parent != parent
+                        || pid == parent
+                        || pid == 0
+                        || members.iter().any(|(m, _, _)| *m == pid)
+                    {
+                        continue;
+                    }
+                    let Some((handle, created)) = open(pid) else {
+                        continue;
+                    };
+                    if created < parent_created {
+                        unsafe { CloseHandle(handle) };
+                        continue;
+                    }
+                    members.push((pid, handle, created));
                 }
-                let Some((handle, created)) = open(pid) else {
-                    continue;
-                };
-                if created < parent_created {
-                    // Its real parent exited long ago; the id was reused.
-                    unsafe { CloseHandle(handle) };
-                    continue;
-                }
-                members.push((pid, handle));
-                todo.push((pid, created));
+            }
+            if members.len() == ended {
+                break;
             }
         }
-        for (_, handle) in members {
-            unsafe {
-                TerminateProcess(handle, 1);
-                CloseHandle(handle);
-            }
+        for (_, handle, _) in members {
+            unsafe { CloseHandle(handle) };
         }
     }
 

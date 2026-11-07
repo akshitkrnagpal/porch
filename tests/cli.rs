@@ -313,6 +313,8 @@ fn daemon_remembers_settings_and_rejects_bind_failure() {
     {
         let deadline = Instant::now() + Duration::from_secs(240);
         while let Err(e) = listener.bind(&address) {
+            // Only "in use" is worth waiting out.
+            assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e}");
             assert!(
                 Instant::now() < deadline,
                 "port {} never freed: {e}",
