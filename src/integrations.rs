@@ -37,6 +37,10 @@ fn write_state(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
     crate::state::inherit_owner(path)?;
     Ok(())
 }
+/// Helper stdout beyond this is an error, never silently truncated (stderr is diagnostic
+/// only and may be capped): callers such as NSS
+/// cleanup infer absence from a complete listing.
+const COMMAND_OUTPUT_LIMIT: u64 = 32 * 1024 * 1024;
 fn command(program: &str, args: &[String]) -> Result<String> {
     let mut command = Command::new(program);
     command
@@ -58,7 +62,7 @@ fn command(program: &str, args: &[String]) -> Result<String> {
         std::thread::spawn(move || {
             let mut data = Vec::new();
             reader
-                .take(32 * 1024 * 1024)
+                .take(COMMAND_OUTPUT_LIMIT + 1)
                 .read_to_end(&mut data)
                 .map(|_| data)
         })
@@ -92,6 +96,9 @@ fn command(program: &str, args: &[String]) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("command stderr reader failed"))??;
     require_status(status)
         .with_context(|| format!("{program} failed: {}", String::from_utf8_lossy(&err)))?;
+    if out.len() as u64 > COMMAND_OUTPUT_LIMIT {
+        bail!("{program} produced more than {COMMAND_OUTPUT_LIMIT} bytes of output");
+    }
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 pub(crate) fn exec(program: &str, args: &[&str]) -> Result<String> {
@@ -804,49 +811,46 @@ fn find_program(name: &str) -> bool {
 fn trust_platform() -> String {
     std::env::var("PORCH_TRUST_PLATFORM").unwrap_or_else(|_| std::env::consts::OS.into())
 }
+/// DER of the first certificate in a PEM file, the same one `openssl x509 -in` reads.
+fn ca_der(ca: &Path) -> Result<Vec<u8>> {
+    let pem = fs::read(ca).with_context(|| format!("could not read {}", ca.display()))?;
+    let der = rustls_pemfile::certs(&mut std::io::BufReader::new(pem.as_slice()))
+        .next()
+        .with_context(|| format!("no PEM certificate in {}", ca.display()))?
+        .with_context(|| format!("invalid PEM certificate in {}", ca.display()))?;
+    Ok(der.to_vec())
+}
+/// Uppercase hex SHA-1 of the certificate DER, without separators. This is the
+/// format `openssl x509 -fingerprint -sha1` produced (minus colons) in Porch 0.3.x,
+/// so existing trust records keep matching.
 fn ca_fingerprint(ca: &Path) -> Result<String> {
-    let out = exec(
-        "openssl",
-        &[
-            "x509",
-            "-in",
-            &ca.to_string_lossy(),
-            "-noout",
-            "-fingerprint",
-            "-sha1",
-        ],
-    )?;
-    let fingerprint = out
-        .trim()
-        .split('=')
-        .next_back()
-        .unwrap_or("")
-        .replace(':', "");
-    if fingerprint.len() != 40 || !fingerprint.bytes().all(|c| c.is_ascii_hexdigit()) {
-        bail!("could not determine CA fingerprint");
-    }
-    Ok(fingerprint)
+    use sha1::Sha1;
+    let der = ca_der(ca)?;
+    Ok(Sha1::digest(&der)
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect())
 }
 fn verify_porch_ca(path: &Path) -> Result<()> {
-    let subject = exec(
-        "openssl",
-        &[
-            "x509",
-            "-in",
-            &path.to_string_lossy(),
-            "-noout",
-            "-subject",
-            "-nameopt",
-            "RFC2253",
-        ],
-    )?;
-    if !subject
-        .split(',')
-        .any(|part| part.trim().trim_start_matches("subject=").trim() == "CN=Porch Local CA")
+    let der = ca_der(path)?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&der)
+        .map_err(|e| anyhow::anyhow!("invalid CA certificate {}: {e}", path.display()))?;
+    if !cert
+        .subject()
+        .iter_common_name()
+        .any(|cn| cn.as_str() == Ok("Porch Local CA"))
     {
         bail!("refusing to alter trust for a certificate not issued as Porch Local CA");
     }
     Ok(())
+}
+/// Whether a successful `certutil -L -d <db>` listing contains `nickname`. Absence is
+/// only ever concluded from a full listing, never from a failed lookup's error text.
+fn nss_listing_has(listing: &str, nickname: &str) -> bool {
+    listing.lines().any(|line| {
+        line.strip_prefix(nickname)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace) && rest.trim().contains(','))
+    })
 }
 fn linux_ca_layout(os_release: &str) -> (&'static str, &'static str) {
     let os = os_release.to_lowercase();
@@ -1101,13 +1105,30 @@ fn untrust() -> Result<()> {
                 if !db.is_absolute() || !db.starts_with(&home) {
                     bail!("invalid recorded NSS database path; refusing removal");
                 }
-                if !db.is_dir() {
-                    continue;
+                match fs::metadata(db) {
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e).context(format!(
+                            "could not access NSS database {}; trust record kept for retry",
+                            db.display()
+                        )))
+                    }
                 }
                 let sql = format!("sql:{}", db.display());
-                // Only delete the nickname this fingerprint installed, and only where present.
-                if exec("certutil", &["-L", "-d", &sql, "-n", &name]).is_ok() {
-                    exec("certutil", &["-D", "-d", &sql, "-n", &name])?;
+                // Only delete the nickname this fingerprint installed, and only where a full
+                // listing shows it. Any certutil failure keeps the trust record for retry.
+                let listing = exec("certutil", &["-L", "-d", &sql]).with_context(|| {
+                    format!(
+                        "could not list {} to check for the Porch CA; trust record kept for retry",
+                        db.display()
+                    )
+                })?;
+                if nss_listing_has(&listing, &name) {
+                    exec("certutil", &["-D", "-d", &sql, "-n", &name]).with_context(|| {
+                        format!("could not remove Porch CA from {}", db.display())
+                    })?;
                 }
             }
         }
@@ -2486,7 +2507,6 @@ async fn doctor() -> Result<()> {
     );
     for (tool, flag) in [
         ("node", "--version"),
-        ("openssl", "version"),
         ("docker", "--version"),
         ("tailscale", "version"),
         ("ngrok", "version"),
@@ -2503,6 +2523,49 @@ async fn doctor() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn oversized_command_output_is_an_error() {
+        let n = (COMMAND_OUTPUT_LIMIT + 1).to_string();
+        let err = exec("head", &["-c", &n, "/dev/zero"]).unwrap_err();
+        assert!(err.to_string().contains("more than"), "{err:#}");
+        assert_eq!(exec("head", &["-c", "3", "/dev/zero"]).unwrap().len(), 3);
+    }
+    #[test]
+    fn ca_fingerprint_matches_openssl_format() {
+        // Pinned against `openssl x509 -noout -fingerprint -sha1` (colons stripped), the
+        // format trust.json records used through 0.3.x.
+        let ca = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/porch-ca.pem"
+        ));
+        assert_eq!(
+            ca_fingerprint(ca).unwrap(),
+            "8B7699335C1F0EDA581E025A5F45400A8BEF9354"
+        );
+        verify_porch_ca(ca).unwrap();
+        let other = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/other-ca.pem"
+        ));
+        assert!(verify_porch_ca(other).is_err());
+        let dir = std::env::temp_dir().join(format!("porch-ca-garbage-{}", std::process::id()));
+        fs::write(&dir, "not a certificate").unwrap();
+        assert!(ca_fingerprint(&dir).is_err());
+        assert!(verify_porch_ca(&dir).is_err());
+        let _ = fs::remove_file(&dir);
+    }
+    #[test]
+    fn nss_listing_matches_exact_nickname() {
+        let listing = "\nCertificate Nickname                                         Trust Attributes\n                                                             SSL,S/MIME,JAR/XPI\n\nPorch Local CA 8B7699335C1F                                  C,,\nPorch Local CA 8B7699335C1F0 other                           CT,C,C\n";
+        assert!(nss_listing_has(listing, "Porch Local CA 8B7699335C1F"));
+        assert!(!nss_listing_has(listing, "Porch Local CA 8B7699335C"));
+        assert!(!nss_listing_has(listing, "Porch Local CA ABCDEF012345"));
+        assert!(!nss_listing_has(
+            "\nCertificate Nickname                                         Trust Attributes\n                                                             SSL,S/MIME,JAR/XPI\n\n",
+            "Porch Local CA 8B7699335C1F"
+        ));
+    }
     #[test]
     fn hosts_preserve_unmanaged() {
         assert_eq!(
