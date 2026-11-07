@@ -78,6 +78,9 @@ struct RunOptions {
 struct App {
     #[command(flatten)]
     options: RunOptions,
+    /// Directory for routes, certificates and settings (default ~/.porch)
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
     /// Command to run and its arguments
     #[arg(trailing_var_arg=true,num_args=0..)]
     command: Vec<String>,
@@ -341,6 +344,9 @@ pub async fn run() -> Result<i32> {
     // --name explicitly bypasses reserved command dispatch.
     if leading_name(&raw) {
         let app = App::parse_from(std::iter::once("porch".to_string()).chain(raw));
+        if let Some(d) = &app.state_dir {
+            std::env::set_var("PORCH_STATE_DIR", d)
+        }
         return launch(app.options, app.command).await;
     }
     let (cli, extra) = if let Some(at) = bare_separator(&raw) {
@@ -387,11 +393,19 @@ pub async fn run() -> Result<i32> {
             }
             return launch_extra(options, vec![], extra).await;
         }
-        Some(Commands::Run(a)) => return launch(merge(options, a.options), a.command).await,
+        Some(Commands::Run(a)) => {
+            if let Some(d) = &a.state_dir {
+                std::env::set_var("PORCH_STATE_DIR", d)
+            }
+            return launch(merge(options, a.options), a.command).await;
+        }
         Some(Commands::SelfUpdate(a)) => return crate::update::run(a).await,
         Some(Commands::Named(mut args)) => {
             let name = args.remove(0);
             let a = App::parse_from(std::iter::once("porch".into()).chain(args));
+            if let Some(d) = &a.state_dir {
+                std::env::set_var("PORCH_STATE_DIR", d)
+            }
             let mut o = merge(options, a.options);
             o.name = Some(name);
             return launch(o, a.command).await;
@@ -568,22 +582,42 @@ pub async fn run() -> Result<i32> {
         Some(Commands::Workspace) => {
             let cwd = std::env::current_dir()?;
             let root = crate::config::find_workspace_root(&cwd).unwrap_or(cwd);
-            let packages = crate::config::discover_workspace_packages(&root);
-            if packages.is_empty() {
-                println!("No workspace packages found under {}", root.display());
-            }
-            for p in packages {
-                let rel = p.dir.strip_prefix(&root).unwrap_or(&p.dir);
-                let script = if p.scripts.get("dev").is_some() {
-                    "dev"
+            let plans = crate::config::launch_plans(
+                &root,
+                None,
+                options.name.as_deref(),
+                options.script.as_deref(),
+                options.prefix.as_deref(),
+            )?;
+            let p = resolve_settings(&ProxyOptions::default())?;
+            use crate::style::{self, Stream::Stdout};
+            let width = plans
+                .iter()
+                .map(|x| p.url(&x.name).len())
+                .max()
+                .unwrap_or(3);
+            println!(
+                "{}",
+                style::dim(Stdout, &format!("{:<width$}  {:<8} COMMAND", "URL", "DIR"))
+            );
+            for plan in plans {
+                let rel = plan.cwd.strip_prefix(&root).unwrap_or(&plan.cwd);
+                let rel = if rel.as_os_str().is_empty() {
+                    ".".to_owned()
                 } else {
-                    "-"
+                    rel.display().to_string()
+                };
+                let url = if plan.proxy {
+                    p.url(&plan.name)
+                } else {
+                    "(task, no URL)".to_owned()
                 };
                 println!(
-                    "{:<32} {:<6} {}",
-                    p.name.as_deref().unwrap_or("(unnamed)"),
-                    script,
-                    rel.display()
+                    "{}{}  {:<8} {}",
+                    style::url(Stdout, &url),
+                    " ".repeat(width.saturating_sub(url.len())),
+                    rel,
+                    style::dim(Stdout, &plan.command.join(" "))
                 );
             }
         }
@@ -1494,6 +1528,9 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
         let u = url::Url::parse(target).with_context(|| {
             format!("target {target:?} must be a port (3000) or a URL (http://127.0.0.1:3000)")
         })?;
+        if u.query().is_some() || u.fragment().is_some() {
+            bail!("target {target:?} can't have a query or fragment; Porch forwards each request's own path and query")
+        }
         if !["http", "https"].contains(&u.scheme()) || u.host_str().is_none() {
             bail!("target must be an HTTP URL or TCP port")
         }

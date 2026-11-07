@@ -1863,7 +1863,13 @@ fn compose_plan(
         if svc["network_mode"] == "host" {
             continue;
         }
-        let labels = svc.get("labels").cloned().unwrap_or(json!({}));
+        let mut labels = svc.get("labels").cloned().unwrap_or(json!({}));
+        // `porch.*` labels win over the Portless names they mirror.
+        for key in ["enable", "name", "ports"] {
+            if let Some(v) = labels.get(format!("porch.{key}")).cloned() {
+                labels[format!("portless.{key}")] = v;
+            }
+        }
         if labels["portless.enable"]
             .as_str()
             .is_some_and(|s| matches!(s.trim(), "0" | "false"))
@@ -2557,27 +2563,15 @@ async fn doctor() -> Result<()> {
                 ""
             }
         );
-        let target = if r.target.contains("://") {
-            r.target.clone()
-        } else {
-            format!("http://{}", r.target)
-        };
-        let listening = match url::Url::parse(&target) {
-            Ok(u) => match (u.host_str(), u.port_or_known_default()) {
-                (Some(h), Some(p)) => tokio::time::timeout(
-                    Duration::from_millis(500),
-                    tokio::net::TcpStream::connect((h.trim_matches(['[', ']']), p)),
-                )
+        let target = r.target.clone();
+        let listening =
+            tokio::task::spawn_blocking(move || crate::health::target_listening(&target))
                 .await
-                .is_ok_and(|c| c.is_ok()),
-                _ => false,
-            },
-            Err(_) => false,
-        };
+                .unwrap_or(false);
         if !resolves {
             bad(
                 &label,
-                &format!("{host} does not resolve on this computer; run `porch hosts sync`"),
+                &format!("{host} does not resolve on this computer; run `sudo porch hosts sync`"),
             );
         } else if !listening {
             println!(
@@ -2740,6 +2734,11 @@ mod tests {
             .get("published")
             .is_none());
         assert_eq!(model["services"]["db"]["ports"][0]["published"], "5432");
+        // porch.* labels work like (and win over) portless.* ones.
+        let source = json!({"name":"shop","services":{"web":{"labels":{"porch.name":"store","portless.name":"old"},"ports":[{"target":3000}]},"db":{"labels":{"porch.enable":"false"},"ports":[{"target":80}]}}});
+        let (_, routes) = compose_plan(source, &crate::state::ProxySettings::default()).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name, "store.shop");
     }
     #[test]
     fn tunnel_output_waits_for_cloudflare_connection() {
