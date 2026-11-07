@@ -5,7 +5,7 @@ Coding agents guess ports, test the wrong server and hardcode `localhost:3000`. 
 - **Skills** teach the agent how to use the `porch` CLI: start apps in the background, read URLs from `porch list --json`, fix common errors. Any agent with a shell can use them.
 - **The MCP server** (`porch mcp`) gives the agent tools to list routes, look up URLs and manage aliases without parsing CLI output.
 
-The MCP server can't start dev servers. Agents start them with `porch` in a shell, then use MCP or the CLI to find them.
+With the `apps` profile (`porch mcp --tools core,apps`), agents start dev servers themselves through the `run` tool, which runs `porch run --detach` and returns the URL once the app answers, then read output with `logs` and end it with `stop`. Without it, start apps with `porch run` in a shell and use MCP to find them.
 
 ## Install the skills
 

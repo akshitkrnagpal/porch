@@ -190,7 +190,7 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
     validate(n, a)?;
     if n == "tools_profiles" {
         return Ok(tool_result(
-            json!({"activeProfiles":p,"availableProfiles":["core","proxy","diagnostics","readonly","all"]}),
+            json!({"activeProfiles":p,"availableProfiles":["core","proxy","diagnostics","readonly","apps","all"]}),
             false,
         ));
     }

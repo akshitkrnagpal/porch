@@ -932,6 +932,11 @@ fn detached_runs_answer_log_and_stop() {
     assert_eq!(list["routes"][0]["health"], "ok", "{list}");
     let logs = s.ok(&["logs", "bg"]);
     assert!(logs.contains("hello from bg"), "{logs}");
+    // A second copy is refused without touching the running one or its log.
+    let again = s.run(&["run", "--detach", "--name", "bg", "python3", "-c", "pass"]);
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already running"));
+    assert!(s.ok(&["logs", "bg"]).contains("hello from bg"));
     assert!(s.ok(&["stop", "bg"]).contains("Stopped"));
     let list: serde_json::Value = serde_json::from_str(&s.ok(&["list", "--json"])).unwrap();
     assert!(list["routes"].as_array().unwrap().is_empty(), "{list}");

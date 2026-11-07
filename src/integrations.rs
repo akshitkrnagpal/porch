@@ -964,6 +964,11 @@ fn trust(system: bool) -> Result<()> {
     }
     verify_porch_ca(&ca)?;
     let fingerprint = ca_fingerprint(&ca)?;
+    // A new CA replaced the trusted one (the domains changed): remove the old
+    // CA's trust first, so no retired root stays trusted.
+    if trust_record()?.is_some_and(|r| r.fingerprint != fingerprint) {
+        untrust().context("couldn't remove trust for the previous Porch CA; trust record kept, run `porch trust` again")?;
+    }
     if let Some(existing) = trust_record()? {
         if existing.scope == "system" && !system && existing.fingerprint == fingerprint {
             println!("Porch local CA is already trusted system-wide");
@@ -1121,14 +1126,32 @@ fn untrust() -> Result<()> {
     let Some(r) = trust_record()? else {
         return Ok(());
     };
-    let ca = crate::state::dir().join("ca.pem");
-    verify_porch_ca(&ca)?;
-    if r.fingerprint.len() != 40
-        || !r.fingerprint.bytes().all(|c| c.is_ascii_hexdigit())
-        || ca_fingerprint(&ca)? != r.fingerprint
-    {
-        bail!("recorded trust fingerprint does not match the Porch CA; certificate retained");
+    if r.fingerprint.len() != 40 || !r.fingerprint.bytes().all(|c| c.is_ascii_hexdigit()) {
+        bail!("invalid recorded trust fingerprint; certificate retained");
     }
+    // The trusted CA may be the current one or one retired when the domains
+    // changed (`ca.pem.retired-*`): find the file with the recorded fingerprint.
+    let dir = crate::state::dir();
+    let mut candidates = vec![dir.join("ca.pem")];
+    if let Ok(entries) = fs::read_dir(&dir) {
+        candidates.extend(
+            entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("ca.pem.retired-")
+                })
+                .map(|e| e.path()),
+        );
+    }
+    let Some(ca) = candidates
+        .into_iter()
+        .find(|c| ca_fingerprint(c).is_ok_and(|f| f == r.fingerprint))
+    else {
+        bail!("recorded trust fingerprint does not match any Porch CA; certificate retained");
+    };
+    verify_porch_ca(&ca)?;
     if r.update
         .as_ref()
         .is_some_and(|s| !matches!(s.as_str(), "update-ca-certificates" | "update-ca-trust"))

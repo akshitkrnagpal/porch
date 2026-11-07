@@ -2319,7 +2319,21 @@ async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
         .collect();
     let log_name = names.first().cloned().unwrap_or_else(|| "workspace".into());
     let log = log_path(&log_name);
-    state::load()?;
+    // Refuse a second copy up front, before touching the running one's log.
+    if !options.force {
+        let s = state::load()?;
+        let p = resolve_settings(&ProxyOptions::default())?;
+        for n in &names {
+            if let Some(r) = s.routes.iter().find(|r| &r.name == n) {
+                if state::route_alive(&s, r) {
+                    bail!(
+                        "{} is already running; see `porch logs {n}`, stop it with `porch stop {n}`, or replace it with --force",
+                        p.url(n)
+                    );
+                }
+            }
+        }
+    }
     fs::create_dir_all(log.parent().unwrap())?;
     let out = fs::File::create(&log)?;
     let mut child = Command::new(std::env::current_exe()?);
@@ -2347,7 +2361,7 @@ async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
         child.creation_flags(0x0000_0008 | 0x0000_0200);
     }
     let mut child = child.spawn().context("starting the background launcher")?;
-    let settings = resolve_settings(&ProxyOptions::default())?;
+    let launcher = child.id();
     let timeout = crate::health::listen_timeout().max(Duration::from_secs(5));
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -2363,12 +2377,14 @@ async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
             );
         }
         let s = state::load()?;
+        // Ready only when *our* launcher owns each route and its app answers.
         let ready = !names.is_empty()
             && names.iter().all(|n| {
-                s.routes
-                    .iter()
-                    .find(|r| &r.name == n)
-                    .is_some_and(|r| crate::health::target_listening(&r.target))
+                s.owners.get(n).is_some_and(|o| o.pid == launcher)
+                    && s.routes
+                        .iter()
+                        .find(|r| &r.name == n)
+                        .is_some_and(|r| crate::health::target_listening(&r.target))
             });
         if ready || names.is_empty() {
             break;
@@ -2382,6 +2398,8 @@ async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    // Read the settings now: the proxy may have moved off a busy port.
+    let settings = state::proxy_settings()?;
     use crate::style::{self, Stream::Stdout};
     for n in &names {
         println!("{}", style::url(Stdout, &settings.url(n)));

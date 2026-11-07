@@ -32,11 +32,21 @@ impl tower_service::Service<Uri> for ToLoopback {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let https = uri.scheme_str() == Some("https");
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-        // Plain TCP to loopback: the TLS layer wraps this stream itself.
-        let local: Uri = format!("http://127.0.0.1:{port}")
+        // Plain TCP to loopback, IPv4 first and then IPv6 (an app may listen
+        // on only one); the TLS layer wraps this stream itself.
+        let v4: Uri = format!("http://127.0.0.1:{port}")
             .parse()
             .expect("loopback URI");
-        Box::pin(self.0.call(local))
+        let v6: Uri = format!("http://[::1]:{port}")
+            .parse()
+            .expect("loopback URI");
+        let mut connector = self.0.clone();
+        Box::pin(async move {
+            match connector.call(v4).await {
+                Ok(stream) => Ok(stream),
+                Err(_) => connector.call(v6).await,
+            }
+        })
     }
 }
 
@@ -258,6 +268,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ipv6_only_backends_are_reached() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return; // no IPv6 loopback here
+        };
+        let port = listener.local_addr().unwrap().port();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+            return; // something else holds the IPv4 side
+        }
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf).await;
+            let _ = s
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nv6")
+                .await;
+        });
+        let up = Upstream {
+            tls: false,
+            authority: Some("backend.internal".into()),
+            insecure: false,
+        };
+        let (uri, host) = request(&up, port, "/");
+        let c: LoopbackClient<http_body_util::Empty<bytes::Bytes>> = client(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth(),
+        );
+        let req = hyper::Request::builder()
+            .uri(uri)
+            .header("host", host.unwrap())
+            .body(http_body_util::Empty::new())
+            .unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(5), c.request(req))
+            .await
+            .unwrap()
+            .unwrap();
+        use http_body_util::BodyExt;
+        assert_eq!(
+            &resp.into_body().collect().await.unwrap().to_bytes()[..],
+            b"v6"
+        );
+    }
     #[tokio::test]
     async fn ip_literal_authority_still_dials_loopback() {
         // A backend on loopback answers; the alias names a non-loopback IP.

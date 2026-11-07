@@ -1117,3 +1117,65 @@ fn linux_user_trust_cleanup_keeps_record_for_inaccessible_db() {
     assert!(err.contains("could not access NSS database"), "{err}");
     assert!(s.dir.join("state/trust.json").exists());
 }
+
+#[test]
+fn a_rotated_ca_loses_its_trust_when_the_new_one_is_trusted() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = Sandbox::new();
+    s.fake("security", "");
+    write_ca(&s);
+    let trust = |s: &Sandbox| {
+        let out = s
+            .cmd()
+            .env_remove("PORCH_TRUST_DIR")
+            .env("PORCH_TRUST_PLATFORM", "macos")
+            .args(["trust"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    trust(&s);
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(s.dir.join("state/trust.json")).unwrap()).unwrap();
+    let old = record["fingerprint"].as_str().unwrap().to_owned();
+    // The domains changed: the old CA is retired beside a new one.
+    fs::rename(
+        s.dir.join("state/ca.pem"),
+        s.dir.join("state/ca.pem.retired-1"),
+    )
+    .unwrap();
+    let made = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=Porch Local CA",
+            "-keyout",
+        ])
+        .arg(s.dir.join("state/ca-key.pem"))
+        .arg("-out")
+        .arg(s.dir.join("state/ca.pem"))
+        .output();
+    if !made.is_ok_and(|o| o.status.success()) {
+        eprintln!("skipping: openssl unavailable");
+        return;
+    }
+    trust(&s);
+    let log = s.log();
+    assert!(
+        log.contains("delete-certificate") && log.contains(&old),
+        "the retired CA's trust must be removed: {log}"
+    );
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(s.dir.join("state/trust.json")).unwrap()).unwrap();
+    assert_ne!(record["fingerprint"].as_str().unwrap(), old);
+}

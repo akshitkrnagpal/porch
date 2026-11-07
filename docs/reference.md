@@ -202,7 +202,7 @@ Interactive commands check for a new release at most once a day, in the backgrou
 
 ## MCP
 
-`porch mcp [--tools core,proxy,diagnostics,readonly,all]` runs an MCP server over stdio (newline-delimited JSON-RPC). `default` is the same as `core`, and `full` the same as `all`. `core` lists and looks up routes, manages static aliases and reports which tool profiles are active; `proxy` adds start and stop; `diagnostics` adds doctor, doctor_fix, prune and version; `readonly` offers only tools that change nothing. Read-only tools reject `extraArgs` that would change state. The server can't start dev servers or run foreground commands. Tools accept `cwd`, `extraArgs` and `timeoutMs`, plus route and proxy options where they apply. Stdout carries only protocol messages.
+`porch mcp [--tools core,proxy,diagnostics,readonly,apps,all]` runs an MCP server over stdio (newline-delimited JSON-RPC). `default` is the same as `core`, and `full` the same as `all`. `core` lists and looks up routes, manages static aliases and reports which tool profiles are active; `proxy` adds start and stop; `diagnostics` adds doctor, doctor_fix, prune and version; `readonly` offers only tools that change nothing. Only `list` and `get` take `extraArgs`, limited to their read-only flags. `apps` adds `run`, `stop` and `logs`, which start dev servers in the background (`porch run --detach`) and manage them; nothing runs in the foreground over MCP. Tools accept `cwd` and `timeoutMs`, plus typed route and proxy options where they apply. Stdout carries only protocol messages.
 
 ## Machines and the tray
 
