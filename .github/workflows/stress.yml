@@ -1,0 +1,62 @@
+name: Stress (temporary)
+# TEMPORARY: repeats the test suite to show it is deterministic. Removed
+# before merge.
+on:
+  push:
+    branches: [fix/flaky-tests]
+permissions:
+  contents: read
+jobs:
+  stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+        shard: [1, 2, 3]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      PORCH_TEST_TURBO_REQUIRED: ${{ matrix.os != 'windows-2025' && '1' || '' }}
+      ROUNDS: 8
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: npm install --global turbo@2.6.3
+      - name: Build test binaries (release, like the release workflow)
+        shell: bash
+        run: |
+          cargo test --release --all-targets --no-run --message-format=json \
+            | jq -r 'select(.profile.test==true) | .executable' > bins.txt
+          cat bins.txt
+      - name: Repeat the suite with two concurrent loops for extra load
+        shell: bash
+        run: |
+          loop() {
+            local fails=0
+            for round in $(seq "$ROUNDS"); do
+              for bin in $(cat bins.txt); do
+                if ! out=$("$bin" 2>&1); then
+                  fails=$((fails + 1))
+                  echo "::error::loop $1 round $round $(basename "$bin") failed"
+                  echo "$out" | tail -80
+                fi
+              done
+            done
+            echo "loop $1: $ROUNDS rounds, $fails failing binaries"
+            return $fails
+          }
+          loop a & a=$!
+          loop b & b=$!
+          status=0
+          wait $a || status=1
+          wait $b || status=1
+          exit $status
