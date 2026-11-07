@@ -1,3 +1,4 @@
+#[cfg(unix)]
 mod common;
 use porch::config::*;
 use serde_json::json;
