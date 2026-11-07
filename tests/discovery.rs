@@ -474,6 +474,11 @@ async fn code_pairing_is_mutual_and_apps_open_at_readable_urls_with_websockets()
         "{}",
         String::from_utf8_lossy(&rejected.stderr)
     );
+    // A failed join leaves this machine's sharing as it was: off.
+    let status: Value =
+        serde_json::from_str(&ok(&a, &["discovery", "status", "--json"]).await).unwrap();
+    assert_eq!(status["running"], false, "{status}");
+    assert!(status["config"].is_null(), "{status}");
     let args = join(&code);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let joined = ok(&a, &args).await;
@@ -546,8 +551,10 @@ async fn code_pairing_is_mutual_and_apps_open_at_readable_urls_with_websockets()
     assert_eq!(again, url_b);
     assert!(get(again.trim()).await.starts_with("machine-B:"));
     // Unpair forgets both directions in one command.
-    let unpaired = ok(&a, &["unpair", "node-b"]).await;
-    assert_eq!(unpaired.trim(), "Unpaired node-b");
+    let unpaired: Value =
+        serde_json::from_str(&ok(&a, &["unpair", "node-b", "--json"]).await).unwrap();
+    assert_eq!(unpaired["machine"]["name"], "node-b");
+    assert_eq!(unpaired["reached"], true);
     let left: Snapshot = serde_json::from_str(&ok(&a, &["list", "--all", "--json"]).await).unwrap();
     assert!(left.peers.is_empty());
     let right: Snapshot =
@@ -603,13 +610,121 @@ async fn five_wrong_codes_close_pairing_for_everyone() {
     .await;
     assert!(!late.status.success(), "right code after lockout must fail");
     assert!(
-        String::from_utf8_lossy(&late.stderr).contains("no machine is showing a pairing code"),
+        String::from_utf8_lossy(&late.stderr).contains("no longer waiting"),
         "{}",
         String::from_utf8_lossy(&late.stderr)
     );
     let peers: Snapshot =
         serde_json::from_str(&ok(&a, &["list", "--all", "--json"]).await).unwrap();
     assert!(peers.peers.is_empty());
+    for t in tasks {
+        t.abort();
+    }
+}
+#[tokio::test]
+async fn shown_codes_report_status_and_cancel_for_the_tray() {
+    let (a, b, _pa, _pb, _nodes, tasks) = setup("status").await;
+    let agent_a = free_port().to_string();
+    let agent_b = free_port().to_string();
+    let host = format!("127.0.0.1:{agent_b}");
+    let shown: Value = serde_json::from_str(
+        &ok(
+            &b,
+            &[
+                "pair",
+                "--no-wait",
+                "--json",
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                &agent_b,
+            ],
+        )
+        .await,
+    )
+    .unwrap();
+    let id = shown["id"].as_str().expect("id for pair status").to_owned();
+    let code = shown["code"].as_str().unwrap().to_owned();
+    let expires_in = shown["expires_in"].as_u64().unwrap();
+    assert!((290..=300).contains(&expires_in), "{shown}");
+    let status = |dir: PathBuf, id: String| async move {
+        serde_json::from_str::<Value>(&ok(&dir, &["pair", "status", &id, "--json"]).await).unwrap()
+    };
+    let waiting = status(b.clone(), id.clone()).await;
+    assert_eq!(waiting["state"], "waiting");
+    assert!(waiting["expires_in"].as_u64().unwrap() <= expires_in);
+    // A wrong code comes back as a structured, retryable error.
+    let wrong = if code == "000000" { "111111" } else { "000000" };
+    let join = |code: &str| {
+        let host = host.clone();
+        let agent_a = agent_a.clone();
+        let a = a.clone();
+        let code = code.to_owned();
+        async move {
+            command(
+                &a,
+                &[
+                    "pair",
+                    &code,
+                    "--host",
+                    &host,
+                    "--bind",
+                    "127.0.0.1",
+                    "--port",
+                    &agent_a,
+                    "--json",
+                ],
+                None,
+            )
+            .await
+        }
+    };
+    let out = join(wrong).await;
+    assert!(!out.status.success());
+    let error: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "wrong_code", "{error}");
+    assert_eq!(error["error"]["retry"], true);
+    let cancelled: Value =
+        serde_json::from_str(&ok(&b, &["pair", "cancel", &id, "--json"]).await).unwrap();
+    assert_eq!(cancelled["state"], "cancelled");
+    assert_eq!(cancelled["reason"], "user");
+    // Idempotent.
+    let again: Value =
+        serde_json::from_str(&ok(&b, &["pair", "cancel", &id, "--json"]).await).unwrap();
+    assert_eq!(again["state"], "cancelled");
+    assert_eq!(status(b.clone(), id.clone()).await["state"], "cancelled");
+    let out = join(&code).await;
+    assert!(!out.status.success(), "cancelled code must not work");
+    let error: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "not_waiting", "{error}");
+    // A new code replaces the old one; it pairs, and the host sees it confirmed.
+    let shown: Value = serde_json::from_str(
+        &ok(
+            &b,
+            &[
+                "pair",
+                "--no-wait",
+                "--json",
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                &agent_b,
+            ],
+        )
+        .await,
+    )
+    .unwrap();
+    let id2 = shown["id"].as_str().unwrap().to_owned();
+    assert_eq!(status(b.clone(), id.clone()).await["state"], "cancelled");
+    let out = join(shown["code"].as_str().unwrap()).await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let paired = status(b.clone(), id2).await;
+    assert_eq!(paired["state"], "paired", "{paired}");
+    assert_eq!(paired["peer"]["name"], "node-a");
     for t in tasks {
         t.abort();
     }

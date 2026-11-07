@@ -111,22 +111,98 @@ fn endpoint_ip(endpoint: &str) -> Option<IpAddr> {
     }
 }
 
+/// A `porch pair CODE` failure with the message the tray shows for it.
+pub fn failure(code: &str) -> JoinFailure {
+    let (code, message, retry) = match code {
+        "wrong_code" => (
+            code,
+            "That code didn't work. Check the code on the other machine.",
+            true,
+        ),
+        "not_waiting" => (
+            code,
+            "That machine is no longer waiting. Show a new code there.",
+            false,
+        ),
+        "rate_limited" => (
+            code,
+            "Too many attempts. Wait a minute and try again.",
+            false,
+        ),
+        "certificate_mismatch" => (
+            code,
+            "The other machine's identity could not be verified. Pairing stopped.",
+            false,
+        ),
+        "host_full" => (
+            code,
+            "The other machine couldn't save this pairing. Remove an unused machine there.",
+            false,
+        ),
+        "no_host" => (
+            code,
+            "No machine is showing a code. Show one there first, or enter its address.",
+            true,
+        ),
+        "multiple_hosts" => (
+            code,
+            "More than one machine is waiting. Pick one under Found nearby.",
+            true,
+        ),
+        "unreachable" => (
+            code,
+            "Couldn't reach that machine. Check it's on the same network or Tailscale.",
+            true,
+        ),
+        "invalid_code" => (
+            code,
+            "A pairing code is the 6 digits shown on the other machine.",
+            true,
+        ),
+        "local" => (code, "This machine could not get ready to pair.", false),
+        _ => (
+            "protocol",
+            "Pairing could not be confirmed. Check Paired machines on both sides before retrying.",
+            false,
+        ),
+    };
+    JoinFailure {
+        code: code.into(),
+        message: message.into(),
+        retry,
+        candidates: vec![],
+        detail: None,
+    }
+}
+fn fail(code: &str, detail: impl Into<String>) -> anyhow::Error {
+    let detail = detail.into();
+    JoinFailure {
+        detail: (!detail.is_empty()).then_some(detail),
+        ..failure(code)
+    }
+    .into()
+}
+
 /// Where to look for the machine showing the code: an explicit `--host`
 /// (IP, IP:port, DNS/MagicDNS name or a discovered machine name), otherwise
 /// every LAN (mDNS) and Tailscale hint.
-async fn candidate_endpoints(host: Option<&str>, port: u16) -> Result<Vec<(String, Source)>> {
-    let mut out: Vec<(String, Source)> = Vec::new();
-    fn push(out: &mut Vec<(String, Source)>, endpoint: Option<String>, source: Source) {
-        if let Some(e) = endpoint {
-            if !out.iter().any(|(x, _)| *x == e) {
-                out.push((e, source));
+async fn candidate_endpoints(host: Option<&str>, port: u16) -> Result<Vec<JoinCandidate>> {
+    let mut out: Vec<JoinCandidate> = Vec::new();
+    fn push(out: &mut Vec<JoinCandidate>, endpoint: Option<String>, source: Source, name: &str) {
+        if let Some(endpoint) = endpoint {
+            if !out.iter().any(|x| x.endpoint == endpoint) {
+                out.push(JoinCandidate {
+                    name: name.into(),
+                    endpoint,
+                    source,
+                });
             }
         }
     }
     let Some(host) = host else {
         let (candidates, warnings) = client::collect_candidates(true).await?;
         for c in candidates {
-            push(&mut out, Some(c.endpoint), c.source);
+            push(&mut out, Some(c.endpoint), c.source, &c.name);
         }
         if out.is_empty() {
             for w in warnings {
@@ -141,9 +217,10 @@ async fn candidate_endpoints(host: Option<&str>, port: u16) -> Result<Vec<(Strin
             &mut out,
             client::endpoint(addr.ip(), addr.port()),
             Source::Explicit,
+            host,
         );
     } else if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
-        push(&mut out, client::endpoint(ip, port), Source::Explicit);
+        push(&mut out, client::endpoint(ip, port), Source::Explicit, host);
     } else {
         let (name, port) = match host.rsplit_once(':') {
             Some((n, p)) if p.parse::<u16>().is_ok() => (n, p.parse().unwrap_or(port)),
@@ -160,6 +237,7 @@ async fn candidate_endpoints(host: Option<&str>, port: u16) -> Result<Vec<(Strin
                     &mut out,
                     client::endpoint(a.ip(), a.port()),
                     Source::Explicit,
+                    name,
                 );
             }
         }
@@ -170,12 +248,15 @@ async fn candidate_endpoints(host: Option<&str>, port: u16) -> Result<Vec<(Strin
                 .into_iter()
                 .filter(|c| c.name.eq_ignore_ascii_case(name) || client::slug(&c.name) == wanted)
             {
-                push(&mut out, Some(c.endpoint), c.source);
+                push(&mut out, Some(c.endpoint), c.source, &c.name);
             }
         }
     }
     if out.is_empty() {
-        bail!("{host} did not resolve to a private LAN, Tailscale or loopback address")
+        return Err(fail(
+            "unreachable",
+            format!("{host} did not resolve to a private LAN, Tailscale or loopback address"),
+        ));
     }
     Ok(out)
 }
@@ -204,6 +285,44 @@ async fn ensure_agent(bind: Option<&str>, port: u16, peer: Option<IpAddr>) -> Re
     super::enable(config.clone()).await?;
     Ok(config)
 }
+/// Sharing as it was before a join turned it on, so a failed join can put it back.
+struct Sharing {
+    running: bool,
+    config: Option<ServerConfig>,
+}
+impl Sharing {
+    fn capture() -> Self {
+        Self {
+            running: super::running(),
+            config: server::config().ok().flatten(),
+        }
+    }
+    async fn restore(self) -> Result<()> {
+        if self.running {
+            if self.config.is_some_and(|c| !c.share_apps) {
+                server::set_share_apps(false)?;
+            }
+            return Ok(());
+        }
+        if super::running() {
+            super::stop_agent().await?;
+        }
+        match self.config {
+            Some(config) => {
+                if server::config()?.is_some_and(|now| {
+                    now.bind != config.bind
+                        || now.port != config.port
+                        || now.advertise != config.advertise
+                        || now.share_apps != config.share_apps
+                }) {
+                    server::configure(config)?;
+                }
+            }
+            None => server::disable()?,
+        }
+        Ok(())
+    }
+}
 
 pub struct Shown {
     pub id: String,
@@ -225,17 +344,42 @@ pub async fn show(bind: Option<&str>, port: u16) -> Result<Shown> {
         endpoint: client::endpoint(ip, config.port).unwrap_or_default(),
     })
 }
+/// How long the host waits for an accepted peer's first authenticated request.
+pub const CONFIRM_GRACE: Duration = Duration::from_secs(60);
+pub enum Waited {
+    /// The other machine stored the pairing and has connected.
+    Paired(String),
+    /// The code was accepted but the other machine has not connected yet.
+    Unconfirmed(String),
+}
 /// Block until the window opened by `show` pairs, closes, or Ctrl-C.
-pub async fn wait(id: &str) -> Result<String> {
+pub async fn wait(id: &str) -> Result<Waited> {
     let poll = async {
+        let mut accepted: Option<std::time::Instant> = None;
         loop {
-            match server::pairing_progress(id)? {
-                server::PairingProgress::Waiting => {
-                    tokio::time::sleep(Duration::from_millis(200)).await
+            let progress = server::pairing_progress(id)?;
+            let name = || {
+                progress
+                    .peer
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default()
+            };
+            match progress.state {
+                PairState::Waiting => {}
+                PairState::Accepted => {
+                    if accepted
+                        .get_or_insert_with(std::time::Instant::now)
+                        .elapsed()
+                        >= CONFIRM_GRACE
+                    {
+                        return Ok(Waited::Unconfirmed(name()));
+                    }
                 }
-                server::PairingProgress::Paired(name) => return Ok(name),
-                server::PairingProgress::Closed(reason) => bail!("{reason}"),
+                PairState::Paired => return Ok(Waited::Paired(name())),
+                _ => bail!("{}", progress.message()),
             }
+            tokio::time::sleep(Duration::from_millis(200)).await
         }
     };
     tokio::select! {
@@ -246,6 +390,28 @@ pub async fn wait(id: &str) -> Result<String> {
         }
     }
 }
+/// `porch pair status ID`.
+pub fn status(id: &str) -> Result<PairStatusReport> {
+    Ok(report(id, server::pairing_progress(id)?))
+}
+/// `porch pair cancel ID`.
+pub fn cancel(id: &str) -> Result<PairStatusReport> {
+    Ok(report(id, server::close_pairing(id)?))
+}
+fn report(id: &str, progress: server::PairingProgress) -> PairStatusReport {
+    PairStatusReport {
+        version: PROTOCOL_VERSION,
+        id: id.into(),
+        state: progress.state,
+        reason: progress.reason,
+        expires: progress.expires,
+        expires_in: progress
+            .expires
+            .filter(|_| progress.state == PairState::Waiting)
+            .map(|e| e.saturating_sub(server::now())),
+        peer: progress.peer,
+    }
+}
 
 fn normalize_code(code: &str) -> Result<String> {
     let code: String = code
@@ -253,12 +419,17 @@ fn normalize_code(code: &str) -> Result<String> {
         .filter(|c| !c.is_whitespace() && *c != '-')
         .collect();
     if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
-        bail!("a pairing code is the 6 digits shown by `porch pair` on the other machine")
+        return Err(fail(
+            "invalid_code",
+            "enter the 6 digits shown by `porch pair` on the other machine",
+        ));
     }
     Ok(code)
 }
 
-/// Joining side: find the machine showing `code`, pair with it in both directions.
+/// Joining side: find the one machine showing a code and pair with it in both
+/// directions. The code is a secret, so it is sent to at most one machine:
+/// several waiting machines without `--host` is an error, not a race.
 pub async fn join(code: &str, host: Option<&str>, bind: Option<&str>, port: u16) -> Result<Peer> {
     let code = normalize_code(code)?;
     let candidates = candidate_endpoints(host, port).await?;
@@ -270,37 +441,112 @@ pub async fn join(code: &str, host: Option<&str>, bind: Option<&str>, port: u16)
     let probes = futures_util::future::join_all(
         candidates
             .iter()
-            .map(|(endpoint, _)| async move { probe(endpoint).await.ok().flatten() }),
+            .map(|c| async move { probe(&c.endpoint).await.map_err(|e| format!("{e:#}")) }),
     )
     .await;
-    let mut open: Vec<(String, Source, String)> = Vec::new();
-    for ((endpoint, source), pin) in candidates.into_iter().zip(probes) {
-        let Some(pin) = pin else { continue };
+    let (target, pin) = select_target(
+        candidates.into_iter().zip(probes).collect(),
+        own.as_deref(),
+        host,
+    )?;
+    let before = Sharing::capture();
+    match join_one(&code, &target.endpoint, target.source, &pin, bind, port).await {
+        Ok(peer) => Ok(peer),
+        Err(e) => {
+            // A failed join must not leave app sharing on as a side effect.
+            if let Err(r) = before.restore().await {
+                eprintln!("Porch: could not restore sharing settings: {r:#}");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Choose the one machine to send the code to from probe results (its
+/// certificate pin when showing a code, `None` when not, or why it failed).
+fn select_target(
+    probed: Vec<(JoinCandidate, std::result::Result<Option<String>, String>)>,
+    own: Option<&str>,
+    host: Option<&str>,
+) -> Result<(JoinCandidate, String)> {
+    let mut open: Vec<(JoinCandidate, String)> = Vec::new();
+    let mut reachable = false;
+    let mut last_error = None;
+    for (candidate, result) in probed {
+        let pin = match result {
+            Ok(Some(pin)) => pin,
+            Ok(None) => {
+                reachable = true;
+                continue;
+            }
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        };
         // One machine reachable over LAN and tailnet presents one certificate.
-        if own.as_ref() == Some(&pin) || open.iter().any(|(_, _, p)| *p == pin) {
+        if own == Some(pin.as_str()) || open.iter().any(|(_, p)| *p == pin) {
+            reachable = true;
             continue;
         }
-        open.push((endpoint, source, pin));
+        open.push((candidate, pin));
     }
-    if open.is_empty() {
-        bail!(
-            "no machine is showing a pairing code{}. Run `porch pair` on the other machine first{}",
-            host.map(|h| format!(" at {h}")).unwrap_or_default(),
-            if host.is_some() {
-                ""
-            } else {
-                ", or pass --host NAME-OR-IP if it is not discovered automatically"
-            }
-        )
-    }
-    let mut errors = Vec::new();
-    for (endpoint, source, pin) in open {
-        match join_one(&code, &endpoint, source, &pin, bind, port).await {
-            Ok(peer) => return Ok(peer),
-            Err(e) => errors.push(format!("{e:#}")),
+    match open.len() {
+        1 => Ok(open.remove(0)),
+        0 if host.is_none() => Err(fail(
+            "no_host",
+            "run `porch pair` on the other machine first, or pass --host NAME-OR-IP",
+        )),
+        0 if reachable => Err(fail(
+            "not_waiting",
+            format!(
+                "{} is not showing a pairing code; run porch pair on it",
+                host.unwrap_or_default()
+            ),
+        )),
+        0 => Err(fail("unreachable", last_error.unwrap_or_default())),
+        _ => Err(JoinFailure {
+            candidates: open.into_iter().map(|(c, _)| c).collect(),
+            detail: Some("choose one with --host NAME-OR-IP".into()),
+            ..failure("multiple_hosts")
         }
+        .into()),
     }
-    bail!("{}", errors.join("; "))
+}
+
+/// Map a refused `/v1/pair-code` response. Status first: older agents send plain text.
+async fn refused(response: reqwest::Response) -> anyhow::Error {
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let structured = serde_json::from_str::<PairCodeError>(&text).ok();
+    let detail: String = match &structured {
+        Some(e) => e.error.message.clone(),
+        None => text,
+    }
+    .chars()
+    .filter(|c| !c.is_control())
+    .take(200)
+    .collect();
+    let code = match status.as_u16() {
+        401 => "wrong_code",
+        410 => "not_waiting",
+        429 => "rate_limited",
+        409 => match structured.as_ref().map(|e| e.error.code.as_str()) {
+            Some("host_full") => "host_full",
+            None if !detail.contains("certificate") => "host_full",
+            // Anything else about the host's identity stops pairing, no bypass.
+            _ => "certificate_mismatch",
+        },
+        _ => "protocol",
+    };
+    fail(
+        code,
+        if detail.is_empty() {
+            status.to_string()
+        } else {
+            detail
+        },
+    )
 }
 
 async fn join_one(
@@ -311,85 +557,100 @@ async fn join_one(
     bind: Option<&str>,
     port: u16,
 ) -> Result<Peer> {
-    let config = ensure_agent(bind, port, endpoint_ip(endpoint)).await?;
-    let ip: IpAddr = config.bind.parse()?;
-    let own_endpoint = client::endpoint(ip, config.port).context("invalid local agent address")?;
-    let bearer = server::mint_client("pending")?;
-    let request = PairCodeRequest {
-        version: PROTOCOL_VERSION,
-        code: code.into(),
-        host_fingerprint: pin.into(),
-        machine: server::identity()?,
-        endpoint: own_endpoint,
-        fingerprint: server::fingerprint()?,
-        token: bearer.clone(),
-    };
+    let config = ensure_agent(bind, port, endpoint_ip(endpoint))
+        .await
+        .map_err(|e| fail("local", format!("{e:#}")))?;
+    let prepared = async {
+        let ip: IpAddr = config.bind.parse()?;
+        let own_endpoint =
+            client::endpoint(ip, config.port).context("invalid local agent address")?;
+        let bearer = server::mint_client("pending")?;
+        anyhow::Ok((own_endpoint, bearer))
+    }
+    .await;
+    let (own_endpoint, bearer) = prepared.map_err(|e| fail("local", format!("{e:#}")))?;
     let result = async {
+        let request = PairCodeRequest {
+            version: PROTOCOL_VERSION,
+            code: code.into(),
+            host_fingerprint: pin.into(),
+            machine: server::identity().map_err(|e| fail("local", format!("{e:#}")))?,
+            endpoint: own_endpoint,
+            fingerprint: server::fingerprint().map_err(|e| fail("local", format!("{e:#}")))?,
+            token: bearer.clone(),
+        };
         let response = client::http_client(pin)?
             .post(format!("{endpoint}v1/pair-code"))
             .json(&request)
             .send()
             .await
-            .context("pairing connection failed")?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            let text: String = text.chars().filter(|c| !c.is_control()).take(200).collect();
-            bail!(
-                "{}",
-                if text.is_empty() {
-                    status.to_string()
-                } else {
-                    text
-                }
-            )
+            .map_err(|e| fail("unreachable", format!("pairing connection failed: {e}")))?;
+        if !response.status().is_success() {
+            return Err(refused(response).await);
         }
-        let response: PairResponse = client::bounded_json(response).await?;
+        let response: PairResponse = client::bounded_json(response)
+            .await
+            .map_err(|e| fail("protocol", format!("{e:#}")))?;
         if response.version != PROTOCOL_VERSION {
-            bail!("unsupported peer protocol version")
+            return Err(fail("protocol", "unsupported peer protocol version"));
         }
-        client::validate_machine(&response.machine)?;
+        client::validate_machine(&response.machine)
+            .map_err(|e| fail("protocol", format!("{e:#}")))?;
         if !(32..=512).contains(&response.token.len())
             || !response
                 .token
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
         {
-            bail!("invalid enrollment response token")
+            return Err(fail("protocol", "invalid enrollment response token"));
         }
-        Ok(response)
+        // The host accepted the code: from here on, store both sides.
+        server::label_client(&bearer, &response.machine.id)?;
+        let mut sources = vec![Source::Explicit];
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+        crate::state::load()?;
+        client::upsert_peer_in(
+            &crate::state::dir(),
+            Peer {
+                machine: response.machine,
+                endpoint: endpoint.into(),
+                fingerprint: pin.into(),
+                token: response.token,
+                sources,
+                last_seen: server::now(),
+                slug: String::new(),
+            },
+        )
+        .map_err(|e| fail("protocol", format!("{e:#}")))
     }
     .await;
-    let response = match result {
-        Ok(r) => r,
+    let peer = match result {
+        Ok(peer) => peer,
         Err(e) => {
             let _ = server::revoke_bearer(&bearer);
             return Err(e);
         }
     };
-    server::label_client(&bearer, &response.machine.id)?;
-    let mut sources = vec![Source::Explicit];
-    if !sources.contains(&source) {
-        sources.push(source);
+    // The first authenticated request tells the host this side stored the
+    // pairing. If it fails now, the next catalog refresh confirms instead.
+    if let Err(e) = client::fetch_catalog(&peer, endpoint).await {
+        eprintln!(
+            "Porch: paired, but {} has not confirmed yet: {e:#}",
+            peer.machine.name
+        );
     }
-    crate::state::load()?;
-    client::upsert_peer_in(
-        &crate::state::dir(),
-        Peer {
-            machine: response.machine,
-            endpoint: endpoint.into(),
-            fingerprint: pin.into(),
-            token: response.token,
-            sources,
-            last_seen: server::now(),
-            slug: String::new(),
-        },
-    )
+    Ok(peer)
 }
 
-/// Forget a machine on both sides when it is reachable, and locally always.
+/// Forget a machine: revoke its access here first, then tell it (best effort,
+/// five seconds). Returns whether the other machine was reached.
 pub async fn unpair(reference: &str) -> Result<(Peer, bool)> {
     let peer = client::find_peer(reference)?;
+    server::revoke_machine(&peer.machine.id)?;
+    super::disconnect_peer(&peer.machine.id).await?;
+    client::remove_peer(&peer.machine.id)?;
     let remote = async {
         client::http_client(&peer.fingerprint)?
             .post(format!("{}v1/unpair", peer.endpoint))
@@ -403,9 +664,6 @@ pub async fn unpair(reference: &str) -> Result<(Peer, bool)> {
         tokio::time::timeout(Duration::from_secs(5), remote).await,
         Ok(Ok(()))
     );
-    server::revoke_machine(&peer.machine.id)?;
-    super::disconnect_peer(&peer.machine.id).await?;
-    client::remove_peer(&peer.machine.id)?;
     Ok((peer, reached))
 }
 
@@ -413,4 +671,95 @@ pub async fn unpair(reference: &str) -> Result<(Peer, bool)> {
 pub fn url_template(slug: &str) -> String {
     let settings = crate::state::proxy_settings().unwrap_or_default();
     settings.url(&format!("APP.{slug}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn at(name: &str, ip: &str) -> JoinCandidate {
+        JoinCandidate {
+            name: name.into(),
+            endpoint: format!("https://{ip}:7463/"),
+            source: Source::Lan,
+        }
+    }
+    fn code_of(e: anyhow::Error) -> JoinFailure {
+        e.downcast::<JoinFailure>().expect("structured failure")
+    }
+    #[test]
+    fn the_code_goes_to_exactly_one_waiting_machine() {
+        let pin = |c: char| Ok(Some(c.to_string().repeat(64)));
+        // Two different machines showing codes: refuse instead of racing them.
+        let e = select_target(
+            vec![
+                (at("mini", "192.168.1.20"), pin('a')),
+                (at("rogue", "192.168.1.66"), pin('b')),
+            ],
+            None,
+            None,
+        )
+        .unwrap_err();
+        let e = code_of(e);
+        assert_eq!(e.code, "multiple_hosts");
+        assert_eq!(e.candidates.len(), 2);
+        assert!(e.to_string().contains("rogue"));
+        // Even an explicit --host that matched two machines is refused.
+        let e = select_target(
+            vec![
+                (at("mini", "192.168.1.20"), pin('a')),
+                (at("mini", "192.168.1.21"), pin('b')),
+            ],
+            None,
+            Some("mini"),
+        )
+        .unwrap_err();
+        assert_eq!(code_of(e).code, "multiple_hosts");
+        // One machine over LAN and Tailscale (same certificate) is one target;
+        // this machine's own agent and closed or failing probes are skipped.
+        let (target, chosen) = select_target(
+            vec![
+                (at("self", "192.168.1.2"), pin('0')),
+                (at("mini", "192.168.1.20"), pin('a')),
+                (at("mini", "100.64.0.20"), pin('a')),
+                (at("closed", "192.168.1.30"), Ok(None)),
+                (at("gone", "192.168.1.40"), Err("timed out".into())),
+            ],
+            Some(&"0".repeat(64)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(target.endpoint, "https://192.168.1.20:7463/");
+        assert_eq!(chosen, "a".repeat(64));
+    }
+    #[test]
+    fn nothing_waiting_is_explained() {
+        let none = select_target(vec![(at("x", "10.0.0.2"), Ok(None))], None, None);
+        assert_eq!(code_of(none.unwrap_err()).code, "no_host");
+        let closed = select_target(
+            vec![(at("x", "10.0.0.2"), Ok(None))],
+            None,
+            Some("10.0.0.2"),
+        );
+        assert_eq!(code_of(closed.unwrap_err()).code, "not_waiting");
+        let down = select_target(
+            vec![(at("x", "10.0.0.2"), Err("refused".into()))],
+            None,
+            Some("10.0.0.2"),
+        );
+        let down = code_of(down.unwrap_err());
+        assert_eq!(down.code, "unreachable");
+        assert!(down.retry);
+    }
+    #[test]
+    fn codes_are_normalized_and_failures_have_stable_codes() {
+        assert_eq!(normalize_code(" 012-345 ").unwrap(), "012345");
+        assert_eq!(normalize_code("012 345").unwrap(), "012345");
+        assert_eq!(
+            code_of(normalize_code("12345").unwrap_err()).code,
+            "invalid_code"
+        );
+        assert_eq!(failure("anything else").code, "protocol");
+        assert!(failure("wrong_code").retry);
+        assert!(!failure("certificate_mismatch").retry);
+    }
 }
