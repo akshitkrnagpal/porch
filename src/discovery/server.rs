@@ -124,7 +124,12 @@ struct Auth {
 #[derive(Serialize, Deserialize)]
 struct PairingWindow {
     id: String,
-    /// SHA-256 of `id \0 code`; the code itself is never written to disk.
+    /// Public salt for the key exchange. Windows written by older versions lack
+    /// it and are treated as closed.
+    #[serde(default)]
+    salt: String,
+    /// SHA-256 of `salt \0 code` (the SPAKE2 password); the code itself is never
+    /// written to disk.
     hash: String,
     expires: u64,
     failures: u32,
@@ -424,6 +429,7 @@ pub fn open_pairing() -> Result<PairingCode> {
 fn open_pairing_in(dir: &Path, lifetime: u64) -> Result<PairingCode> {
     let _lock = lock(dir)?;
     let id = random()?;
+    let salt = random()?;
     let code = six_digits()?;
     let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
     if let Some(old) = auth.pairing.take() {
@@ -437,7 +443,8 @@ fn open_pairing_in(dir: &Path, lifetime: u64) -> Result<PairingCode> {
     }
     let expires = now() + lifetime;
     auth.pairing = Some(PairingWindow {
-        hash: digest(&format!("{id}\0{code}")),
+        hash: super::pake::password(&salt, &code),
+        salt,
         id: id.clone(),
         expires,
         failures: 0,
@@ -518,26 +525,52 @@ fn close_pairing_in(dir: &Path, id: &str) -> Result<PairingProgress> {
     }
     Ok(progress_of(&auth, id))
 }
-fn pairing_open(dir: &Path) -> bool {
+/// The open window's public salt and SPAKE2 password, if a code is showing.
+fn open_window(dir: &Path) -> Option<(String, String)> {
     read::<Auth>(&dir.join("discovery-auth.json"))
         .ok()
         .flatten()
         .and_then(|a| a.pairing)
-        .is_some_and(|w| w.expires > now() && w.failures < PAIR_CODE_MAX_FAILURES)
+        .filter(|w| w.expires > now() && w.failures < PAIR_CODE_MAX_FAILURES && !w.salt.is_empty())
+        .map(|w| (w.salt, w.hash))
+}
+#[cfg(test)]
+fn pairing_open(dir: &Path) -> bool {
+    open_window(dir).is_some()
 }
 enum CodeOutcome {
     Accepted(String),
-    Wrong,
     Closed,
     /// The code was right but this machine has no room for another client.
     Full,
 }
-/// Check a code in constant time. Five wrong guesses or expiry close the window;
-/// success consumes it and enrolls a new bearer labelled with the peer's machine ID.
-fn try_code(dir: &Path, code: &str, peer: &Machine) -> Result<CodeOutcome> {
+/// Count a failed key confirmation (a wrong code) against the window `salt`.
+/// Five close it, even for the right code.
+fn code_failed(dir: &Path, salt: &str) -> Result<()> {
     let _lock = lock(dir)?;
     let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
-    let Some(window) = auth.pairing.as_mut() else {
+    let Some(window) = auth.pairing.as_mut().filter(|w| equal(&w.salt, salt)) else {
+        return Ok(());
+    };
+    window.failures += 1;
+    if window.failures >= PAIR_CODE_MAX_FAILURES {
+        let (id, expires) = (window.id.clone(), window.expires);
+        auth.pairing = None;
+        auth.pairing_result = Some(PairingResult::closed(
+            id,
+            expires,
+            PairState::Cancelled,
+            Some("too_many_failures"),
+        ));
+    }
+    write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)
+}
+/// The joiner proved the code for window `salt`: consume the window and enroll
+/// a new bearer labelled with the peer's machine ID.
+fn code_accepted(dir: &Path, salt: &str, peer: &Machine) -> Result<CodeOutcome> {
+    let _lock = lock(dir)?;
+    let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    let Some(window) = auth.pairing.as_ref().filter(|w| equal(&w.salt, salt)) else {
         return Ok(CodeOutcome::Closed);
     };
     let (id, expires) = (window.id.clone(), window.expires);
@@ -551,21 +584,6 @@ fn try_code(dir: &Path, code: &str, peer: &Machine) -> Result<CodeOutcome> {
         auth.pairing_result = Some(PairingResult::closed(id, expires, state, reason));
         write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
         return Ok(CodeOutcome::Closed);
-    }
-    let candidate = digest(&format!("{id}\0{code}"));
-    if !equal(&candidate, &window.hash) {
-        window.failures += 1;
-        if window.failures >= PAIR_CODE_MAX_FAILURES {
-            auth.pairing = None;
-            auth.pairing_result = Some(PairingResult::closed(
-                id,
-                expires,
-                PairState::Cancelled,
-                Some("too_many_failures"),
-            ));
-        }
-        write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
-        return Ok(CodeOutcome::Wrong);
     }
     auth.pairing = None;
     // Re-pairing replaces this machine's previous credential.
@@ -909,8 +927,24 @@ struct ContextState {
     client: Upstream,
     tunnels: Arc<tokio::sync::Semaphore>,
     attempts: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
+    /// In-progress code-pairing key exchanges, by random session ID.
+    sessions: Arc<Mutex<HashMap<String, PairSession>>>,
 }
+struct PairSession {
+    salt: String,
+    key: super::pake::Key,
+    confirmed: bool,
+    started: Instant,
+}
+/// A key exchange must finish within this time (the joiner may start its agent).
+const PAIR_SESSION_LIFETIME: Duration = Duration::from_secs(60);
+const MAX_PAIR_SESSIONS: usize = 16;
 impl ContextState {
+    fn take_session(&self, id: &str) -> Option<PairSession> {
+        let mut all = self.sessions.lock().ok()?;
+        all.retain(|_, s| s.started.elapsed() < PAIR_SESSION_LIFETIME);
+        all.remove(id)
+    }
     fn sharing(&self) -> bool {
         read::<ServerConfig>(&self.dir.join("discovery-config.json"))
             .ok()
@@ -982,52 +1016,133 @@ fn host_full() -> Response<Body> {
         "cannot store the pairing machine; remove an unused peer and retry",
     )
 }
-async fn pair_code(req: Request<Incoming>, context: &ContextState) -> Result<Response<Body>> {
-    let Some(input) = small_body::<PairCodeRequest>(req, 4096).await else {
-        return Ok(pair_error(
-            StatusCode::BAD_REQUEST,
-            "protocol",
-            "invalid pairing request",
-        ));
+fn bad_pairing_request() -> Response<Body> {
+    pair_error(
+        StatusCode::BAD_REQUEST,
+        "protocol",
+        "invalid pairing request",
+    )
+}
+fn not_waiting() -> Response<Body> {
+    pair_error(
+        StatusCode::GONE,
+        "not_waiting",
+        "this machine is not waiting to pair; run porch pair on it",
+    )
+}
+fn session_expired() -> Response<Body> {
+    pair_error(
+        StatusCode::GONE,
+        "not_waiting",
+        "pairing session expired; run porch pair CODE again",
+    )
+}
+/// Step 1: answer the joiner's SPAKE2 message. Nothing here reveals the code
+/// or lets a caller test a guess; only a key confirmation (step 2) does.
+async fn pair_start(req: Request<Incoming>, context: &ContextState) -> Result<Response<Body>> {
+    let Some(input) = small_body::<PairStart>(req, 1024).await else {
+        return Ok(bad_pairing_request());
     };
-    let code_ok = input.code.len() == 6 && input.code.bytes().all(|b| b.is_ascii_digit());
-    let peer_ok = input.version == PROTOCOL_VERSION
-        && super::client::validate_machine(&input.machine).is_ok()
-        && input.machine.id != context.machine.id
-        && super::client::validate_endpoint(&input.endpoint).is_ok()
-        && super::client::normalize_pin(&input.fingerprint).is_ok()
-        && valid_secret(&input.token);
-    if !code_ok || !peer_ok {
+    if input.pairing != PAIRING_VERSION {
         return Ok(pair_error(
             StatusCode::BAD_REQUEST,
             "protocol",
-            "invalid pairing request",
+            "unsupported pairing protocol; update Porch on both machines",
         ));
     }
-    // The joiner binds the code to the certificate it pinned. A TLS-terminating
-    // interceptor relaying the request presents a different certificate.
-    let own = fingerprint_in(&context.dir)?;
-    let seen = super::client::normalize_pin(&input.host_fingerprint)
-        .map(|p| super::client::hex_pin(&p))
-        .unwrap_or_default();
-    if !equal(&own, &seen) {
+    let Some((salt, password)) = open_window(&context.dir) else {
+        return Ok(not_waiting());
+    };
+    if !equal(&salt, &input.salt) {
         return Ok(pair_error(
-            StatusCode::CONFLICT,
-            "certificate_mismatch",
-            "certificate mismatch; the pairing connection was intercepted",
-        ));
-    }
-    match try_code(&context.dir, &input.code, &input.machine)? {
-        CodeOutcome::Closed => Ok(pair_error(
             StatusCode::GONE,
             "not_waiting",
-            "this machine is not waiting to pair; run porch pair on it",
-        )),
-        CodeOutcome::Wrong => Ok(pair_error(
+            "the pairing code on this machine changed; enter the new code",
+        ));
+    }
+    let Ok((msg, key)) = super::pake::host_respond(&password, &input.msg) else {
+        return Ok(bad_pairing_request());
+    };
+    let session = random()?;
+    let Ok(mut all) = context.sessions.lock() else {
+        bail!("pairing session state poisoned")
+    };
+    all.retain(|_, s| s.started.elapsed() < PAIR_SESSION_LIFETIME);
+    if all.len() >= MAX_PAIR_SESSIONS {
+        return Ok(pair_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many pairing attempts; wait a minute",
+        ));
+    }
+    all.insert(
+        session.clone(),
+        PairSession {
+            salt,
+            key,
+            confirmed: false,
+            started: Instant::now(),
+        },
+    );
+    Ok(json(&PairStarted { session, msg }))
+}
+/// Step 2: the joiner proves the key, bound to the certificate it pinned. A
+/// wrong proof is a wrong code (counted); a relaying interceptor presenting
+/// another certificate fails the same way. Only then does the host prove itself.
+async fn pair_confirm(req: Request<Incoming>, context: &ContextState) -> Result<Response<Body>> {
+    let Some(input) = small_body::<PairConfirm>(req, 1024).await else {
+        return Ok(bad_pairing_request());
+    };
+    let Some(mut session) = context
+        .take_session(&input.session)
+        .filter(|s| !s.confirmed)
+    else {
+        return Ok(session_expired());
+    };
+    let pin = super::client::normalize_pin(&fingerprint_in(&context.dir)?)?;
+    if !session.key.check_joiner_confirm(&pin, &input.confirm) {
+        code_failed(&context.dir, &session.salt)?;
+        return Ok(pair_error(
             StatusCode::UNAUTHORIZED,
             "wrong_code",
             "wrong pairing code",
-        )),
+        ));
+    }
+    if open_window(&context.dir).is_none_or(|(salt, _)| !equal(&salt, &session.salt)) {
+        return Ok(not_waiting());
+    }
+    let confirm = session.key.host_confirm(&pin);
+    session.confirmed = true;
+    if let Ok(mut all) = context.sessions.lock() {
+        all.insert(input.session, session);
+    }
+    Ok(json(&PairConfirmed { confirm }))
+}
+/// Step 3: both sides proved the code. Store the joiner, enroll its credential.
+async fn pair_finish(req: Request<Incoming>, context: &ContextState) -> Result<Response<Body>> {
+    let Some(input) = small_body::<PairFinish>(req, 4096).await else {
+        return Ok(bad_pairing_request());
+    };
+    let Some(session) = context.take_session(&input.session).filter(|s| s.confirmed) else {
+        return Ok(session_expired());
+    };
+    let peer_ok = super::client::validate_machine(&input.machine).is_ok()
+        && input.machine.id != context.machine.id
+        && super::client::validate_endpoint(&input.endpoint).is_ok()
+        && super::client::normalize_pin(&input.fingerprint).is_ok()
+        && valid_secret(&input.token)
+        && session.key.check_joiner_payload(
+            &input.machine,
+            &input.endpoint,
+            &input.fingerprint,
+            &input.token,
+            &input.mac,
+        );
+    if !peer_ok {
+        return Ok(bad_pairing_request());
+    }
+    match code_accepted(&context.dir, &session.salt, &input.machine)? {
+        CodeOutcome::Closed => Ok(not_waiting()),
         CodeOutcome::Full => Ok(host_full()),
         CodeOutcome::Accepted(token) => {
             let peer = Peer {
@@ -1045,10 +1160,12 @@ async fn pair_code(req: Request<Incoming>, context: &ContextState) -> Result<Res
                 reject_accepted(&context.dir, &token)?;
                 return Ok(host_full());
             }
-            Ok(json(&PairResponse {
+            let mac = session.key.host_payload(&context.machine, &token);
+            Ok(json(&PairFinished {
                 version: PROTOCOL_VERSION,
                 machine: context.machine.clone(),
                 token,
+                mac,
             }))
         }
     }
@@ -1065,22 +1182,44 @@ async fn request(
         ));
     }
     if req.uri().path() == "/v1/pairing" && req.method() == Method::GET {
+        let salt = open_window(&context.dir).map(|(salt, _)| salt);
         return Ok(json(&PairingStatus {
             version: PROTOCOL_VERSION,
-            open: pairing_open(&context.dir),
+            open: salt.is_some(),
+            pairing: PAIRING_VERSION,
+            salt,
         }));
     }
-    let pairing = matches!(req.uri().path(), "/v1/pair" | "/v1/pair-code");
+    // Each key exchange allows one guess, so limiting starts limits guesses;
+    // confirm and finish need a session that a start created.
+    let pairing = matches!(
+        req.uri().path(),
+        "/v1/pair" | "/v1/pair-code" | "/v1/pair-code/start"
+    );
     if pairing && req.method() == Method::POST && !context.allow_attempt(source) {
         let message = "too many pairing attempts; wait a minute";
-        return Ok(if req.uri().path() == "/v1/pair-code" {
+        return Ok(if req.uri().path().starts_with("/v1/pair-code") {
             pair_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited", message)
         } else {
             response(StatusCode::TOO_MANY_REQUESTS, message)
         });
     }
-    if req.uri().path() == "/v1/pair-code" && req.method() == Method::POST {
-        return pair_code(req, &context).await;
+    if req.method() == Method::POST {
+        match req.uri().path() {
+            // Version 1 sent the code and a live credential to whoever answered.
+            // Refuse it without reading the body or touching the window.
+            "/v1/pair-code" => {
+                return Ok(pair_error(
+                    StatusCode::UPGRADE_REQUIRED,
+                    "protocol",
+                    "this machine uses a newer, authenticated pairing protocol; update Porch on the joining machine",
+                ))
+            }
+            "/v1/pair-code/start" => return pair_start(req, &context).await,
+            "/v1/pair-code/confirm" => return pair_confirm(req, &context).await,
+            "/v1/pair-code/finish" => return pair_finish(req, &context).await,
+            _ => {}
+        }
     }
     if req.uri().path() == "/v1/pair" && req.method() == Method::POST {
         let body = match tokio::time::timeout(
@@ -1378,6 +1517,7 @@ pub async fn serve() -> Result<()> {
         client: upstream(&dir)?,
         tunnels: Arc::new(tokio::sync::Semaphore::new(64)),
         attempts: Arc::default(),
+        sessions: Arc::default(),
     });
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
     let slots = Arc::new(tokio::sync::Semaphore::new(64));
