@@ -48,4 +48,16 @@ Or open `http://localhost` in a browser for a live dashboard.
 
 URLs carry no port where your OS lets Porch serve port 80 without sudo (macOS, Windows, and Linux with a lowered `net.ipv4.ip_unprivileged_port_start`). Elsewhere they look like `http://web.localhost:7462`. `porch get NAME` always prints the right one.
 
+## How names and HTTPS reach each client
+
+| Client | How `web.localhost` resolves | How the HTTPS certificate is trusted |
+| --- | --- | --- |
+| Chrome, Edge, Firefox, Arc, Brave | The browser itself sends every `*.localhost` name to loopback | macOS keychain or Windows user store; on Linux, the NSS databases `porch trust` writes |
+| Safari | The system resolver; macOS answers `localhost` itself, so `porch hosts sync` covers subdomains | macOS login keychain |
+| `curl`, Python, Go, Java | The system resolver; use `curl --resolve` or `sudo porch hosts sync` if it can't find the name | Pass `--cacert ~/.porch/ca.pem`, or run `porch trust --system` |
+| Node apps Porch starts | Same as above | Automatic: Porch sets `NODE_EXTRA_CA_CERTS` |
+| Phones on your network (`--lan`) | mDNS `NAME.local` | Install the CA on the device, or use plain HTTP |
+
+`porch doctor` checks both for each route: whether its name resolves on this computer, and whether the CA is actually in the trust store. [Troubleshooting](troubleshooting.md) has a fix for each case.
+
 Next: the [command and configuration reference](reference.md), or [recipes](recipes.md) for your framework.

@@ -120,7 +120,7 @@ curl -H 'Host: web.localhost:7462' http://127.0.0.1:7462
 sudo porch hosts sync      # writes Porch's block in the hosts file for current routes
 ```
 
-`porch hosts sync` covers the routes that exist when you run it; rerun it after adding apps. `porch hosts clean` removes the block. `porch doctor` reports `DNS web.localhost: unavailable; run porch hosts sync` when the system resolver can't find a route's name.
+`porch hosts sync` covers the routes that exist when you run it; rerun it after adding apps. `porch hosts clean` removes the block. `porch doctor` marks the route with ✗ and "does not resolve on this computer; run `sudo porch hosts sync`" when the system resolver can't find its name.
 
 ### Safari can't open `web.localhost`
 
@@ -146,7 +146,7 @@ sudo porch hosts sync      # writes Porch's block in the hosts file for current 
 
 **Cause.** Porch's local CA isn't trusted for your user. An unattended start (no terminal, a service, an agent) skips the trust prompt and prints `Browsers will warn about https://<app>.localhost:7462 until you run porch trust once in a terminal (no sudo).`
 
-**Fix.** `porch trust` in a terminal. macOS asks for your password or Touch ID once. On Linux it installs into `~/.pki/nssdb` (Chrome, Chromium) and every Firefox profile; restart the browser afterwards. `porch doctor` shows `CA trust: not recorded; run porch trust` until it's done.
+**Fix.** `porch trust` in a terminal. macOS asks for your password or Touch ID once. On Linux it installs into `~/.pki/nssdb` (Chrome, Chromium) and every Firefox profile; restart the browser afterwards. `porch doctor` checks the trust store itself (not just Porch's record) and shows "not trusted yet; run `porch trust`" until it's done, or "its trust was removed from the trust store" if something removed it later.
 
 ### "per-user trust needs NSS certutil: install libnss3-tools (Debian/Ubuntu) or nss-tools (Fedora/Arch) …"
 
