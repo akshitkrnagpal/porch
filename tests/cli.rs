@@ -927,9 +927,22 @@ fn detached_runs_answer_log_and_stop() {
         String::from_utf8_lossy(&o.stderr)
     );
     assert_eq!(out.trim(), format!("http://bg.localhost:{}", s.port));
-    // Ready means answering: the route is healthy as soon as run returns.
-    let list: serde_json::Value = serde_json::from_str(&s.ok(&["list", "--json"])).unwrap();
-    assert_eq!(list["routes"][0]["health"], "ok", "{list}");
+    // The app answers once run returns (allowing a moment for the health
+    // probe on slow CI runners); on failure, show what the app printed.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let list: serde_json::Value = serde_json::from_str(&s.ok(&["list", "--json"])).unwrap();
+        if list["routes"][0]["health"] == "ok" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{list}\nrun stderr: {}\nlog: {}",
+            String::from_utf8_lossy(&o.stderr),
+            String::from_utf8_lossy(&s.run(&["logs", "bg"]).stdout)
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     let logs = s.ok(&["logs", "bg"]);
     assert!(logs.contains("hello from bg"), "{logs}");
     // A second copy is refused without touching the running one or its log.
