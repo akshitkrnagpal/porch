@@ -96,7 +96,7 @@ jobs:
       - if: matrix.musl
         run: |
           python3 -m pip install ziglang==0.13.0
-          cargo install --locked cargo-zigbuild@0.19.8
+          cargo install --locked cargo-zigbuild@0.24.1
       - if: matrix.test
         run: cargo test --features tray --lib tray::tests
       - if: matrix.test
