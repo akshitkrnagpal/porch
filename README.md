@@ -12,7 +12,7 @@
   <a href="https://github.com/akshitkrnagpal/porch/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/akshitkrnagpal/porch?label=release"></a>
   <a href="https://github.com/akshitkrnagpal/porch/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/akshitkrnagpal/porch/ci.yml?branch=main&label=CI"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/akshitkrnagpal/porch"></a>
-  <img alt="macOS, Linux and Windows" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-555">
+  <img alt="macOS, Linux and Windows (preview)" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows%20%28preview%29-555">
 </p>
 
 <p align="center">
@@ -24,17 +24,12 @@
 </p>
 
 <p align="center">
-  <img src="assets/screenshots/hero.png" alt="Porch command examples beside the real macOS menu: three local apps and storybook and admin on a paired Mac mini" width="800">
+  <img src="assets/screenshots/hero.png" alt="Porch command examples and their URLs beside the real macOS menu, with three local apps and two apps on a paired Mac mini" width="800">
 </p>
 
 Porch runs your dev command on a free port and gives it a name that stays the same across restarts. Pair another machine and open its apps from your terminal or the menu bar.
 
-```sh
-porch run pnpm dev                       # web.localhost, for a package named web
-porch open storybook --peer mac-mini     # storybook.mac-mini.localhost, after pairing
-```
-
-Your app receives its port as `PORT`. The menu above uses demo data: three apps on this Mac and two on a paired Mac mini. Click a URL to open it; hold Option on macOS to copy it.
+Your app receives its port as `PORT`. The image uses demo apps; the commands below are ready to copy.
 
 ## Install
 
@@ -42,13 +37,25 @@ Your app receives its port as `PORT`. The menu above uses demo data: three apps 
 curl -fsSL https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.sh | sh
 ```
 
-macOS and Linux, no sudo or Python needed. The installer verifies the checksum and, if the GitHub CLI is installed, the signed build attestation.
+Installing on macOS and Linux needs no sudo or Python. The installer verifies the checksum and, if the GitHub CLI is installed, the signed build attestation.
 
 **Windows (PowerShell):**
 
 ```powershell
 irm https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.ps1 | iex
 ```
+
+On macOS, the script also installs `Porch.app`. Open the menu with `open ~/Applications/Porch.app`. If `porch` is not found, run `export PATH="$HOME/.local/bin:$PATH"` and add that line to your shell profile.
+
+On Linux, the default install is CLI only. For the tray on x86_64 Linux (glibc 2.39+, GTK 3 and an AppIndicator host):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.sh | PORCH_TRAY=1 sh
+```
+
+There is no prebuilt tray for ARM64 Linux. On Windows, open a new terminal after installing to pick up the updated `PATH`; run `porch-tray.exe` for the tray.
+
+Run `porch setup` for a guided first run, or continue with [Quick start](#quick-start).
 
 **Homebrew** (macOS and Linux, CLI only): `brew install akshitkrnagpal/tap/porch`.
 
@@ -87,16 +94,16 @@ cd my-app
 porch                      # runs the package's "dev" script at http://my-app.localhost
 porch run pnpm dev         # any command; the name comes from package.json or the folder
 porch api node server.js   # choose the name: http://api.localhost
-porch alias db 5432        # name a server Porch didn't start
+porch alias storybook 6006 # name an existing HTTP server (not a database or other TCP service)
 porch list                 # every route and whether it's answering
 porch run -d pnpm dev      # in the background; then porch logs / porch stop
 ```
 
 ```console
 $ porch list
-  HEALTH         URL                    TARGET
-● ok             http://web.localhost   http://127.0.0.1:4480 (pid 28686)
-● not listening  http://db.localhost    http://127.0.0.1:5432
+  HEALTH  URL                         TARGET
+● ok      http://web.localhost        http://127.0.0.1:4480 (pid 28686)
+● ok      http://storybook.localhost  http://localhost:6006
 ```
 
 URLs carry no port when your OS lets Porch serve port 80 without sudo (macOS, Windows, Linux with a lowered `net.ipv4.ip_unprivileged_port_start`). Elsewhere they look like `http://web.localhost:7462`. `porch get NAME` always prints the right one, and `PORCH_CLEAN_URLS=0` keeps port 7462.
@@ -107,8 +114,8 @@ For a guided first run, `porch setup` asks four questions (HTTPS, proxy port, st
 
 ## Features
 
-- **Named URLs with no port and no sudo.** Apps live at `http://web.localhost`, `http://api.localhost` and so on, so bookmarks and OAuth callbacks keep working across restarts. On macOS and Windows Porch serves port 80 (or 443 with HTTPS) as your user. Where the OS doesn't allow that, it uses port 7462, also without sudo.
-- **HTTPS without sudo.** `porch setup` turns on HTTP/2 over TLS with a local CA trusted for your user only.
+- **Named URLs with no port and no sudo.** Apps live at `http://web.localhost`, `http://api.localhost` and so on, so bookmarks and OAuth callbacks keep working across restarts. See [Quick start](#quick-start) for platform requirements and fallback URLs.
+- **HTTPS without sudo.** `porch setup` turns on HTTP/2 over TLS with a local CA trusted for your user only. macOS asks for your password or Touch ID once; `porch trust --system` is available for tools that ignore user trust stores.
 - **Framework flags.** Vite, Astro, Angular, React Router, Rsbuild, Expo, React Native and Wrangler, plus Django, Flask, FastAPI, uvicorn, gunicorn, Streamlit, MkDocs, Jupyter, Hugo, Jekyll and `python -m http.server`, get the right port and host flags with no config.
 - **Monorepos.** Run `porch` at a pnpm, npm, Yarn or Bun workspace root and every package gets its own URL. Turborepo keeps its task graph and TUI.
 - **Other machines.** Pair two machines with a 6-digit code and open each other's apps over your LAN or Tailscale. Traffic is encrypted and pinned to the other machine's certificate.
@@ -122,7 +129,6 @@ For a guided first run, `porch setup` asks four questions (HTTPS, proxy port, st
 - **Public and tailnet URLs:** add `--tailscale`, `--funnel`, `--ngrok` or `--cloudflare` when you launch an app. Porch removes the share when the app exits.
 - **Docker Compose:** `porch compose up` gives each HTTP service a name and a stable port.
 - **Git worktrees:** a linked worktree on branch `fix/login` serves at `login.web.localhost`, so two checkouts of the same app don't collide.
-- **HTTPS:** `porch setup` (or `porch proxy start --https`) serves `https://web.localhost` with HTTP/2 and a local certificate authority trusted for your user only, without sudo (macOS asks for your password or Touch ID once). `porch trust --system` trusts the CA machine-wide for command-line tools that ignore per-user trust stores.
 - **Remote aliases:** `porch alias staging https://staging.example.com` puts a real site behind a local name, with verified TLS, the right `Host` and redirects that stay on the Porch URL.
 - **Phones and tablets:** `--lan` publishes `web.local` over mDNS so other devices on your network can reach the app.
 - **Coding agents:** `porch mcp` runs a stdio MCP server that lets an agent list routes, look up URLs and run diagnostics. Read-only tools can't change anything. Install the skill with `npx skills add akshitkrnagpal/porch`.
@@ -142,7 +148,7 @@ On the machine you're using:
 
 ```console
 $ porch pair 482913
-Paired with mac-mini.local
+Paired with Mac-mini.local
 ```
 
 Both machines can now see each other's apps:
@@ -158,9 +164,9 @@ To keep sharing on after a reboot, run `porch discovery autostart enable` on the
 
 ## Menu bar and tray app
 
-On macOS, open `Porch.app`. On Linux, run `porch tray` (needs GTK 3 and an AppIndicator host). On Windows, run `porch tray` or `porch-tray.exe` to add Porch to the notification area.
+On macOS, run `open ~/Applications/Porch.app` after installing with the script or release archive. On x86_64 Linux, install with `PORCH_TRAY=1` as shown in [Install](#install), then run `porch tray`; GTK 3 and an AppIndicator host are required. ARM64 Linux builds and Homebrew installs contain the CLI only. On Windows, run `porch-tray.exe` to add Porch to the notification area.
 
-The menu lists every app's URL at the top level: this machine's apps first, then each paired machine's (such as `storybook.mac-mini.localhost`), under a heading for each machine. Click a URL to open it; on macOS, hold Option to copy it instead (Linux and Windows show Open and Copy in a small submenu). The switch beside Porch starts or stops the proxy, and the menu also refreshes apps and pairs a new device. The icon's dots are solid while the proxy runs and dimmed when it stops, and a badge appears when a paired machine is reachable. On macOS and Linux, `porch-login enable` starts the app at login.
+The menu lists every app's URL at the top level: this machine's apps first, then each paired machine's (such as `storybook.mac-mini.localhost`), under a heading for each machine. Click a URL to open it; on macOS, hold Option to copy it instead (Linux and Windows show Open and Copy in a small submenu). The switch beside Porch starts or stops the proxy, and the menu also refreshes apps and pairs a new device. The icon's dots are solid while the proxy runs and dimmed when it stops, and a badge appears when a paired machine is reachable. On macOS and Linux, `porch-login enable` starts the app at login (requires Python 3 and an installed tray).
 
 ## Coming from Portless
 

@@ -17,7 +17,7 @@ use std::{
     version,
     about = "Stable named URLs for local development",
     long_about = "Stable named URLs for local development.\n\nPorch runs your dev command on a free port and serves it at a name you choose, such as http://web.localhost. Run `porch` in a package or workspace root to start its dev script.",
-    after_help = "Examples:\n  porch                         Run this package's dev script (every package at a workspace root)\n  porch run pnpm dev            Run a command, naming the app after the package\n  porch api node server.js      Run a command as api.localhost\n  porch alias db 5432           Route db.localhost to an existing port\n  porch list                    Show routes and their health\n  porch setup                   Guided first run (HTTPS, port, start at login)\n  porch doctor --fix            Find and fix common problems\n\nDocs: https://github.com/akshitkrnagpal/porch/blob/main/docs/reference.md",
+    after_help = "Examples:\n  porch                         Run this package's dev script (every package at a workspace root)\n  porch run pnpm dev            Run a command, naming the app after the package\n  porch api node server.js      Run a command as api.localhost\n  porch alias storybook 6006    Give an existing HTTP server a named URL\n  porch list                    Show routes and their health\n  porch setup                   Guided first run (HTTPS, port, start at login)\n  porch doctor --fix            Find and fix common problems\n\nDocs: https://github.com/akshitkrnagpal/porch/blob/main/docs/reference.md",
     disable_version_flag = true
 )]
 struct Cli {
@@ -215,7 +215,7 @@ enum Commands {
     Tray,
     /// Route a name to something Porch didn't start (a port, Docker container or URL)
     #[command(
-        after_help = "Examples:\n  porch alias db 5432\n  porch alias grafana http://127.0.0.1:3001\n  porch alias --remove db"
+        after_help = "Examples:\n  porch alias storybook 6006\n  porch alias grafana http://127.0.0.1:3001\n  porch alias --remove storybook"
     )]
     Alias {
         /// Name for the route

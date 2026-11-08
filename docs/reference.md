@@ -60,7 +60,7 @@ Proxy options: `--port`/`-p`, `--https`, `--no-tls`, `--foreground`, `--skip-tru
 **Matching.** TLDs must be valid DNS labels. When configured TLDs overlap, the longest match wins. Routing is strict by default: with `--wildcard`, a request for an unregistered subdomain goes to the closest registered parent. An exact route always wins. An alias registered with `--tld` applies only to that TLD.
 
 ```sh
-porch alias database 5432
+porch alias storybook 6006
 porch alias web 3000 --force --tld test
 porch alias --remove web --tld test
 porch get web                            # the app's URL, even before it is registered
@@ -69,7 +69,7 @@ porch list                               # routes with health and sharing URLs
 porch list --json                        # routes with health, proxy settings and version
 ```
 
-Aliases can also point at an HTTP or HTTPS URL. For a target that isn't on this machine (`porch alias api https://staging.example.com`), Porch sends the target's own name in `Host` and TLS SNI, verifies its certificate against the system trust store, and rewrites the target's redirects to itself so they stay on the Porch URL. Targets can't carry a query string, fragment or credentials.
+Aliases route HTTP and HTTPS services, not database or other raw TCP protocols. They can also point at an HTTP or HTTPS URL. For a target that isn't on this machine (`porch alias api https://staging.example.com`), Porch sends the target's own name in `Host` and TLS SNI, verifies its certificate against the system trust store, and rewrites the target's redirects to itself so they stay on the Porch URL. Targets can't carry a query string, fragment or credentials.
 
 `--upstream` sets how Porch talks to an alias's port, which it always dials on this computer:
 
