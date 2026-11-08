@@ -15,6 +15,53 @@ const NAMES: &[&str] = &[
     "doctor",
     "prune",
     "version",
+    "doctor_fix",
+    "machines",
+    "run",
+    "stop",
+    "logs",
+];
+/// What each tool does, for agents choosing between them.
+fn description(n: &str) -> &'static str {
+    match n {
+        "list" => "List the apps Porch is serving on this computer: name, URL, upstream target, owning pid, health (ok, not listening, stopped, dead) and any sharing URLs. Use this to find the URL of a running dev server instead of guessing a localhost port.",
+        "get" => "Print the stable URL for an app name, applying the current Git worktree prefix unless noWorktree is set. Works before the app runs, so it is safe for wiring one app's URL into another's config.",
+        "alias_add" => "Route NAME.localhost to an existing local port that Porch did not start (a database UI, a Docker container). Fails if the name is taken unless force is set. private keeps it off paired machines; upstream (https, https://HOST or http://HOST) sets TLS and the Host sent to the port; insecure skips certificate checks for an https upstream (self-signed dev servers; trusting its CA is better).",
+        "alias_remove" => "Remove a static alias created with alias_add. Never stops a process.",
+        "tools_profiles" => "Report which tool profiles are active and which exist (core, proxy, diagnostics, all).",
+        "proxy_start" => "Start the Porch proxy in the background if it is not running. Apps start it automatically, so this is rarely needed. https serves HTTPS with a local CA trusted for the user.",
+        "proxy_stop" => "Stop the Porch proxy. Running apps keep their routes but their URLs stop answering until the proxy starts again.",
+        "doctor" => "Read-only health check: proxy listeners, routes, name resolution, HTTPS trust and optional tools. Returns a non-zero exit code when it finds problems. Never changes anything; use doctor_fix to apply fixes.",
+        "prune" => "Remove routes whose apps have exited. With force, also stop processes those routes left behind.",
+        "version" => "Print the Porch version.",
+        "run" => "Start a dev server in the background behind a stable URL (porch run --detach). Give command as an argument list, e.g. [\"pnpm\",\"dev\"], and cwd as the project directory; name is optional. Returns once the app answers, with its URL. Use logs to read its output and stop to end it.",
+        "stop" => "Stop an app Porch started (its launcher and whole process tree). Aliases are not affected.",
+        "logs" => "Read the output of an app started with run (porch run --detach). lines limits it to the last N lines.",
+        "machines" => "List this computer's apps and every paired machine's apps, with the URL that opens each remote app through the local proxy (APP.MACHINE.localhost). Use this to reach a dev server running on another computer.",
+        "doctor_fix" => "Apply doctor's safe fixes: move a stopped proxy off a busy port, prune dead routes, restart an outdated proxy. With yes, also terminate stopped or orphaned launches without asking.",
+        _ => "",
+    }
+}
+/// Extra CLI arguments each tool may pass through. Read-only tools accept only
+/// read-only flags, so `extraArgs` can never turn an inspection into a repair.
+/// The only `extraArgs` each tool passes through. Every other option is a
+/// typed argument, so an agent can't reach CLI flags the schema doesn't show.
+fn allowed_extra(n: &str) -> &'static [&'static str] {
+    match n {
+        "list" => &["--all", "--json"],
+        "get" => &["--no-worktree"],
+        _ => &[],
+    }
+}
+/// Tools that never change routes, the proxy or processes.
+const READ_ONLY: &[&str] = &[
+    "list",
+    "get",
+    "tools_profiles",
+    "doctor",
+    "version",
+    "machines",
+    "logs",
 ];
 fn profiles(s: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
@@ -24,7 +71,7 @@ fn profiles(s: &str) -> Result<Vec<String>> {
             "full" => "all",
             p => p,
         };
-        if !["core", "all", "proxy", "diagnostics"].contains(&p) {
+        if !["core", "all", "proxy", "diagnostics", "readonly", "apps"].contains(&p) {
             bail!("Unknown tools profile: {p}");
         }
         if !out.iter().any(|x| x == p) {
@@ -40,9 +87,13 @@ fn enabled(p: &[String], n: &str) -> bool {
     p.iter().any(|p| {
         p == "all"
             || match p.as_str() {
-                "core" => NAMES[..5].contains(&n),
+                "core" => NAMES[..5].contains(&n) || n == "machines" || n == "logs",
+                // Start and stop dev servers in the background.
+                "apps" => ["run", "stop", "logs"].contains(&n),
                 "proxy" => NAMES[5..7].contains(&n),
-                "diagnostics" => NAMES[7..].contains(&n),
+                "diagnostics" => ["doctor", "prune", "version", "doctor_fix"].contains(&n),
+                // Inspection only: nothing that changes routes, the proxy or processes.
+                "readonly" => READ_ONLY.contains(&n),
                 _ => false,
             }
     })
@@ -50,32 +101,54 @@ fn enabled(p: &[String], n: &str) -> bool {
 fn definition(n: &str) -> Value {
     let mut properties = json!({});
     if n != "tools_profiles" {
-        properties = json!({"cwd":{"type":"string","minLength":1},"extraArgs":{"type":"array","items":{"type":"string"}},"timeoutMs":{"type":"integer","minimum":1,"maximum":2147483647,"default":120000}});
+        properties = json!({"cwd":{"type":"string","minLength":1},"timeoutMs":{"type":"integer","minimum":1,"maximum":2147483647,"default":120000}});
+        if !allowed_extra(n).is_empty() {
+            properties["extraArgs"] =
+                json!({"type":"array","items":{"type":"string","enum":allowed_extra(n)}});
+        }
     }
     let fields: &[&str] = match n {
         "get" => &["name", "noWorktree"],
-        "alias_add" => &["name", "port", "force", "tld"],
+        "alias_add" => &[
+            "name", "port", "force", "tld", "private", "upstream", "insecure",
+        ],
         "alias_remove" => &["name", "tld"],
-        "proxy_start" => &["port", "noTls", "lan", "tld", "wildcard", "unprivileged"],
+        "proxy_start" => &[
+            "port",
+            "https",
+            "noTls",
+            "lan",
+            "tld",
+            "wildcard",
+            "unprivileged",
+        ],
         "proxy_stop" => &["port"],
         "prune" => &["force"],
+        "doctor_fix" => &["yes"],
+        "run" => &["command", "name", "private", "appPort"],
+        "stop" => &["name", "all"],
+        "logs" => &["name", "lines"],
         _ => &[],
     };
     for f in fields {
         properties[*f] = match *f {
-            "name" => json!({"type":"string","minLength":1}),
+            "name" | "upstream" => json!({"type":"string","minLength":1}),
             "port" => json!({"type":"integer","minimum":1,"maximum":65535}),
+            "lines" => json!({"type":"integer","minimum":1,"maximum":100000}),
+            "appPort" => json!({"type":"integer","minimum":1,"maximum":65535}),
+            "command" => json!({"type":"array","minItems":1,"items":{"type":"string"}}),
             "tld" => json!({"type":"array","minItems":1,"items":{"type":"string"}}),
             _ => json!({"type":"boolean"}),
         };
     }
     let required: Vec<&str> = match n {
-        "get" | "alias_remove" => vec!["name"],
+        "get" | "alias_remove" | "stop" | "logs" => vec!["name"],
+        "run" => vec!["command"],
         "alias_add" => vec!["name", "port"],
         _ => vec![],
     };
-    let read = ["list", "get", "tools_profiles", "doctor", "version"].contains(&n);
-    json!({"name":n,"description":format!("Porch {}", n.replace('_', " ")),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read,"destructiveHint":(["alias_add","alias_remove","proxy_stop","prune"].contains(&n)),"idempotentHint":n!="alias_add","openWorldHint":n=="proxy_start"}})
+    let read = READ_ONLY.contains(&n);
+    json!({"name":n,"description":description(n),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read,"destructiveHint":(["alias_add","alias_remove","proxy_stop","prune","doctor_fix","stop","run"].contains(&n)),"idempotentHint":n!="alias_add","openWorldHint":(n=="proxy_start"||n=="run")}})
 }
 fn validate(n: &str, a: &Value) -> Result<()> {
     let d = definition(n);
@@ -118,34 +191,69 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
     validate(n, a)?;
     if n == "tools_profiles" {
         return Ok(tool_result(
-            json!({"activeProfiles":p,"availableProfiles":["core","proxy","diagnostics","all"]}),
+            json!({"activeProfiles":p,"availableProfiles":["core","proxy","diagnostics","readonly","apps","all"]}),
             false,
         ));
     }
-    // Route listing uses the same persistent state as the proxy.
-    if n == "list" && a.as_object().unwrap().is_empty() {
-        let state = crate::state::load()?;
-        let settings = crate::state::proxy_settings()?;
-        let routes: Vec<_> = state
-            .routes
-            .iter()
-            .filter(|r| crate::state::route_alive(&state,r))
-            .map(|r| json!({"name":r.name,"url":settings.url(&r.name),"target":r.target,"pid":r.pid,"urls":state.shares.get(&r.name)}))
-            .collect();
-        return Ok(tool_result(json!({"routes":routes}), false));
+    if let Some(extra) = a["extraArgs"].as_array() {
+        let allowed = allowed_extra(n);
+        for arg in extra {
+            let s = arg.as_str().unwrap_or_default();
+            let flag = s.split('=').next().unwrap_or(s);
+            if !allowed.contains(&flag) {
+                bail!("{n} does not accept the argument {s:?}");
+            }
+        }
     }
     let mut argv: Vec<String> = match n {
         "list" => vec!["list".into(), "--json".into()],
         "alias_add" => vec![
             "alias".into(),
             a["name"].as_str().unwrap().into(),
-            format!("http://127.0.0.1:{}", a["port"]),
+            a["port"].to_string(),
         ],
         "alias_remove" => vec!["remove".into(), a["name"].as_str().unwrap().into()],
         "get" => vec!["get".into(), a["name"].as_str().unwrap().into()],
         "proxy_start" => vec!["proxy".into(), "start".into()],
         "proxy_stop" => vec!["proxy".into(), "stop".into()],
         "version" => vec!["--version".into()],
+        "doctor_fix" => vec!["doctor".into(), "--fix".into()],
+        "machines" => vec!["list".into(), "--all".into(), "--json".into()],
+        "run" => {
+            let mut v = vec!["run".into(), "--detach".into()];
+            if let Some(name) = a["name"].as_str() {
+                v.extend(["--name".into(), name.into()]);
+            }
+            if a["private"] == true {
+                v.push("--private".into());
+            }
+            if let Some(port) = a["appPort"].as_u64() {
+                v.extend(["--app-port".into(), port.to_string()]);
+            }
+            v.push("--".into());
+            v.extend(
+                a["command"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c.as_str().unwrap().to_owned()),
+            );
+            v
+        }
+        "stop" => {
+            let mut v = vec!["stop".into(), a["name"].as_str().unwrap().into()];
+            if a["all"] == true {
+                v.push("--all".into());
+            }
+            v
+        }
+        "logs" => {
+            let mut v = vec!["logs".into(), a["name"].as_str().unwrap().into()];
+            if let Some(n) = a["lines"].as_u64() {
+                v.extend(["--lines".into(), n.to_string()]);
+            }
+            v
+        }
         _ => vec![n.into()],
     };
     if n.starts_with("proxy_") {
@@ -160,10 +268,18 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
         ("lan", "--lan"),
         ("wildcard", "--wildcard"),
         ("unprivileged", "--unprivileged"),
+        ("yes", "--yes"),
+        ("private", "--private"),
+        ("insecure", "--insecure"),
+        ("https", "--https"),
     ] {
-        if a[key] == true {
+        // `run` places its own flags before the child command's `--`.
+        if a[key] == true && n != "run" {
             argv.push(flag.into());
         }
+    }
+    if let Some(up) = a["upstream"].as_str() {
+        argv.extend(["--upstream".into(), up.into()]);
     }
     if let Some(tlds) = a["tld"].as_array() {
         for tld in tlds {
@@ -187,6 +303,11 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
         .stderr(Stdio::piped())
         .env("NO_COLOR", "1")
         .env("CI", "1")
+        // Read-only tools must not even prune dead routes.
+        .env(
+            "PORCH_READ_ONLY",
+            if READ_ONLY.contains(&n) { "1" } else { "0" },
+        )
         .env_remove("FORCE_COLOR")
         .kill_on_drop(true);
     if let Some(cwd) = a["cwd"].as_str() {
@@ -350,6 +471,11 @@ mod tests {
         );
         assert!(profiles("bad").is_err());
         assert!(!enabled(&profiles("core").unwrap(), "proxy_start"));
+        let ro = profiles("readonly").unwrap();
+        for n in NAMES {
+            let read = definition(n)["annotations"]["readOnlyHint"] == true;
+            assert_eq!(enabled(&ro, n), read, "{n}");
+        }
     }
     #[test]
     fn arguments() {
@@ -360,6 +486,109 @@ mod tests {
             json!({"name":"x","port":3,"unknown":true}),
         ] {
             assert!(validate("alias_add", &a).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn read_only_tools_reject_repair_arguments() {
+        for (tool, extra) in [("list", "--force"), ("get", "--force")] {
+            let err = call(
+                tool,
+                &json!({"extraArgs":[extra]})
+                    .as_object()
+                    .map(|o| {
+                        let mut o = o.clone();
+                        if tool == "get" {
+                            o.insert("name".into(), json!("web"));
+                        }
+                        Value::Object(o)
+                    })
+                    .unwrap(),
+                &["all".into()],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("does not accept"),
+                "{tool} {extra}: {err}"
+            );
+        }
+        // Tools that change things take no extraArgs at all.
+        for tool in ["doctor", "alias_add", "proxy_start", "run", "stop", "prune"] {
+            assert!(
+                validate(
+                    tool,
+                    &json!({"extraArgs":["--upstream","https://example.com"]})
+                )
+                .is_err(),
+                "{tool}"
+            );
+        }
+        let doctor = definition("doctor");
+        assert_eq!(doctor["annotations"]["readOnlyHint"], true);
+        assert_eq!(
+            definition("doctor_fix")["annotations"]["destructiveHint"],
+            true
+        );
+    }
+    /// Every flag of the commands MCP wraps is either a typed tool argument
+    /// or deliberately left out, so the two can't drift apart.
+    #[test]
+    fn tool_arguments_cover_the_cli_flags() {
+        let cli = crate::cli::command();
+        let camel = |flag: &str| {
+            let mut out = String::new();
+            let mut upper = false;
+            for c in flag.chars() {
+                if c == '-' {
+                    upper = true;
+                } else if upper {
+                    out.extend(c.to_uppercase());
+                    upper = false;
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        for (path, tool, excluded) in [
+            (vec!["alias"], "alias_add", vec!["remove", "help"]),
+            (
+                vec!["proxy", "start"],
+                "proxy_start",
+                // Foreground can't work over MCP; the rest need files or are
+                // saved settings an agent shouldn't change behind the user.
+                vec![
+                    "foreground",
+                    "skip-trust",
+                    "ip",
+                    "cert",
+                    "key",
+                    "bind",
+                    "redirect-port",
+                    "state-dir",
+                    "help",
+                ],
+            ),
+            (vec!["get"], "get", vec!["help"]),
+            (vec!["stop"], "stop", vec!["help"]),
+            (vec!["logs"], "logs", vec!["follow", "help"]),
+        ] {
+            let mut command = &cli;
+            for part in &path {
+                command = command.find_subcommand(part).unwrap();
+            }
+            let properties = definition(tool)["inputSchema"]["properties"].clone();
+            for arg in command.get_arguments() {
+                let Some(long) = arg.get_long() else { continue };
+                if excluded.contains(&long) {
+                    continue;
+                }
+                assert!(
+                    !properties[camel(long)].is_null(),
+                    "MCP tool {tool} has no argument for `porch {} --{long}`",
+                    path.join(" ")
+                );
+            }
         }
     }
     #[tokio::test]
@@ -389,8 +618,15 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            5
+            7
         );
+        let tools = s
+            .handle(r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#)
+            .await
+            .unwrap();
+        for tool in tools["result"]["tools"].as_array().unwrap() {
+            assert!(tool["description"].as_str().unwrap().len() > 40, "{tool}");
+        }
         s.handle(r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#)
             .await;
         assert!(s.shutdown);

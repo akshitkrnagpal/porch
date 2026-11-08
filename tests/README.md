@@ -38,3 +38,7 @@ Tests run in parallel threads, and several test processes may run at once. Every
 CI installs Turbo 2.6.3 and sets `PORCH_TEST_TURBO_REQUIRED=1`, so the real Turbo TUI test must run. Locally, set `PORCH_TEST_TURBO=/absolute/path/to/turbo` if `turbo` isn't on your PATH. Without Turbo 2, the other terminal tests still run and the Turbo test reports a skip.
 
 Tests never run real sudo or bind privileged ports; the sudo flow uses a fake prompt attached to a terminal. Port-collision tests hold wildcard IPv4 and dual-stack IPv6 listeners, the accept-error test lowers the file descriptor limit of its own proxy only, and hosts-file permission tests use temporary read-only files.
+
+## Real frameworks (`tests/e2e.rs`)
+
+`python3 -m http.server`, which ignores `PORT`, always runs through Porch, which adds its port and bind address. With `PORCH_E2E=1` (set in CI on Linux and macOS), the suite also installs Next.js 15 (page and HMR socket), Astro 5 (which needs the port flags Porch adds) and Vite 6 from npm, runs it with `porch run`, and checks through the proxy that the page and Vite's client module load under the Porch name, that Vite's HMR WebSocket connects with its token, and that editing a module sends an HMR update over that socket. Without the variable the test is skipped, so offline runs stay green.

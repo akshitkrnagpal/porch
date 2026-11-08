@@ -36,6 +36,14 @@ concurrency:
   group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  deny:
+    # Known vulnerabilities, unmaintained crates, licenses and sources.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
   test:
     strategy:
       fail-fast: false
@@ -44,6 +52,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       PORCH_TEST_TURBO_REQUIRED: "1"
+      # tests/e2e.rs installs real Vite from npm and drives its HMR socket.
+      PORCH_E2E: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

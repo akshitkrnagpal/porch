@@ -118,22 +118,75 @@ fn orphaned(s: &State, r: &Route) -> bool {
     })
 }
 
-fn target_port(r: &Route) -> Option<(String, u16)> {
-    let u = url::Url::parse(&r.target).ok()?;
-    Some((u.host_str()?.to_owned(), u.port_or_known_default()?))
+fn listening(r: &Route) -> bool {
+    target_listening(&r.target)
 }
 
-fn listening(r: &Route) -> bool {
-    match target_port(r) {
-        Some((host, port)) => {
-            let host = host.trim_start_matches('[').trim_end_matches(']');
-            match host.parse::<std::net::IpAddr>() {
-                Ok(ip) => crate::ports::accepts_on((ip, port).into()),
-                // Remote alias targets are not probed.
-                Err(_) => true,
+/// [`target_listening`], remembered for two seconds per target, for pages
+/// that many tabs refresh (the dashboard) so views don't probe every app.
+pub fn target_listening_cached(target: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<HashMap<String, (bool, Instant)>>> = Mutex::new(None);
+    if let Ok(mut cache) = CACHE.lock() {
+        let map = cache.get_or_insert_with(HashMap::new);
+        if let Some((up, at)) = map.get(target) {
+            if at.elapsed() < Duration::from_secs(2) {
+                return *up;
             }
         }
-        None => true,
+        if map.len() > 1024 {
+            map.clear();
+        }
+    }
+    let up = target_listening(target);
+    if let Ok(mut cache) = CACHE.lock() {
+        cache
+            .get_or_insert_with(HashMap::new)
+            .insert(target.to_owned(), (up, Instant::now()));
+    }
+    up
+}
+
+/// Does the route's target accept connections the way the proxy dials it?
+///
+/// The proxy dials plain-HTTP loopback targets as `localhost`, which reaches an
+/// app on either 127.0.0.1 or ::1, so both are probed. Remote alias targets
+/// are not probed.
+pub fn target_listening(target: &str) -> bool {
+    let target = if target.contains("://") {
+        target.to_owned()
+    } else {
+        format!("http://{target}")
+    };
+    let Ok(u) = url::Url::parse(&target) else {
+        return true;
+    };
+    let Some(port) = u.port_or_known_default() else {
+        return true;
+    };
+    let loopback = match u.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        None => return true,
+    };
+    if loopback {
+        let v4 = std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST);
+        let v6 = std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST);
+        return [v4, v6]
+            .into_iter()
+            .any(|ip| crate::ports::accepts_on((ip, port).into()));
+    }
+    match u.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            crate::ports::accepts_on((std::net::IpAddr::from(ip), port).into())
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            crate::ports::accepts_on((std::net::IpAddr::from(ip), port).into())
+        }
+        _ => true,
     }
 }
 
@@ -171,6 +224,12 @@ fn now() -> u64 {
 /// Remove dead routes whose processes are gone, remember when routes were first
 /// seen stopped, and return the health of every remaining route.
 pub fn reconcile() -> Result<(Vec<String>, Vec<RouteHealth>)> {
+    reconcile_with(true)
+}
+
+/// Like [`reconcile`], but with `apply: false` nothing is written: the dead
+/// routes that would be removed are returned instead (for `porch doctor`).
+pub fn reconcile_with(apply: bool) -> Result<(Vec<String>, Vec<RouteHealth>)> {
     let procs = processes();
     let snapshot = state::load()?;
     let mut removable = Vec::new();
@@ -194,7 +253,9 @@ pub fn reconcile() -> Result<(Vec<String>, Vec<RouteHealth>)> {
         since.entry(n.clone()).or_insert_with(now);
     }
     let mut removed = Vec::new();
-    if !removable.is_empty() || since != snapshot.stopped_since {
+    if !apply {
+        removed = removable.into_iter().map(|(n, _)| n).collect();
+    } else if !removable.is_empty() || since != snapshot.stopped_since {
         state::transaction(|s| {
             for (name, pid) in &removable {
                 // Only remove the exact registration we judged dead.
@@ -312,6 +373,19 @@ fn not_listening_message(port: u16, group: u32, command: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ipv6_only_app_counts_as_listening_like_the_proxy_sees_it() {
+        let Ok(v6) = std::net::TcpListener::bind("[::1]:0") else {
+            return; // no IPv6 loopback on this machine
+        };
+        let port = v6.local_addr().unwrap().port();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+            return; // the IPv4 side is taken by something else
+        }
+        assert!(super::target_listening(&format!("http://127.0.0.1:{port}")));
+        drop(v6);
+    }
+
     use super::*;
     #[test]
     fn process_tree_follows_group_and_descendants() {

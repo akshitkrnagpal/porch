@@ -82,14 +82,14 @@ fn catalog_keeps_identity_stable_and_reports_local_only_routes_without_leaking_t
         ..Default::default()
     };
     write(&dir, "state.json", &serde_json::to_vec(&data).unwrap()).unwrap();
-    let local = catalog(&dir, m.clone(), false).unwrap();
+    let local = catalog(&dir, m.clone(), false, true).unwrap();
     assert!(!local.apps[0].remote_access);
     assert!(local.apps[0]
         .unavailable_reason
         .as_ref()
         .unwrap()
         .contains("Local only"));
-    let remote = catalog(&dir, m, true).unwrap();
+    let remote = catalog(&dir, m, true, true).unwrap();
     assert!(remote.apps[0].remote_access);
     assert_eq!(local.apps[0].id, remote.apps[0].id);
     // Only the apps can carry a route's target. The whole catalog also holds
@@ -97,6 +97,52 @@ fn catalog_keeps_identity_stable_and_reports_local_only_routes_without_leaking_t
     let apps = serde_json::to_string(&remote.apps).unwrap();
     assert!(!apps.contains("127.0.0.1"), "{apps}");
     assert!(!apps.contains(":9000"), "{apps}");
+    let _ = fs::remove_dir_all(dir);
+}
+#[test]
+fn private_routes_and_remote_targets_are_never_offered_to_peers() {
+    let dir = temp();
+    let m = machine(&dir).unwrap();
+    let route = |name: &str, target: &str| Route {
+        name: name.into(),
+        target: target.into(),
+        pid: None,
+    };
+    let data = State {
+        routes: vec![
+            route("web", "http://127.0.0.1:9000"),
+            route("secret", "http://127.0.0.1:9001"),
+            route("router", "http://192.168.1.1"),
+            route("metadata", "http://169.254.169.254"),
+        ],
+        private: ["secret".to_owned()].into_iter().collect(),
+        ..Default::default()
+    };
+    write(&dir, "state.json", &serde_json::to_vec(&data).unwrap()).unwrap();
+    let apps = catalog(&dir, m, true, true).unwrap().apps;
+    let names: Vec<_> = apps.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["web", "router", "metadata"]);
+    // The local catalog (tray, `porch open`) still lists the private app, but
+    // never as remotely reachable.
+    let local = catalog(&dir, machine(&dir).unwrap(), true, false)
+        .unwrap()
+        .apps;
+    let secret = local.iter().find(|a| a.name == "secret").unwrap();
+    assert!(!secret.remote_access);
+    assert!(secret
+        .unavailable_reason
+        .as_ref()
+        .unwrap()
+        .contains("Private"));
+    assert!(apps[0].remote_access);
+    for app in &apps[1..] {
+        assert!(!app.remote_access, "{}", app.name);
+        assert!(app
+            .unavailable_reason
+            .as_ref()
+            .unwrap()
+            .contains("on this machine"));
+    }
     let _ = fs::remove_dir_all(dir);
 }
 #[test]
@@ -118,7 +164,7 @@ fn catalog_health_matches_porch_list() {
         ..Default::default()
     };
     write(&dir, "state.json", &serde_json::to_vec(&data).unwrap()).unwrap();
-    let apps = catalog(&dir, m, true).unwrap().apps;
+    let apps = catalog(&dir, m, true, true).unwrap().apps;
     // A listening app is healthy, not "status unknown" in the menu.
     assert_eq!(apps[0].health, Health::Healthy);
     assert_eq!(apps[1].health, Health::Unreachable);
@@ -185,6 +231,15 @@ async fn fixture(label: &'static str) -> Fixture {
             }),
         )
         .route(
+            "/go",
+            get(|| async {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [("location", "http://api.internal:8080/login?next=1")],
+                )
+            }),
+        )
+        .route(
             "/ws",
             get(|ws: WebSocketUpgrade| async move {
                 ws.on_upgrade(|mut socket| async move {
@@ -214,7 +269,7 @@ async fn fixture(label: &'static str) -> Fixture {
     ensure_certificate(&dir, "127.0.0.1").unwrap();
     let cert = cert_der(&dir).unwrap().remove(0);
     let bytes = fs::read(dir.join("discovery-key.pem")).unwrap();
-    let key = rustls_pemfile::private_key(&mut bytes.as_slice())
+    let key = crate::pem::private_key(&mut bytes.as_slice())
         .unwrap()
         .unwrap();
     let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -231,6 +286,8 @@ async fn fixture(label: &'static str) -> Fixture {
         machine: machine.clone(),
         share_apps: true,
         client: upstream(&dir).unwrap(),
+        loopback: crate::upstream::client(tls_roots(&dir).unwrap()),
+        loopback_insecure: crate::upstream::client(crate::upstream::insecure_tls().unwrap()),
         tunnels: Arc::new(tokio::sync::Semaphore::new(64)),
         attempts: Arc::default(),
         sessions: Arc::default(),
@@ -1064,4 +1121,67 @@ async fn real_tls_window_changes_mid_exchange_and_racing_finishes_enroll_at_most
     assert_eq!(codes, [StatusCode::OK, StatusCode::GONE]);
     let auth: Auth = read(&f.dir.join("discovery-auth.json")).unwrap().unwrap();
     assert_eq!(auth.clients.len(), 1);
+}
+
+#[tokio::test]
+async fn paired_access_honors_an_aliases_upstream_settings() {
+    let a = fixture("machine-a").await;
+    let mut data: State = read(&a.dir.join("state.json")).unwrap().unwrap();
+    data.upstreams.insert(
+        "web".into(),
+        crate::state::Upstream {
+            tls: false,
+            authority: Some("api.internal:8080".into()),
+            insecure: false,
+        },
+    );
+    write(&a.dir, "state.json", &serde_json::to_vec(&data).unwrap()).unwrap();
+    let bearer = pair(&a).await;
+    let (_, body) = call(
+        &a,
+        Method::GET,
+        "/v1/catalog",
+        Some(&bearer),
+        None,
+        String::new(),
+    )
+    .await;
+    let catalog: Catalog = serde_json::from_slice(&body).unwrap();
+    let id = &catalog.apps[0].id;
+    // The backend sees the alias's own Host, as it does through the local proxy.
+    let (status, body) = call(
+        &a,
+        Method::GET,
+        &format!("/v1/apps/{id}/proxy/hello"),
+        Some(&bearer),
+        None,
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "machine-a|api.internal:8080|none");
+    // Its redirects to itself come back as the app's Porch URL.
+    let stream = tls_stream(&a).await;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let response = sender
+        .send_request(
+            Request::builder()
+                .uri(format!("/v1/apps/{id}/proxy/go"))
+                .header("host", a.addr.to_string())
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(http_body_util::Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(
+        response.headers()["location"],
+        "http://web.localhost:7462/login?next=1"
+    );
 }

@@ -394,7 +394,7 @@ fn ensure_certificate(dir: &Path, bind: &str) -> Result<()> {
 }
 fn cert_der(dir: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let bytes = fs::read(dir.join("discovery-cert.pem"))?;
-    Ok(rustls_pemfile::certs(&mut bytes.as_slice()).collect::<std::io::Result<_>>()?)
+    Ok(crate::pem::certs(&mut bytes.as_slice()).collect::<std::io::Result<_>>()?)
 }
 pub fn fingerprint() -> Result<String> {
     let bind = config()?
@@ -803,7 +803,9 @@ fn route_url(settings: &ProxySettings, name: &str) -> String {
         format!("{url}/{path}")
     }
 }
-fn catalog(dir: &Path, machine: Machine, share: bool) -> Result<Catalog> {
+/// The app catalog. `for_peer` is the copy sent to paired machines, which
+/// never mentions private apps; the local copy (tray, `porch open`) keeps them.
+fn catalog(dir: &Path, machine: Machine, share: bool, for_peer: bool) -> Result<Catalog> {
     let data: State = read(&dir.join("state.json"))?.unwrap_or_default();
     let settings: ProxySettings = read(&dir.join("proxy.json"))?.unwrap_or_default();
     let proxy_running = running(dir);
@@ -811,11 +813,13 @@ fn catalog(dir: &Path, machine: Machine, share: bool) -> Result<Catalog> {
     let apps = data
         .routes
         .iter()
+        .filter(|route| !(for_peer && data.private.contains(&route.name)))
         .take(MAX_ROUTES)
         .map(|route| {
             let alive = state::route_alive(&data, route);
             let supported = route_target(route).is_ok();
-            let remote_access = share && alive && supported;
+            let private = data.private.contains(&route.name);
+            let remote_access = share && alive && supported && !private;
             App {
                 id: route_id(&machine, &route.name),
                 name: route.name.clone(),
@@ -829,12 +833,17 @@ fn catalog(dir: &Path, machine: Machine, share: bool) -> Result<Catalog> {
                     }
                 },
                 remote_access,
-                unavailable_reason: if !alive {
+                unavailable_reason: if private {
+                    Some("Private to this machine (--private)".into())
+                } else if !alive {
                     Some("App process is stopped".into())
                 } else if !share {
                     Some("Local only; remote app transport is disabled on this machine".into())
                 } else if !supported {
-                    Some("Route target is not a supported HTTP URL".into())
+                    Some(
+                        "Only apps on this machine can be shared; this route points elsewhere"
+                            .into(),
+                    )
                 } else {
                     None
                 },
@@ -855,6 +864,7 @@ pub fn local_catalog() -> Result<Catalog> {
         &dir,
         machine(&dir)?,
         config()?.is_some_and(|c| c.share_apps),
+        false,
     )
 }
 fn response(status: StatusCode, message: impl Into<Bytes>) -> Response<Body> {
@@ -897,6 +907,17 @@ fn route_target(route: &Route) -> Result<url::Url> {
     {
         bail!("unsupported route target")
     };
+    // Paired machines may only reach apps on this machine. An alias to another
+    // host (a LAN service, a cloud metadata address) must not become a relay.
+    let local = match target.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if !local {
+        bail!("route target is not on this machine")
+    }
     Ok(target)
 }
 fn strip(headers: &mut header::HeaderMap) {
@@ -932,6 +953,9 @@ struct ContextState {
     /// `porch pair` can turn sharing on without restarting the agent.
     share_apps: bool,
     client: Upstream,
+    /// For `--upstream` aliases: verified, and `--insecure` (loopback only).
+    loopback: crate::upstream::LoopbackClient<Body>,
+    loopback_insecure: crate::upstream::LoopbackClient<Body>,
     tunnels: Arc<tokio::sync::Semaphore>,
     attempts: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
     /// In-progress code-pairing key exchanges, by random session ID.
@@ -1271,6 +1295,7 @@ async fn request(
             &context.dir,
             context.machine.clone(),
             context.sharing(),
+            true,
         )?));
     }
     if req.uri().path() == "/v1/unpair" && req.method() == Method::POST {
@@ -1305,11 +1330,11 @@ async fn request(
         return Ok(response(StatusCode::NOT_FOUND, "unknown app"));
     }
     let data: State = read(&context.dir.join("state.json"))?.unwrap_or_default();
-    let Some(route) = data
-        .routes
-        .iter()
-        .find(|r| route_id(&context.machine, &r.name) == app_id && state::route_alive(&data, r))
-    else {
+    let Some(route) = data.routes.iter().find(|r| {
+        route_id(&context.machine, &r.name) == app_id
+            && !data.private.contains(&r.name)
+            && state::route_alive(&data, r)
+    }) else {
         return Ok(response(
             StatusCode::NOT_FOUND,
             "app is no longer registered",
@@ -1333,6 +1358,22 @@ async fn request(
             .map(|q| format!("?{q}"))
             .unwrap_or_default()
     );
+    // `--upstream` aliases: the same scheme, Host and certificate policy as
+    // the local proxy uses, still dialing only this computer.
+    let upstream_spec = data.upstreams.get(&route.name).cloned();
+    let uri = match &upstream_spec {
+        Some(up) => {
+            let pq = format!(
+                "{path}{}",
+                req.uri()
+                    .query()
+                    .map(|q| format!("?{q}"))
+                    .unwrap_or_default()
+            );
+            crate::upstream::request(up, target.port_or_known_default().unwrap_or(80), &pq).0
+        }
+        None => uri,
+    };
     let uri: hyper::Uri = uri.parse().context("invalid route URI")?;
     let websocket = req
         .headers()
@@ -1355,6 +1396,10 @@ async fn request(
     let origin = req.headers_mut().remove("x-porch-app-origin");
     let auth = req.headers_mut().remove("x-porch-app-authorization");
     let original_host = req.headers_mut().remove("x-porch-app-host");
+    let original_proto = req
+        .headers_mut()
+        .remove("x-porch-app-proto")
+        .filter(|v| v == "https" || v == "http");
     strip(req.headers_mut());
     req.headers_mut().remove(header::AUTHORIZATION);
     // Never let a bearer or arbitrary internal control header reach a development app.
@@ -1376,13 +1421,18 @@ async fn request(
     if let Some(v) = original_host {
         req.headers_mut().insert("x-forwarded-host", v);
     }
-    let host = route_url(&settings, &route.name);
-    let host = url::Url::parse(&host)?;
-    let host = &host[url::Position::BeforeHost..url::Position::AfterPort];
+    let public = route_url(&settings, &route.name);
+    let public = url::Url::parse(&public)?;
+    let host = match upstream_spec.as_ref().and_then(|u| u.authority.clone()) {
+        Some(authority) => authority,
+        None => public[url::Position::BeforeHost..url::Position::AfterPort].to_owned(),
+    };
     req.headers_mut().insert(header::HOST, host.parse()?);
+    // The scheme the browser used on the paired machine, so apps build
+    // correct redirects and secure cookies.
     req.headers_mut().insert(
         "x-forwarded-proto",
-        header::HeaderValue::from_static("http"),
+        original_proto.unwrap_or(header::HeaderValue::from_static("http")),
     );
     if websocket {
         req.headers_mut().insert(
@@ -1403,16 +1453,23 @@ async fn request(
             .map_err(|e| -> BoxError { e })
             .boxed_unsync(),
     );
-    let mut upstream =
-        match tokio::time::timeout(Duration::from_secs(15), context.client.request(req)).await {
-            Ok(Ok(v)) => v,
-            _ => {
-                return Ok(response(
-                    StatusCode::BAD_GATEWAY,
-                    "registered app is unavailable",
-                ))
-            }
-        };
+    let mut upstream = match tokio::time::timeout(Duration::from_secs(15), async {
+        match &upstream_spec {
+            Some(up) if up.insecure => context.loopback_insecure.request(req).await,
+            Some(_) => context.loopback.request(req).await,
+            None => context.client.request(req).await,
+        }
+    })
+    .await
+    {
+        Ok(Ok(v)) => v,
+        _ => {
+            return Ok(response(
+                StatusCode::BAD_GATEWAY,
+                "registered app is unavailable",
+            ))
+        }
+    };
     if upstream.status() == StatusCode::SWITCHING_PROTOCOLS {
         if let Some(downstream) = downstream {
             let remote = hyper::upgrade::on(&mut upstream);
@@ -1429,25 +1486,31 @@ async fn request(
         }
     } else {
         strip(upstream.headers_mut());
+        // An `--upstream` backend's redirects to itself become redirects to
+        // the app's Porch URL, which the paired machine's relay maps onward.
+        if let Some(up) = &upstream_spec {
+            let public_origin = public.origin().ascii_serialization();
+            let rewritten = upstream
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|l| {
+                    crate::upstream::rewrite_location(
+                        l,
+                        &crate::upstream::origins(up),
+                        &public_origin,
+                    )
+                })
+                .and_then(|l| header::HeaderValue::from_str(&l).ok());
+            if let Some(v) = rewritten {
+                upstream.headers_mut().insert(header::LOCATION, v);
+            }
+        }
     }
     Ok(upstream.map(|body| body.map_err(|e| -> BoxError { Box::new(e) }).boxed_unsync()))
 }
 fn upstream(dir: &Path) -> Result<Upstream> {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(cert);
-    }
-    if let Ok(bytes) = fs::read(dir.join("ca.pem")) {
-        for cert in rustls_pemfile::certs(&mut bytes.as_slice()).flatten() {
-            let _ = roots.add(cert);
-        }
-    }
-    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    let tls = tls_roots(dir)?;
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     http.set_connect_timeout(Some(Duration::from_secs(5)));
@@ -1457,6 +1520,25 @@ fn upstream(dir: &Path) -> Result<Upstream> {
         .enable_http1()
         .wrap_connector(http);
     Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+/// TLS for reaching apps: the system roots plus Porch's own CA.
+fn tls_roots(dir: &Path) -> Result<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert);
+    }
+    if let Ok(bytes) = fs::read(dir.join("ca.pem")) {
+        for cert in crate::pem::certs(&mut bytes.as_slice()).flatten() {
+            let _ = roots.add(cert);
+        }
+    }
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(tls)
 }
 struct Advertisement {
     daemon: mdns_sd::ServiceDaemon,
@@ -1494,8 +1576,7 @@ pub async fn serve() -> Result<()> {
     ensure_certificate(&dir, &config.bind)?;
     let certificates = cert_der(&dir)?;
     let bytes = fs::read(dir.join("discovery-key.pem"))?;
-    let key =
-        rustls_pemfile::private_key(&mut bytes.as_slice())?.context("missing discovery key")?;
+    let key = crate::pem::private_key(&mut bytes.as_slice())?.context("missing discovery key")?;
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -1522,6 +1603,8 @@ pub async fn serve() -> Result<()> {
         machine,
         share_apps: config.share_apps,
         client: upstream(&dir)?,
+        loopback: crate::upstream::client(tls_roots(&dir)?),
+        loopback_insecure: crate::upstream::client(crate::upstream::insecure_tls()?),
         tunnels: Arc::new(tokio::sync::Semaphore::new(64)),
         attempts: Arc::default(),
         sessions: Arc::default(),

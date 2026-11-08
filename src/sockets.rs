@@ -1,4 +1,9 @@
-//! Exclusive TCP reservations. Never enable SO_REUSEADDR on live listeners.
+//! Exclusive TCP reservations.
+//!
+//! SO_REUSEADDR is never set up front. On Unix it is used only to retry a bind
+//! that failed because closed connections still linger in TIME_WAIT, after
+//! checking that no process is listening on the port (with it, BSD would let
+//! us bind a specific address beside another program's wildcard listener).
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
@@ -46,9 +51,33 @@ pub fn bind(addr: SocketAddr, v6_only: bool) -> io::Result<TcpListener> {
         }
     })?;
     #[cfg(not(windows))]
-    socket.bind(&addr.into())?;
+    if let Err(e) = socket.bind(&addr.into()) {
+        if e.kind() != io::ErrorKind::AddrInUse || listening(addr) {
+            return Err(e);
+        }
+        // Only TIME_WAIT connections hold the port (for example right after
+        // the proxy restarts): reuse it instead of waiting up to a minute.
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        if addr.is_ipv6() {
+            socket.set_only_v6(v6_only)?;
+        }
+        socket.set_reuse_address(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        return Ok(socket.into());
+    }
     socket.listen(1024)?;
     Ok(socket.into())
+}
+/// Is any process listening on this port (not just lingering connections)?
+#[cfg(not(windows))]
+fn listening(addr: SocketAddr) -> bool {
+    let port = addr.port();
+    crate::ports::owner(port).is_some()
+        || crate::ports::accepts_on(SocketAddr::from(([127, 0, 0, 1], port)))
+        || crate::ports::accepts_on(SocketAddr::from((Ipv6Addr::LOCALHOST, port)))
+        || (!addr.ip().is_unspecified() && crate::ports::accepts_on(addr))
 }
 
 /// Windows lets a wildcard bind share a port with a specific-address

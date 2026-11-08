@@ -11,7 +11,7 @@ pub struct SetupArgs {
     /// Accept the defaults (current settings) without prompting.
     #[arg(long, short = 'y')]
     pub yes: bool,
-    /// Proxy port (default 7462, for HTTP and HTTPS alike).
+    /// Proxy port (default: 80/443 when no sudo is needed, else 7462).
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     pub port: Option<u16>,
     /// Opt in to HTTPS with a local CA trusted for your user (no sudo).
@@ -140,9 +140,40 @@ pub async fn run(a: SetupArgs) -> Result<()> {
     } else {
         current.port
     };
-    let wanted = explicit.unwrap_or(default_port);
-    let ours = running && current.port == wanted;
-    let port = choose_port(wanted, explicit.is_some(), ours, interactive)?;
+    // URLs without a port: offered when this OS lets Porch bind the standard
+    // port as this user (macOS, Windows, Linux with a lowered
+    // ip_unprivileged_port_start). Never needs sudo.
+    let standard = if https { 443 } else { 80 };
+    let already_clean = current.unprivileged && current.port == standard;
+    let fresh = !state::dir().join("proxy.json").exists();
+    let clean_possible = explicit.is_none()
+        && ports::clean_urls_enabled()
+        && ((running && already_clean) || ports::clean_port_bindable(standard));
+    let clean = clean_possible
+        && confirm(
+            &format!(
+                "Use URLs without a port, like {}://app.localhost? (no sudo needed on this computer)",
+                if https { "https" } else { "http" }
+            ),
+            already_clean || fresh || current.port < ports::FIRST_UNPRIVILEGED_PORT,
+            interactive,
+        );
+    if explicit.is_none() && !clean_possible && cfg!(target_os = "linux") && interactive {
+        println!("Tip: for URLs without a port on Linux, allow unprivileged low ports once with\n  echo 'net.ipv4.ip_unprivileged_port_start=80' | sudo tee /etc/sysctl.d/50-porch.conf && sudo sysctl --system\nthen run `porch setup` again.");
+    }
+    let port = if clean {
+        standard
+    } else {
+        let default_port = if default_port < ports::FIRST_UNPRIVILEGED_PORT && current.unprivileged
+        {
+            ports::DEFAULT_PROXY_PORT
+        } else {
+            default_port
+        };
+        let wanted = explicit.unwrap_or(default_port);
+        let ours = running && current.port == wanted;
+        choose_port(wanted, explicit.is_some(), ours, interactive)?
+    };
 
     // 3. Start at login (reuses the service integration).
     let service_installed = state::dir().join("service.json").exists();
@@ -168,6 +199,7 @@ pub async fn run(a: SetupArgs) -> Result<()> {
         port: Some(port),
         https,
         no_tls: !https,
+        unprivileged: clean,
         ..Default::default()
     };
     let settings = cli::resolve_settings(&options)?;
@@ -245,10 +277,10 @@ pub async fn run(a: SetupArgs) -> Result<()> {
     println!(
         "\nPorch is ready: {} ({}).",
         settings.url("<app>"),
-        if settings.tls {
-            "HTTPS with a local CA"
-        } else {
-            "plain HTTP, no sudo"
+        match (settings.tls, settings.unprivileged) {
+            (true, true) => "HTTPS with a local CA, no sudo",
+            (true, false) => "HTTPS with a local CA",
+            (false, _) => "plain HTTP, no sudo",
         }
     );
     println!(

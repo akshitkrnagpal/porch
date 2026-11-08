@@ -32,9 +32,9 @@ fn write_private(path: &Path, value: &str) -> Result<()> {
     Ok(())
 }
 fn certified(cert: &str, key: &str) -> Result<Arc<CertifiedKey>> {
-    let chain = rustls_pemfile::certs(&mut BufReader::new(cert.as_bytes()))
+    let chain = crate::pem::certs(&mut BufReader::new(cert.as_bytes()))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key.as_bytes()))?
+    let key = crate::pem::private_key(&mut BufReader::new(key.as_bytes()))?
         .context("No private key in PEM")?;
     let provider = rustls::crypto::ring::default_provider();
     Ok(Arc::new(CertifiedKey::from_der(chain, key, &provider)?))
@@ -43,25 +43,17 @@ fn certified(cert: &str, key: &str) -> Result<Arc<CertifiedKey>> {
 struct LocalResolver {
     ca_pem: String,
     ca_key: String,
-    cache: Mutex<HashMap<String, Arc<CertifiedKey>>>,
+    /// Issued certificates and when each was last used (least recently used
+    /// entries are evicted first).
+    cache: Mutex<HashMap<String, (Arc<CertifiedKey>, std::time::Instant)>>,
     settings: crate::state::ProxySettings,
-    route_state: PathBuf,
 }
 impl LocalResolver {
     fn authorize(&self, name: &str) -> Result<()> {
+        // Route names never widen issuance (see allowed_name), so there is no
+        // need to read route state here.
         if !allowed_name(name, &self.settings, &[]) {
-            let routes = match fs::read(&self.route_state) {
-                Ok(bytes) => {
-                    serde_json::from_slice::<crate::state::State>(&bytes)
-                        .context("invalid route state for TLS issuance")?
-                        .routes
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Err(error) => return Err(error.into()),
-            };
-            if !allowed_name(name, &self.settings, &routes) {
-                bail!("TLS name {name:?} is outside Porch's configured domains");
-            }
+            bail!("TLS name {name:?} is outside Porch's configured domains");
         }
         Ok(())
     }
@@ -90,6 +82,27 @@ impl LocalResolver {
         )
     }
 }
+/// At most 30 new leaf certificates per 10 seconds, across all clients.
+fn issuance_allowed() -> bool {
+    use std::time::{Duration, Instant};
+    static RECENT: Mutex<std::collections::VecDeque<Instant>> =
+        Mutex::new(std::collections::VecDeque::new());
+    let Ok(mut recent) = RECENT.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    while recent
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(10))
+    {
+        recent.pop_front();
+    }
+    if recent.len() >= 30 {
+        return false;
+    }
+    recent.push_back(now);
+    true
+}
 impl ResolvesServerCert for LocalResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let name = hello
@@ -98,14 +111,26 @@ impl ResolvesServerCert for LocalResolver {
             .to_ascii_lowercase();
         self.authorize(&name).ok()?;
         let mut cache = self.cache.lock().ok()?;
-        if let Some(cert) = cache.get(&name) {
+        if let Some((cert, used)) = cache.get_mut(&name) {
+            *used = std::time::Instant::now();
             return Some(cert.clone());
+        }
+        // Each new name costs a key generation: cap the rate, so a client
+        // cycling random names can't burn CPU (names in use stay cached).
+        if !issuance_allowed() {
+            return None;
         }
         let cert = self.issue(&name).ok()?;
         if cache.len() >= 256 {
-            cache.clear();
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest);
+            }
         }
-        cache.insert(name, cert.clone());
+        cache.insert(name, (cert.clone(), std::time::Instant::now()));
         Some(cert)
     }
 }
@@ -131,21 +156,19 @@ fn allowed_name(
     {
         return false;
     }
+    // Only names under a domain Porch serves: the configured TLDs and, in LAN
+    // mode, `.local`. A route's name never widens this: a route called
+    // `github.com` is served as `github.com.localhost`, so the CA must never
+    // sign `github.com` itself. Real domains need your own --cert/--key.
+    let _ = routes;
     let in_domain = |domain: &str| name == domain || name.ends_with(&format!(".{domain}"));
     name == "localhost"
         || settings
             .tlds
             .iter()
+            .filter(|tld| signable_domain(tld))
             .any(|tld| in_domain(tld.trim_start_matches('.')))
         || (settings.lan && in_domain("local"))
-        || routes.iter().any(|route| {
-            let domain = route.name.split('/').next().unwrap_or("");
-            if let Some(suffix) = domain.strip_prefix("*.") {
-                name.ends_with(&format!(".{suffix}"))
-            } else {
-                name == domain
-            }
-        })
 }
 fn set_validity(params: &mut CertificateParams, days: u64) {
     // A short backdate tolerates normal clock skew without extending the profile.
@@ -153,8 +176,85 @@ fn set_validity(params: &mut CertificateParams, days: u64) {
     params.not_before = start.into();
     params.not_after = (start + Duration::from_secs(days * 86_400)).into();
 }
-fn ca_params() -> Result<CertificateParams> {
+/// Domains a new local CA may ever sign for: reserved, never-public names plus
+/// the TLDs configured when it is created. Browsers enforce these X.509 name
+/// constraints, so even a leaked CA key can't impersonate a real website.
+const RESERVED: [&str; 5] = ["localhost", "local", "test", "internal", "home.arpa"];
+/// Can the local CA ever sign names under `tld`? Reserved, never-public names
+/// can, and so can a domain with at least two labels (one you control, such as
+/// `local.example.com`). A bare TLD like `com`, `dev` or `app` never can: a CA
+/// allowed to sign all of `.com` could impersonate real sites.
+pub fn signable_domain(tld: &str) -> bool {
+    let t = tld.trim_start_matches('.').to_ascii_lowercase();
+    if RESERVED
+        .iter()
+        .any(|r| t == *r || t.ends_with(&format!(".{r}")))
+    {
+        return true;
+    }
+    // Anything else must sit inside a registrable domain (a name someone can
+    // own, such as example.com or example.co.uk), never be a public suffix
+    // itself (com, co.uk, github.io) per the Public Suffix List.
+    match (psl::suffix(t.as_bytes()), psl::domain(t.as_bytes())) {
+        (Some(suffix), Some(_)) => suffix.as_bytes() != t.as_bytes(),
+        _ => false,
+    }
+}
+fn ca_permitted(settings: &crate::state::ProxySettings) -> Vec<String> {
+    let mut out: Vec<String> = RESERVED.into_iter().map(str::to_owned).collect();
+    for t in &settings.tlds {
+        let t = t.trim_start_matches('.').to_ascii_lowercase();
+        if signable_domain(&t) && !out.iter().any(|p| t == *p || t.ends_with(&format!(".{p}"))) {
+            out.push(t);
+        }
+    }
+    out
+}
+/// The configured TLDs the CA's name constraints don't cover (none for an
+/// older, unconstrained CA).
+pub fn uncovered_tlds(ca_pem: &str, settings: &crate::state::ProxySettings) -> Vec<String> {
+    let Ok(ca) = CertificateParams::from_ca_cert_pem(ca_pem) else {
+        return vec![];
+    };
+    let Some(constraints) = ca.name_constraints else {
+        return vec![];
+    };
+    let permitted: Vec<String> = constraints
+        .permitted_subtrees
+        .iter()
+        .filter_map(|s| match s {
+            rcgen::GeneralSubtree::DnsName(d) => {
+                Some(d.trim_start_matches('.').to_ascii_lowercase())
+            }
+            _ => None,
+        })
+        .collect();
+    settings
+        .tlds
+        .iter()
+        .chain(settings.lan.then(|| "local".to_owned()).iter())
+        .map(|t| t.trim_start_matches('.').to_ascii_lowercase())
+        .filter(|t| signable_domain(t))
+        .filter(|t| {
+            !permitted
+                .iter()
+                .any(|p| t == p || t.ends_with(&format!(".{p}")))
+        })
+        .collect()
+}
+fn ca_params(settings: &crate::state::ProxySettings) -> Result<CertificateParams> {
     let mut params = CertificateParams::new(Vec::<String>::new())?;
+    params.name_constraints = Some(rcgen::NameConstraints {
+        permitted_subtrees: ca_permitted(settings)
+            .into_iter()
+            .map(rcgen::GeneralSubtree::DnsName)
+            .collect(),
+        // No IP addresses at all: Porch only ever signs DNS names.
+        excluded_subtrees: vec![
+            rcgen::GeneralSubtree::IpAddress(rcgen::CidrSubnet::V4([0; 4], [0; 4])),
+            rcgen::GeneralSubtree::IpAddress(rcgen::CidrSubnet::V6([0; 16], [0; 16])),
+        ],
+    });
     set_validity(&mut params, 3650);
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params
@@ -210,9 +310,27 @@ fn config_in_dir(
             lock.lock_exclusive()?;
             let cert_path = dir.join("ca.pem");
             let key_path = dir.join("ca-key.pem");
+            // A name-constrained CA can't sign for domains added later. Retire
+            // it (kept beside, so `porch clean` can still find it) and make a
+            // new one for the current domains; trust is offered again.
+            if let Ok(existing) = fs::read_to_string(&cert_path) {
+                let uncovered = uncovered_tlds(&existing, settings);
+                if !uncovered.is_empty() {
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or_default();
+                    fs::rename(&cert_path, dir.join(format!("ca.pem.retired-{stamp}")))?;
+                    fs::rename(&key_path, dir.join(format!("ca-key.pem.retired-{stamp}")))?;
+                    eprintln!(
+                        "Porch made a new local CA, because the old one didn't cover {}. Browsers need it trusted once: run `porch trust` (no sudo).",
+                        uncovered.join(", ")
+                    );
+                }
+            }
             if !cert_path.exists() && !key_path.exists() {
                 let key = KeyPair::generate()?;
-                let params = ca_params()?;
+                let params = ca_params(settings)?;
                 let ca = params.self_signed(&key)?;
                 write_private(&key_path, &key.serialize_pem())?;
                 write_private(&cert_path, &ca.pem())?;
@@ -222,7 +340,6 @@ fn config_in_dir(
                 ca_key: fs::read_to_string(key_path)?,
                 cache: Mutex::new(HashMap::new()),
                 settings: settings.clone(),
-                route_state: dir.join("state.json"),
             };
             resolver.issue("localhost").context("Invalid local CA")?;
             // There are no persisted leaf certificates: profile v2 takes effect on
@@ -257,8 +374,6 @@ mod tests {
             ca_key: key.serialize_pem(),
             cache: Mutex::new(HashMap::new()),
             settings: crate::state::ProxySettings::default(),
-            route_state: std::env::temp_dir()
-                .join(format!("porch-no-route-state-{}", std::process::id())),
         };
         assert!(resolver.issue("app.localhost").is_ok());
         assert!(resolver.issue("*.example.test").is_err());
@@ -273,8 +388,6 @@ mod tests {
             ca_key: key.serialize_pem(),
             cache: Mutex::new(HashMap::new()),
             settings: crate::state::ProxySettings::default(),
-            route_state: std::env::temp_dir()
-                .join(format!("porch-no-route-state-{}", std::process::id())),
         }
     }
     #[test]
@@ -322,8 +435,16 @@ mod tests {
             target: "http://127.0.0.1:3000".into(),
             pid: None,
         }];
-        assert!(allowed_name("registered.example.com", &settings, &routes));
+        // A route's raw name is never a certificate name outside the TLDs.
+        assert!(!allowed_name("registered.example.com", &settings, &routes));
         assert!(!allowed_name("other.example.com", &settings, &routes));
+        let github = vec![crate::state::Route {
+            name: "github.com".into(),
+            target: "http://127.0.0.1:3000".into(),
+            pid: None,
+        }];
+        assert!(!allowed_name("github.com", &settings, &github));
+        assert!(allowed_name("github.com.localhost", &settings, &github));
         assert!(!allowed_name("registered.example.com", &settings, &[]));
         for invalid in [
             "*.localhost",
@@ -352,6 +473,61 @@ mod tests {
         let params = CertificateParams::from_ca_cert_pem(&cert).unwrap();
         assert!((params.not_after - params.not_before).whole_days() <= 3650);
         assert_eq!(params.is_ca, IsCa::Ca(BasicConstraints::Constrained(0)));
+        // New CAs are name-constrained to never-public names and the TLDs.
+        let permitted: Vec<_> = params
+            .name_constraints
+            .as_ref()
+            .expect("new CA has name constraints")
+            .permitted_subtrees
+            .iter()
+            .filter_map(|s| match s {
+                rcgen::GeneralSubtree::DnsName(d) => Some(d.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(permitted.contains(&"localhost") && permitted.contains(&"local"));
+        assert!(!permitted.iter().any(|p| *p == "com" || p.is_empty()));
+        let excluded = &params.name_constraints.as_ref().unwrap().excluded_subtrees;
+        assert_eq!(excluded.len(), 2, "IPv4 and IPv6 are excluded");
+        // A bare public TLD is never added to the CA, nor issued for.
+        let risky = crate::state::ProxySettings {
+            tlds: vec!["com".into(), "dev.example.com".into()],
+            ..Default::default()
+        };
+        assert!(!ca_permitted(&risky).contains(&"com".to_owned()));
+        for public in ["co.uk", "github.io", "com.au", "dev", "app"] {
+            assert!(!signable_domain(public), "{public}");
+        }
+        for owned in [
+            "example.co.uk",
+            "local.example.com",
+            "me.github.io",
+            "test",
+            "a.test",
+        ] {
+            assert!(signable_domain(owned), "{owned}");
+        }
+        assert!(ca_permitted(&risky).contains(&"dev.example.com".to_owned()));
+        assert!(!allowed_name("github.com", &risky, &[]));
+        assert!(allowed_name("web.dev.example.com", &risky, &[]));
+        assert!(uncovered_tlds(&cert, &settings).is_empty());
+        let other = crate::state::ProxySettings {
+            tlds: vec!["dev.example.com".into()],
+            ..Default::default()
+        };
+        assert_eq!(uncovered_tlds(&cert, &other), ["dev.example.com"]);
+        // A new domain gets a new CA that covers it; the old one is retired.
+        config_in_dir(&other, &path).unwrap();
+        let rotated = fs::read_to_string(path.join("ca.pem")).unwrap();
+        assert_ne!(rotated, cert);
+        assert!(uncovered_tlds(&rotated, &other).is_empty());
+        assert!(fs::read_dir(&path).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("ca.pem.retired-")));
+        // Back to the defaults for the legacy-profile checks below.
+        config_in_dir(&settings, &path).unwrap();
         // Install an old profile only in this temporary fixture; no system trust.
         let resolver = test_resolver();
         fs::write(path.join("ca.pem"), &resolver.ca_pem).unwrap();
@@ -374,18 +550,9 @@ mod tests {
     }
     #[tokio::test]
     async fn tls_policy_foreign_sni_handshake_rejected() {
-        let mut resolver = test_resolver();
-        let path = std::env::temp_dir().join(format!(
-            "porch-tls-handshake-{}-{}.json",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        resolver.route_state = path.clone();
+        let resolver = test_resolver();
         let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut BufReader::new(resolver.ca_pem.as_bytes())) {
+        for cert in crate::pem::certs(&mut BufReader::new(resolver.ca_pem.as_bytes())) {
             roots.add(cert.unwrap()).unwrap();
         }
         let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -424,26 +591,8 @@ mod tests {
             "configured local name must complete TLS"
         );
         assert_eq!(handshake("www.google.com").await, (false, false));
-        fs::write(
-            &path,
-            serde_json::to_vec(&crate::state::State {
-                routes: vec![crate::state::Route {
-                    name: "registered.example.com".into(),
-                    target: "http://127.0.0.1:3000".into(),
-                    pid: None,
-                }],
-                ..Default::default()
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(handshake("registered.example.com").await, (true, true));
-        fs::remove_file(path).unwrap();
-        assert_eq!(
-            handshake("registered.example.com").await,
-            (false, false),
-            "cached certificate must not survive route removal"
-        );
+        // A route named like a real domain doesn't get a certificate for it.
+        assert_eq!(handshake("registered.example.com").await, (false, false));
     }
     #[test]
     fn rejects_invalid_pem() {

@@ -6,15 +6,25 @@ use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::{body::Incoming, header, Method, Request, Response, StatusCode, Version};
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder,
 };
 use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 type Body = UnsyncBoxBody<Bytes, hyper::Error>;
+/// Open client connections the proxy serves at once; more are refused.
+const MAX_CONNECTIONS: usize = 4096;
+/// Time a client gets to send a complete HTTP/1 request head.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 type Upstream = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
+type LoopbackUpstream = crate::upstream::LoopbackClient<Body>;
 #[derive(Clone)]
 struct ProxyContext {
     client: Upstream,
+    /// Dials every name on loopback, for `--upstream` aliases: the URI host is
+    /// the TLS server name, the connection still goes to this computer.
+    loopback: LoopbackUpstream,
+    /// The same, without certificate verification (`--insecure` aliases only).
+    loopback_insecure: LoopbackUpstream,
     settings: Arc<ProxySettings>,
     token: Arc<String>,
     stopped: tokio::sync::watch::Receiver<bool>,
@@ -31,9 +41,128 @@ fn escape(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
+const PAGE_CSS: &str = ":root{color-scheme:light dark;--bg:#faf8f2;--fg:#242421;--muted:#6b675e;--card:#fff;--line:#e6e1d6;--accent:#b4532a;--code:#efeadf}@media (prefers-color-scheme:dark){:root{--bg:#161513;--fg:#ece9e1;--muted:#a19c90;--card:#1f1e1b;--line:#33312c;--accent:#f08a5d;--code:#2a2925}}*{box-sizing:border-box}body{margin:0;font:16px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg)}main{max-width:46rem;margin:0 auto;padding:12vh 1rem 4rem}.status{font:600 .8rem ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}h1{font-size:1.75rem;line-height:1.2;margin:.4rem 0 1rem}p{margin:.6rem 0}code{font:.9em ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--code);padding:.1rem .35rem;border-radius:4px}.muted{color:var(--muted)}h2{font-size:.95rem;margin:2.5rem 0 .75rem;color:var(--muted);font-weight:600}ul.apps{list-style:none;padding:0;margin:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}ul.apps li{border-top:1px solid var(--line);display:flex;align-items:center}ul.apps li[hidden]{display:none}ul.apps li>a{flex:1;min-width:0}button.copy{font:.8rem inherit;margin-right:.75rem;padding:.25rem .6rem;border:1px solid var(--line);border-radius:6px;background:transparent;color:var(--muted);cursor:pointer}button.copy:hover,button.copy:focus-visible{color:var(--fg);border-color:var(--muted)}ul.apps li:first-child{border-top:0}ul.apps a{display:flex;justify-content:space-between;gap:1rem;padding:.75rem 1rem;color:inherit;text-decoration:none}ul.apps a:hover,ul.apps a:focus-visible{background:var(--code);outline:none}.name{font-weight:600}.target{color:var(--muted);font:.85em ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}input[type=search]{width:100%;font:inherit;padding:.55rem .75rem;margin:0 0 .75rem;border:1px solid var(--line);border-radius:8px;background:var(--card);color:inherit}.spinner{display:inline-block;width:.8em;height:.8em;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;vertical-align:-.05em;margin-right:.4rem}@keyframes spin{to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.spinner{animation:none}}footer{margin-top:3rem;font-size:.85rem;color:var(--muted)}.dot{display:inline-block;width:.55rem;height:.55rem;border-radius:50%;margin-right:.55rem;vertical-align:.08em}.dot.up{background:#2f9e44}.dot.down{background:#e0a100}";
+/// Live data for the dashboard at the bare domain: this machine's apps with
+/// health and, with `peers`, every paired machine's apps (loopback only).
+async fn dashboard_json(settings: &ProxySettings, peers: bool) -> serde_json::Value {
+    let state = crate::state::live_routes().unwrap_or_default();
+    let routes = state.routes.clone();
+    let health = tokio::task::spawn_blocking(move || {
+        routes
+            .iter()
+            .map(|r| crate::health::target_listening_cached(&r.target))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let apps: Vec<_> = state
+        .routes
+        .iter()
+        .zip(health)
+        .map(|(r, up)| {
+            serde_json::json!({
+                "name": r.name,
+                "host": settings.hostname(&r.name),
+                "url": settings.url(&r.name),
+                "target": r.target,
+                "health": if up { "ok" } else { "not listening" },
+                "private": state.private.contains(&r.name),
+            })
+        })
+        .collect();
+    let mut out = serde_json::json!({ "apps": apps });
+    if peers {
+        let snapshot = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::discovery::client::snapshot(false),
+        )
+        .await;
+        let machines: Vec<_> = match snapshot {
+            Ok(Ok(snap)) => snap
+                .peers
+                .iter()
+                .map(|p| {
+                    let apps: Vec<_> = p
+                        .catalog
+                        .iter()
+                        .flat_map(|c| c.apps.iter())
+                        .map(|a| {
+                            let url = (a.remote_access && !p.slug.is_empty())
+                                .then(|| crate::discovery::gateway::hostname_app(&a.name))
+                                .flatten()
+                                .map(|n| settings.url(&format!("{n}.{}", p.slug)));
+                            serde_json::json!({
+                                "name": a.name,
+                                "url": url,
+                                "health": a.health,
+                                "note": a.unavailable_reason,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "machine": p.machine.name,
+                        "error": p.error,
+                        "apps": apps,
+                    })
+                })
+                .collect(),
+            _ => vec![],
+        };
+        out["machines"] = serde_json::json!(machines);
+    }
+    out
+}
+const COPY_SCRIPT: &str = "document.addEventListener('click',e=>{const b=e.target.closest('button.copy');if(!b)return;navigator.clipboard.writeText(b.dataset.url).then(()=>{b.textContent='Copied';setTimeout(()=>b.textContent='Copy',1200)})});";
+const DASHBOARD_SCRIPT: &str = r#"<script>
+(()=>{const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+const row=(url,label,up,detail)=>`<li><a href="${esc(url)}"><span class="name"><span class="dot ${up?'up':'down'}"></span>${esc(label)}</span><span class="target">${esc(detail)}</span></a><button class="copy" data-url="${esc(url)}" title="Copy URL" aria-label="Copy URL">Copy</button></li>`;
+async function local(){const st=document.getElementById('status');try{const r=await fetch('/_porch/apps.json',{cache:'no-store'});if(!r.ok)throw 0;const d=await r.json();if(st)st.hidden=true;
+const el=document.getElementById('local');if(!d.apps.length){el.dataset.empty='1';el.innerHTML='<p class="muted">No apps are running. Start one with <code>porch run pnpm dev</code>.</p>';return}
+d.apps.sort((a,b)=>a.host.localeCompare(b.host));const html=d.apps.map(a=>row(a.url,a.host,a.health==='ok',a.health==='ok'?a.target:a.target+' · not listening')).join('');
+let ul=el.querySelector('ul.apps');if(!ul||el.dataset.empty){delete el.dataset.empty;el.innerHTML=(d.apps.length>5?'<input type="search" placeholder="Filter apps" aria-label="Filter apps"><p id="nomatch" class="muted" role="status" hidden>No apps match.</p>':'')+'<ul class="apps"></ul>';ul=el.querySelector('ul.apps');const q=el.querySelector('input[type=search]');if(q)q.oninput=filter}
+ul.innerHTML=html;filter()}catch(e){if(st)st.hidden=false}}
+function filter(){const q=document.querySelector('#local input[type=search]');const f=q?q.value.toLowerCase():'';let n=0;for(const li of document.querySelectorAll('#local ul.apps li')){li.hidden=!!f&&!li.textContent.toLowerCase().includes(f);n+=!li.hidden}const nm=document.getElementById('nomatch');if(nm)nm.hidden=n>0}
+async function peers(){try{const r=await fetch('/_porch/apps.json?peers=1',{cache:'no-store'});const d=await r.json();const el=document.getElementById('peers');
+el.innerHTML=(d.machines||[]).map(m=>`<h2>${esc(m.machine)}${m.error?' · unreachable':''}</h2>`+(m.apps.length?'<ul class="apps">'+m.apps.map(a=>a.url?row(a.url,a.name,a.health==='healthy',''):`<li><a><span class="name"><span class="dot down"></span>${esc(a.name)}</span><span class="target">${esc(a.note||'not shared')}</span></a></li>`).join('')+'</ul>':'<p class="muted">No apps.</p>')).join('')}catch(e){}}
+setInterval(local,3000);peers();setInterval(peers,30000);})();
+</script>"#;
+fn page(code: StatusCode, title: &str, body: &str, head: &str) -> String {
+    let status = if code.is_success() {
+        "<div class=\"status\">Porch</div>".to_owned()
+    } else {
+        format!(
+            "<div class=\"status\">{} {}</div>",
+            code.as_u16(),
+            escape(code.canonical_reason().unwrap_or("Proxy error"))
+        )
+    };
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{head}<title>{} · Porch</title><style>{PAGE_CSS}</style></head><body><main>{status}<h1>{}</h1>{body}<footer>Served by Porch · run <code>porch list</code> or <code>porch doctor</code></footer></main></body></html>",
+        escape(title),
+        escape(title),
+    )
+}
 fn error(code: StatusCode, kind: &str, message: &str, host: &str, html: bool) -> Response<Body> {
     let body = if html {
-        format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>{} · Porch</title><style>body{{font:16px system-ui;background:#faf8f2;color:#242421;max-width:52rem;margin:12vh auto;padding:2rem}}h1{{font-size:2rem}}code{{background:#eee9df;padding:.2rem}}</style><h1>{} {}</h1><p>{}</p><p>Host: <code>{}</code></p><p>Run <code>porch list</code> to inspect registered apps.</p></html>", code.as_u16(),code.as_u16(),escape(code.canonical_reason().unwrap_or("Proxy error")), escape(message),escape(host))
+        // An app that isn't listening yet is usually still starting: retry on
+        // our own so the tab comes up as soon as the dev server does.
+        let starting = kind == "upstream_unavailable";
+        let title = if starting {
+            "Waiting for the app to start"
+        } else {
+            message
+        };
+        let detail = if starting {
+            format!("<p><span class=\"spinner\" aria-hidden=\"true\"></span><strong>{}</strong> is registered, but nothing is answering on its port yet. This page reloads by itself.</p><p class=\"muted\">{}</p>", escape(host), escape(message))
+        } else {
+            format!("<p class=\"muted\">Host: <code>{}</code></p>", escape(host))
+        };
+        let head = if starting {
+            "<meta http-equiv=\"refresh\" content=\"2\">"
+        } else {
+            ""
+        };
+        page(code, title, &detail, head)
     } else {
         serde_json::json!({"error":kind,"upstream":host,"message":message}).to_string()
     };
@@ -301,6 +430,8 @@ async fn forward(
 ) -> Result<Response<Body>, Infallible> {
     let ProxyContext {
         client,
+        loopback,
+        loopback_insecure,
         settings,
         token,
         mut stopped,
@@ -326,6 +457,38 @@ async fn forward(
             &host,
             html,
         ));
+    }
+    let dashboard_host = settings.tlds.contains(&hostname) || hostname == "porch.localhost";
+    if dashboard_host && req.uri().path() == "/_porch/apps.json" {
+        if !peer.ip().is_loopback() {
+            return Ok(error(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "The app list is only available on this computer",
+                &host,
+                false,
+            ));
+        }
+        let peers = req
+            .uri()
+            .query()
+            .is_some_and(|q| q.split('&').any(|p| p == "peers=1"));
+        let body = dashboard_json(&settings, peers).await.to_string();
+        let mut r = Response::new(
+            Full::new(Bytes::from(body))
+                .map_err(|e: Infallible| match e {})
+                .boxed_unsync(),
+        );
+        r.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        r.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+        marker(&mut r);
+        return Ok(r);
     }
     let extended = req.method() == Method::CONNECT
         && req.version() == Version::HTTP_2
@@ -354,17 +517,20 @@ async fn forward(
             html,
         ));
     }
+    // Only a proxy on this machine can have forwarded this request before; a
+    // LAN client's hop count is ignored so it can't force a 508.
     let hops = req
         .headers()
         .get("x-porch-hops")
         .or_else(|| req.headers().get("x-portless-hops"))
+        .filter(|_| peer.ip().is_loopback())
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
     if hops >= 5 {
         return Ok(error(StatusCode::LOOP_DETECTED,"loop_detected","Request passed through Porch too many times. Add changeOrigin: true to your dev server proxy config.",&host,html));
     }
-    let state = match crate::state::load() {
+    let state = match crate::state::live_routes() {
         Ok(s) => s,
         Err(_) => {
             return Ok(error(
@@ -379,7 +545,6 @@ async fn forward(
     let route = state
         .routes
         .iter()
-        .filter(|r| crate::state::route_alive(&state, r))
         .filter_map(|r| score(&r.name, &hostname, req.uri().path(), &settings).map(|s| (s, r)))
         .max_by_key(|(s, _)| *s)
         .map(|(_, r)| r)
@@ -388,12 +553,11 @@ async fn forward(
                 .parse::<hyper::http::uri::Authority>()
                 .ok()
                 .and_then(|a| a.port_u16())
-                .unwrap_or(443);
+                .unwrap_or(if secure { 443 } else { 80 });
             state
                 .routes
                 .iter()
                 .rev()
-                .filter(|r| crate::state::route_alive(&state, r))
                 .filter_map(|r| {
                     let score = state
                         .shares
@@ -422,6 +586,7 @@ async fn forward(
             crate::discovery::gateway::target(&hostname, peer.ip().is_loopback(), &settings.tlds)
         })
         .flatten();
+    let upstream_spec = route.and_then(|r| state.upstreams.get(&r.name)).cloned();
     let Some(target) = route.map(|r| r.target.clone()).or(remote) else {
         let local_name = settings
             .tlds
@@ -442,6 +607,22 @@ async fn forward(
                 html,
             ));
         }
+        if dashboard_host && !html && peer.ip().is_loopback() {
+            let body = dashboard_json(&settings, false).await.to_string();
+            let mut r = Response::new(
+                Full::new(Bytes::from(body))
+                    .map_err(|e: Infallible| match e {})
+                    .boxed_unsync(),
+            );
+            r.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
+            );
+            r.headers_mut()
+                .insert(header::VARY, header::HeaderValue::from_static("Accept"));
+            marker(&mut r);
+            return Ok(r);
+        }
         let mut response = error(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -450,21 +631,75 @@ async fn forward(
             html,
         );
         if html {
-            let links = state
-                .routes
-                .iter()
-                .filter(|r| crate::state::route_alive(&state, r))
-                .map(|r| {
+            // Other devices (LAN mode) see names only; upstream targets stay private.
+            let show_targets = peer.ip().is_loopback();
+            let targets: Vec<String> = state.routes.iter().map(|r| r.target.clone()).collect();
+            let health = tokio::task::spawn_blocking(move || {
+                targets
+                    .iter()
+                    .map(|t| crate::health::target_listening_cached(t))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            let mut order: Vec<usize> = (0..state.routes.len()).collect();
+            order.sort_by_key(|&i| settings.hostname(&state.routes[i].name));
+            let links = order
+                .into_iter()
+                .map(|i| (i, &state.routes[i]))
+                .map(|(i, r)| {
+                    let up = health.get(i).copied().unwrap_or(true);
                     format!(
-                        "<li><a href=\"{}\">{}</a> → <code>{}</code></li>",
+                        "<li><a href=\"{0}\"><span class=\"name\"><span class=\"dot {1}\" title=\"{2}\"></span>{3}</span>{4}</a><button class=\"copy\" data-url=\"{0}\" title=\"Copy URL\" aria-label=\"Copy URL\">Copy</button></li>",
                         escape(&settings.url(&r.name)),
+                        if up { "up" } else { "down" },
+                        if up { "answering" } else { "not listening" },
                         escape(&settings.hostname(&r.name)),
-                        escape(&r.target)
+                        if show_targets {
+                            format!("<span class=\"target\">{}</span>", escape(&r.target))
+                        } else {
+                            String::new()
+                        }
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("");
-            let page=format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>404 · Porch</title><style>body{{font:16px system-ui;max-width:52rem;margin:10vh auto;padding:2rem;background:#faf8f2;color:#242421}}li{{margin:1rem 0}}</style><h1>404 Not Found</h1><p>No app registered for <strong>{}</strong>.</p><h2>Active apps</h2><ul>{}</ul><p>Start an app with <code>porch &lt;name&gt; &lt;command&gt;</code>.</p></html>",escape(&hostname),links);
+                .collect::<Vec<_>>();
+            let list = if links.is_empty() {
+                "<p class=\"muted\">No apps are running. Start one with <code>porch run pnpm dev</code> or <code>porch NAME COMMAND</code>.</p>".to_owned()
+            } else {
+                let filter = if links.len() > 5 {
+                    "<input type=\"search\" placeholder=\"Filter apps\" aria-label=\"Filter apps\" oninput=\"let n=0;for(const li of document.querySelectorAll('#local ul.apps li, ul.apps li')){li.hidden=!li.textContent.toLowerCase().includes(this.value.toLowerCase());n+=!li.hidden}document.getElementById('nomatch').hidden=n>0\" autofocus><p id=\"nomatch\" class=\"muted\" role=\"status\" hidden>No apps match.</p>"
+                } else {
+                    ""
+                };
+                format!(
+                    "{filter}<ul class=\"apps\">{}</ul><script>{COPY_SCRIPT}</script>",
+                    links.join("")
+                )
+            };
+            // The bare domain (http://localhost) is Porch's dashboard: a 200
+            // page listing every app, rather than an error.
+            let page = if dashboard_host {
+                *response.status_mut() = StatusCode::OK;
+                let live = if peer.ip().is_loopback() {
+                    DASHBOARD_SCRIPT
+                } else {
+                    ""
+                };
+                page(
+                    StatusCode::OK,
+                    "Your apps",
+                    &format!(
+                        "<p class=\"muted\">Every app Porch is serving on this computer. This page updates by itself.</p><p id=\"status\" class=\"muted\" role=\"status\" hidden>Can't reach Porch's proxy right now; retrying…</p><div id=\"local\">{list}</div><div id=\"peers\"></div>{live}"
+                    ),
+                    "",
+                )
+            } else {
+                let body = format!(
+                    "<p>No app is registered for <code>{}</code>.</p><h2>Running apps</h2>{list}",
+                    escape(&hostname)
+                );
+                page(StatusCode::NOT_FOUND, "No app at this address", &body, "")
+            };
             *response.body_mut() = Full::new(Bytes::from(page))
                 .map_err(|e: Infallible| match e {})
                 .boxed_unsync();
@@ -493,14 +728,17 @@ async fn forward(
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or("/");
-    let target_authority = if target.scheme_str() == Some("http")
-        && target
-            .host()
-            .is_some_and(|h| matches!(h, "127.0.0.1" | "[::1]" | "::1"))
-    {
-        format!("localhost:{}", target.port_u16().unwrap_or(80))
-    } else {
-        target.authority().unwrap().to_string()
+    // Dial the address the route records. Only for an app Porch launched on
+    // 127.0.0.1 that turned out to listen on ::1 alone does the proxy use ::1
+    // (an alias never moves: another user could be listening there).
+    let launched = route.is_some_and(|r| r.pid.is_some());
+    let target_authority = match (target.host(), target.port_u16()) {
+        (Some("127.0.0.1"), Some(port))
+            if launched && target.scheme_str() == Some("http") && ipv6_only(port) =>
+        {
+            format!("[::1]:{port}")
+        }
+        _ => target.authority().unwrap().to_string(),
     };
     let uri = format!(
         "{}://{}{}{}",
@@ -509,6 +747,11 @@ async fn forward(
         target.path().trim_end_matches('/'),
         path
     );
+    // `--upstream`: same loopback port, but our own scheme and TLS name.
+    let uri = match &upstream_spec {
+        Some(up) => crate::upstream::request(up, target.port_u16().unwrap_or(80), path).0,
+        None => uri,
+    };
     let Ok(uri) = uri.parse::<hyper::Uri>() else {
         return Ok(error(
             StatusCode::BAD_GATEWAY,
@@ -543,6 +786,21 @@ async fn forward(
             header::HeaderValue::from_static("upgrade"),
         );
     }
+    // Only a client on this machine (another proxy, a tunnel) may set its own
+    // forwarding headers. Anyone else on the LAN could otherwise spoof the
+    // scheme or host the app sees.
+    let trust_forwarded = peer.ip().is_loopback();
+    if !trust_forwarded {
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "forwarded",
+        ] {
+            req.headers_mut().remove(name);
+        }
+    }
     let forwarded_for = req
         .headers()
         .get("x-forwarded-for")
@@ -576,9 +834,37 @@ async fn forward(
             req.headers_mut().insert(name, value.parse().unwrap());
         }
     }
-    if let Ok(v) = host.parse() {
+    // A remote alias (https://api.example.com) is a real site: it needs its own
+    // name in Host (TLS SNI already uses it), and its redirects to itself are
+    // rewritten to stay on the Porch URL. Local apps keep the browser's Host.
+    let remote_origin = target
+        .host()
+        .map(|h| h.trim_matches(['[', ']']))
+        .filter(|h| {
+            !h.eq_ignore_ascii_case("localhost")
+                && !h
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+        .map(|_| {
+            format!(
+                "{}://{}",
+                target.scheme_str().unwrap_or("http"),
+                target.authority().unwrap()
+            )
+        });
+    let host_header =
+        if let Some(authority) = upstream_spec.as_ref().and_then(|u| u.authority.clone()) {
+            authority
+        } else if remote_origin.is_some() {
+            target.authority().unwrap().to_string()
+        } else {
+            host.clone()
+        };
+    if let Ok(v) = host_header.parse() {
         req.headers_mut().insert(header::HOST, v);
     }
+    let public_origin = format!("{}://{host}", if secure { "https" } else { "http" });
     *req.uri_mut() = uri;
     *req.version_mut() = Version::HTTP_11;
     let (parts, body) = req.into_parts();
@@ -590,7 +876,12 @@ async fn forward(
             body.boxed_unsync()
         },
     );
-    match client.request(req).await {
+    let sent = match &upstream_spec {
+        Some(up) if up.insecure => loopback_insecure.request(req).await,
+        Some(_) => loopback.request(req).await,
+        None => client.request(req).await,
+    };
+    match sent {
         Ok(mut response) => {
             if response.status() == StatusCode::SWITCHING_PROTOCOLS {
                 if let Some(key) = ws_key {
@@ -613,8 +904,20 @@ async fn forward(
                     }
                 }
                 if let Some(downstream) = downstream {
+                    // Upgraded sockets outlive their connection task, so they
+                    // count against their own cap for their whole lifetime.
+                    let Ok(permit) = upgrade_slots().clone().try_acquire_owned() else {
+                        return Ok(error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "too_many_websockets",
+                            "Too many open WebSocket connections through Porch",
+                            &host,
+                            html,
+                        ));
+                    };
                     let upstream = hyper::upgrade::on(&mut response);
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Ok((a, b)) = tokio::try_join!(downstream, upstream) {
                             let mut a = TokioIo::new(a);
                             let mut b = TokioIo::new(b);
@@ -633,10 +936,91 @@ async fn forward(
                 }
             } else {
                 strip(response.headers_mut());
+                // Redirects a backend sends to its own address stay on the
+                // Porch URL: remote aliases and `--upstream` authorities.
+                let origins: Vec<String> = match (&upstream_spec, &remote_origin) {
+                    (Some(up), _) => crate::upstream::origins(up),
+                    (None, Some(_)) => crate::upstream::origins(&crate::state::Upstream {
+                        tls: target.scheme_str() == Some("https"),
+                        authority: target.authority().map(|a| a.to_string()),
+                        insecure: false,
+                    }),
+                    (None, None) => vec![],
+                };
+                // Cookies a real backend scopes to its own domain would never
+                // come back to the Porch name; keep them host-only instead.
+                let backend_host = upstream_spec
+                    .as_ref()
+                    .and_then(|u| u.authority.as_deref())
+                    .and_then(|a| a.parse::<hyper::http::uri::Authority>().ok())
+                    .map(|a| a.host().to_owned())
+                    .or_else(|| remote_origin.as_ref().and(target.host().map(str::to_owned)));
+                if let Some(backend) = backend_host {
+                    let cookies: Vec<_> = response
+                        .headers()
+                        .get_all(header::SET_COOKIE)
+                        .iter()
+                        .map(|v| {
+                            v.to_str()
+                                .ok()
+                                .and_then(|c| crate::upstream::host_only_cookie(c, &backend))
+                                .and_then(|c| header::HeaderValue::from_str(&c).ok())
+                                .unwrap_or_else(|| v.clone())
+                        })
+                        .collect();
+                    if !cookies.is_empty() {
+                        response.headers_mut().remove(header::SET_COOKIE);
+                        for c in cookies {
+                            response.headers_mut().append(header::SET_COOKIE, c);
+                        }
+                    }
+                }
+                // An alias to `http://host/base` serves the backend's `/base` at
+                // the Porch URL's root: drop that prefix from its redirects.
+                let base = target.path().trim_end_matches('/').to_owned();
+                let rewritten = response
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|l| {
+                        let absolute = crate::upstream::rewrite_location(l, &origins, &public_origin);
+                        let loc = absolute.clone().unwrap_or_else(|| l.to_owned());
+                        let (prefix, path) = if let Some(p) = loc.strip_prefix(&public_origin) {
+                            (public_origin.as_str(), p)
+                        } else if loc.starts_with('/') && !loc.starts_with("//") {
+                            ("", loc.as_str())
+                        } else {
+                            return absolute;
+                        };
+                        match path.strip_prefix(base.as_str()) {
+                            Some(rest)
+                                if !base.is_empty()
+                                    && (rest.is_empty() || rest.starts_with(['/', '?', '#'])) =>
+                            {
+                                let rest = if rest.starts_with('/') { rest.to_owned() } else { format!("/{rest}") };
+                                Some(format!("{prefix}{rest}"))
+                            }
+                            _ => absolute,
+                        }
+                    })
+                    .and_then(|l| header::HeaderValue::from_str(&l).ok());
+                if let Some(v) = rewritten {
+                    response.headers_mut().insert(header::LOCATION, v);
+                }
             }
             let mut r = response.map(|b| b.boxed_unsync());
             marker(&mut r);
             Ok(r)
+        }
+        Err(e) if upstream_spec.as_ref().is_some_and(|u| u.tls) && certificate_error(&e) =>
+        {
+            Ok(error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_certificate",
+                "The app's TLS certificate isn't trusted for this name. Trust its CA, or re-register the alias with --insecure.",
+                &host,
+                html,
+            ))
         }
         Err(_) => Ok(error(
             StatusCode::BAD_GATEWAY,
@@ -697,6 +1081,11 @@ async fn listen(
                 continue;
             }
         };
+        // Bound the work a flood of (or a LAN full of) idle clients can pin.
+        if connections.len() >= MAX_CONNECTIONS {
+            drop(stream);
+            continue;
+        }
         let context = context.clone();
         let acceptor = acceptor.clone();
         connections.spawn(async move {
@@ -715,7 +1104,18 @@ async fn listen(
                 forward(req,peer,tls,redirect_plain,context.clone())
             });
             let mut builder = Builder::new(TokioExecutor::new());
-            builder.http2().enable_connect_protocol();
+            // Slow or silent clients can't hold a connection open forever
+            // before sending a full request head.
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_READ_TIMEOUT);
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .enable_connect_protocol()
+                .keep_alive_interval(Some(Duration::from_secs(30)))
+                .keep_alive_timeout(Duration::from_secs(20));
             if tls {
                 if let Some(acceptor) = acceptor {
                     if let Ok(Ok(stream)) =
@@ -775,7 +1175,7 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
         let _ = roots.add(cert);
     }
     if let Ok(ca) = std::fs::read(crate::state::dir().join("ca.pem")) {
-        for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(ca.as_slice())).flatten() {
+        for cert in crate::pem::certs(&mut std::io::BufReader::new(ca.as_slice())).flatten() {
             let _ = roots.add(cert);
         }
     }
@@ -790,12 +1190,14 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
     http.set_connect_timeout(Some(Duration::from_secs(10)));
     http.set_happy_eyeballs_timeout(Some(Duration::from_millis(50)));
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config)
+        .with_tls_config(tls_config.clone())
         .https_or_http()
         .enable_http1()
         .enable_http2()
         .wrap_connector(http);
     let client = Client::builder(TokioExecutor::new()).build::<_, Body>(connector);
+    let loopback = crate::upstream::client(tls_config.clone());
+    let loopback_insecure = crate::upstream::client(crate::upstream::insecure_tls()?);
     let binds = if let Some(bind) = &settings.bind {
         vec![bind.clone()]
     } else if settings.lan
@@ -837,6 +1239,8 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
     let (_shutdown, stopped) = tokio::sync::watch::channel(false);
     let context = ProxyContext {
         client,
+        loopback,
+        loopback_insecure,
         settings: settings.clone(),
         token,
         stopped,
@@ -864,6 +1268,61 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
         None => anyhow::bail!("proxy has no listeners"),
     };
     Ok(())
+}
+/// Open upgraded (WebSocket) connections across all listeners.
+fn upgrade_slots() -> &'static Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)))
+}
+/// Is a launched app on `port` reachable on ::1 but not 127.0.0.1? Probed at
+/// most every two seconds per port.
+fn ipv6_only(port: u16) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static SEEN: Mutex<Option<HashMap<u16, (bool, Instant)>>> = Mutex::new(None);
+    if let Ok(mut seen) = SEEN.lock() {
+        if let Some((v6, at)) = seen.get_or_insert_with(HashMap::new).get(&port) {
+            if at.elapsed() < Duration::from_secs(2) {
+                return *v6;
+            }
+        }
+    }
+    let v6 = crate::ports::accepts_ipv6_only(port);
+    if let Ok(mut seen) = SEEN.lock() {
+        let map = seen.get_or_insert_with(HashMap::new);
+        if map.len() > 4096 {
+            map.clear();
+        }
+        map.insert(port, (v6, Instant::now()));
+    }
+    v6
+}
+/// Did the upstream TLS handshake fail on the backend's certificate?
+fn certificate_error(e: &(dyn std::error::Error + 'static)) -> bool {
+    let is_cert = |tls: &rustls::Error| {
+        matches!(
+            tls,
+            rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented
+        )
+    };
+    let mut source = Some(e);
+    while let Some(err) = source {
+        if let Some(tls) = err.downcast_ref::<rustls::Error>() {
+            return is_cert(tls);
+        }
+        // hyper-rustls nests the rustls error inside io::Error wrappers,
+        // which don't expose it through source().
+        let mut io = err.downcast_ref::<std::io::Error>();
+        while let Some(inner) = io.and_then(|e| e.get_ref()) {
+            if let Some(tls) = inner.downcast_ref::<rustls::Error>() {
+                return is_cert(tls);
+            }
+            io = inner.downcast_ref::<std::io::Error>();
+        }
+        source = err.source();
+    }
+    false
 }
 #[cfg(test)]
 mod tests {

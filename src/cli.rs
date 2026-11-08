@@ -16,104 +16,159 @@ use std::{
     name = "porch",
     version,
     about = "Stable named URLs for local development",
+    long_about = "Stable named URLs for local development.\n\nPorch runs your dev command on a free port and serves it at a name you choose, such as http://web.localhost. Run `porch` in a package or workspace root to start its dev script.",
+    after_help = "Examples:\n  porch                         Run this package's dev script (every package at a workspace root)\n  porch run pnpm dev            Run a command, naming the app after the package\n  porch api node server.js      Run a command as api.localhost\n  porch alias db 5432           Route db.localhost to an existing port\n  porch list                    Show routes and their health\n  porch setup                   Guided first run (HTTPS, port, start at login)\n  porch doctor --fix            Find and fix common problems\n\nDocs: https://github.com/akshitkrnagpal/porch/blob/main/docs/reference.md",
     disable_version_flag = true
 )]
 struct Cli {
+    /// Print the version
     #[arg(short='v',short_alias='V',long,action=clap::ArgAction::Version)]
     version: (),
     #[command(flatten)]
     options: RunOptions,
-    #[arg(long)]
+    /// Directory for routes, certificates and settings (default ~/.porch)
+    #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 #[derive(Args, Debug, Default, Clone)]
 struct RunOptions {
+    /// App name; the URL becomes NAME.localhost
     #[arg(long)]
     name: Option<String>,
+    /// Package script to run instead of `dev`
     #[arg(long)]
     script: Option<String>,
+    /// Worktree prefix for the name; '' turns worktree naming off
     #[arg(long)]
     prefix: Option<String>,
-    #[arg(long,value_parser=clap::value_parser!(u16).range(1..))]
+    /// Give the app this fixed port instead of a free one
+    #[arg(long,value_name="PORT",value_parser=clap::value_parser!(u16).range(1..))]
     app_port: Option<u16>,
+    /// Take over the name if another app holds it, stopping that app
     #[arg(long)]
     force: bool,
+    /// Also share the app on your tailnet over Tailscale Serve
     #[arg(long)]
     tailscale: bool,
+    /// Also share the app publicly with Tailscale Funnel
     #[arg(long)]
     funnel: bool,
+    /// Also share the app publicly through an ngrok tunnel
     #[arg(long)]
     ngrok: bool,
+    /// Also share the app publicly through a Cloudflare quick tunnel
     #[arg(long)]
     cloudflare: bool,
+    /// Publish NAME.local over mDNS so phones and other devices on the LAN can open it
     #[arg(long)]
     lan: bool,
+    /// LAN address to advertise (default: detected automatically)
     #[arg(long)]
     ip: Option<String>,
+    /// Framework whose port and host flags to add (detected automatically)
     #[arg(long)]
     framework: Option<String>,
+    /// Keep this app off paired machines, even when sharing is on
+    #[arg(long)]
+    private: bool,
+    /// Run in the background: print the URL once the app answers, then return.
+    /// Output goes to `porch logs NAME`; stop it with `porch stop NAME`
+    #[arg(long, short = 'd')]
+    detach: bool,
 }
 #[derive(Parser, Debug)]
 struct App {
     #[command(flatten)]
     options: RunOptions,
+    /// Directory for routes, certificates and settings (default ~/.porch)
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+    /// Command to run and its arguments
     #[arg(trailing_var_arg=true,num_args=0..)]
     command: Vec<String>,
 }
 #[derive(Args, Debug, Default, Clone)]
 pub(crate) struct ProxyOptions {
+    /// Proxy port (default 80, or 443 with HTTPS, when no sudo is needed; otherwise 7462)
     #[arg(short='p',long,value_parser=clap::value_parser!(u16).range(1..))]
     pub(crate) port: Option<u16>,
+    /// Serve HTTPS and HTTP/2 with a local CA trusted for your user (no sudo)
     #[arg(long, conflicts_with = "no_tls")]
     pub(crate) https: bool,
+    /// Serve plain HTTP
     #[arg(long)]
     pub(crate) no_tls: bool,
+    /// Run in this terminal instead of in the background
     #[arg(long)]
     pub(crate) foreground: bool,
+    /// Don't offer to trust the local CA
     #[arg(long)]
     pub(crate) skip_trust: bool,
+    /// Never use sudo or edit the hosts file (implied for ports 1024 and up)
     #[arg(long)]
     pub(crate) unprivileged: bool,
+    /// Serve .local names to other devices on your network
     #[arg(long)]
     pub(crate) lan: bool,
+    /// LAN address to advertise (default: detected automatically)
     #[arg(long)]
     pub(crate) ip: Option<String>,
+    /// Domains to serve (repeatable or comma-separated, default localhost)
     #[arg(long, value_delimiter = ',')]
     pub(crate) tld: Vec<String>,
+    /// Send unknown subdomains to the closest registered parent
     #[arg(long)]
     pub(crate) wildcard: bool,
-    #[arg(long, requires = "key")]
+    /// Your own TLS certificate (PEM); turns on HTTPS
+    #[arg(long, requires = "key", value_name = "FILE")]
     pub(crate) cert: Option<PathBuf>,
-    #[arg(long, requires = "cert")]
+    /// Private key for --cert (PEM)
+    #[arg(long, requires = "cert", value_name = "FILE")]
     pub(crate) key: Option<PathBuf>,
-    #[arg(long)]
+    /// Address to listen on (default: loopback only)
+    #[arg(long, value_name = "IP")]
     pub(crate) bind: Option<String>,
-    #[arg(long,value_parser=clap::value_parser!(u16).range(1..))]
+    /// Extra plain-HTTP port that redirects to HTTPS
+    #[arg(long,value_name="PORT",value_parser=clap::value_parser!(u16).range(1..))]
     pub(crate) redirect_port: Option<u16>,
-    #[arg(long)]
+    /// Directory for routes, certificates and settings (default ~/.porch)
+    #[arg(long, value_name = "DIR")]
     pub(crate) state_dir: Option<PathBuf>,
 }
 #[derive(Subcommand, Debug)]
 enum ProxyCommand {
+    /// Start the proxy (it also starts on its own when you launch an app)
     Start(ProxyOptions),
+    /// Stop the proxy; running apps keep their routes
     Stop {
+        /// Only stop it if it is on this port
         #[arg(short = 'p', long)]
         port: Option<u16>,
     },
+    /// Print whether the proxy is running
     Status,
 }
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Run a command behind a named URL, naming it from package.json, Git or the directory
+    #[command(
+        after_help = "Examples:\n  porch run pnpm dev\n  porch run --name docs npx vitepress dev\n  porch run --app-port 4500 -- node server.js"
+    )]
     Run(App),
+    /// Print an app's URL (works before the app is running, for cross-app references)
     Get {
+        /// App name
         name: String,
+        /// Ignore the Git worktree prefix
         #[arg(long)]
         no_worktree: bool,
     },
+    /// List routes with their health and sharing URLs
     #[command(alias = "routes")]
     List {
+        /// Machine-readable output
         #[arg(long)]
         json: bool,
         /// Include paired LAN and tailnet machines in the versioned shared catalog.
@@ -124,81 +179,145 @@ enum Commands {
     Pair(crate::discovery::commands::PairArgs),
     /// Forget a paired machine on both sides.
     Unpair {
+        /// Machine name or ID
         machine: String,
+        /// Machine-readable output
         #[arg(long)]
         json: bool,
     },
+    /// List, refresh or add paired machines
     Peers(crate::discovery::commands::Peers),
+    /// Manage the discovery agent that shares apps with paired machines
     Discovery {
         #[command(subcommand)]
         command: crate::discovery::commands::Command,
     },
     /// Open an app locally or through a paired machine's authenticated browser relay.
     Open {
+        /// App name
         app: String,
+        /// Paired machine that runs the app
         #[arg(long)]
         peer: Option<String>,
+        /// Print the URL instead of opening a browser
         #[arg(long)]
         url_only: bool,
     },
     /// Copy a local app URL or a paired machine's loopback relay URL.
     Copy {
+        /// App name
         app: String,
+        /// Paired machine that runs the app
         #[arg(long)]
         peer: Option<String>,
     },
     /// Launch the optional native menu bar / tray companion.
     Tray,
+    /// Route a name to something Porch didn't start (a port, Docker container or URL)
+    #[command(
+        after_help = "Examples:\n  porch alias db 5432\n  porch alias grafana http://127.0.0.1:3001\n  porch alias --remove db"
+    )]
     Alias {
+        /// Name for the route
         name: Option<String>,
+        /// Port (3000) or HTTP(S) URL to send requests to
         target: Option<String>,
-        #[arg(long)]
+        /// Remove the alias with this name
+        #[arg(long, value_name = "NAME")]
         remove: Option<String>,
+        /// Replace an existing route with this name
         #[arg(long)]
         force: bool,
+        /// Only register under these domains
         #[arg(long, value_delimiter = ',')]
         tld: Vec<String>,
+        /// Keep this alias off paired machines, even when sharing is on
+        #[arg(long)]
+        private: bool,
+        /// How to talk to the port: https (TLS, keep Host), https://HOST[:PORT]
+        /// (TLS with that server name and Host) or http://HOST[:PORT] (that Host)
+        #[arg(long, value_name = "SPEC")]
+        upstream: Option<String>,
+        /// With an https upstream, don't verify its certificate (self-signed dev servers)
+        #[arg(long, requires = "upstream")]
+        insecure: bool,
     },
+    /// Stop an app Porch started (in this or another terminal, or with --detach)
+    Stop {
+        /// App name
+        name: String,
+        /// Also stop the other apps started by the same `porch` run (a workspace)
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show the output of an app started with `porch run --detach`
+    Logs {
+        /// App name
+        name: String,
+        /// Keep printing new output
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Show only the last N lines
+        #[arg(long, short = 'n', value_name = "N")]
+        lines: Option<usize>,
+    },
+    /// Remove an alias
     #[command(alias = "rm")]
     Remove {
+        /// Alias name
         name: String,
+        /// Only remove it from these domains
         #[arg(long, value_delimiter = ',')]
         tld: Vec<String>,
     },
+    /// Remove routes whose apps are gone
     Prune {
+        /// Also stop processes left behind by those routes
         #[arg(long)]
         force: bool,
     },
+    /// Remove everything Porch installed: trust, services, hosts entries and state
     Clean {
+        /// Don't ask for confirmation
         #[arg(long)]
         force: bool,
     },
+    /// Start, stop or check the proxy
     Proxy {
         #[command(subcommand)]
         command: Option<ProxyCommand>,
     },
+    /// Run an MCP server over stdio so coding agents can find and manage your apps
     Mcp {
+        /// Tool profiles: core, proxy, diagnostics, readonly or all
         #[arg(long, alias = "tools-profiles")]
         tools: Option<String>,
+        /// Same as --tools
         profile: Option<String>,
     },
+    /// Sync or clean Porch's block in the hosts file (`porch hosts sync|clean`)
     Hosts {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Start the proxy at login (`porch service install|status|uninstall`)
     Service {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run `docker compose` and give each HTTP service a named URL (`porch compose up`)
     Compose {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Manage Tailscale, ngrok and Cloudflare sharing for running apps
     Share {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Show LAN mode status and addresses
     Lan,
+    /// Check the proxy, routes, name resolution and trust, and suggest fixes
     Doctor {
         /// Apply safe fixes; terminating stopped or orphaned launches still asks first.
         #[arg(long)]
@@ -215,11 +334,44 @@ enum Commands {
         #[arg(long)]
         system: bool,
     },
+    /// Show the packages Porch would start at this workspace root
     Workspace,
     /// Update porch to the latest release (or run `brew upgrade` for Homebrew installs).
     SelfUpdate(crate::update::SelfUpdateArgs),
     #[command(external_subcommand)]
     Named(Vec<String>),
+}
+/// A subcommand within two edits of `word`, if any.
+fn closest_subcommand(word: &str) -> Option<String> {
+    fn distance(a: &str, b: &str) -> usize {
+        let b: Vec<char> = b.chars().collect();
+        let mut prev: Vec<usize> = (0..=b.len()).collect();
+        for (i, ca) in a.chars().enumerate() {
+            let mut cur = vec![i + 1];
+            for (j, cb) in b.iter().enumerate() {
+                cur.push(
+                    (prev[j] + usize::from(ca != *cb))
+                        .min(prev[j + 1] + 1)
+                        .min(cur[j] + 1),
+                );
+            }
+            prev = cur;
+        }
+        prev[b.len()]
+    }
+    Cli::command()
+        .get_subcommands()
+        .map(|c| c.get_name().to_owned())
+        .filter(|n| n != word)
+        .map(|n| (distance(word, &n), n))
+        .filter(|(d, n)| *d <= 2 && *d < n.len().min(word.len()))
+        .min()
+        .map(|(_, n)| n)
+}
+/// The CLI definition, for tests that keep other surfaces (MCP) in sync.
+#[cfg(test)]
+pub(crate) fn command() -> clap::Command {
+    Cli::command()
 }
 fn merge(mut a: RunOptions, b: RunOptions) -> RunOptions {
     if b.name.is_some() {
@@ -246,6 +398,8 @@ fn merge(mut a: RunOptions, b: RunOptions) -> RunOptions {
     a.ngrok |= b.ngrok;
     a.cloudflare |= b.cloudflare;
     a.lan |= b.lan;
+    a.private |= b.private;
+    a.detach |= b.detach;
     a
 }
 pub async fn run() -> Result<i32> {
@@ -253,6 +407,9 @@ pub async fn run() -> Result<i32> {
     // --name explicitly bypasses reserved command dispatch.
     if leading_name(&raw) {
         let app = App::parse_from(std::iter::once("porch".to_string()).chain(raw));
+        if let Some(d) = &app.state_dir {
+            std::env::set_var("PORCH_STATE_DIR", d)
+        }
         return launch(app.options, app.command).await;
     }
     let (cli, extra) = if let Some(at) = bare_separator(&raw) {
@@ -272,6 +429,9 @@ pub async fn run() -> Result<i32> {
     }
     if let Some(ip) = &options.ip {
         std::env::set_var("PORCH_LAN_IP", ip)
+    }
+    if options.private {
+        std::env::set_var("PORCH_PRIVATE", "1")
     }
     for (key, on) in [
         ("TAILSCALE", options.tailscale),
@@ -296,11 +456,37 @@ pub async fn run() -> Result<i32> {
             }
             return launch_extra(options, vec![], extra).await;
         }
-        Some(Commands::Run(a)) => return launch(merge(options, a.options), a.command).await,
+        Some(Commands::Run(a)) => {
+            if let Some(d) = &a.state_dir {
+                std::env::set_var("PORCH_STATE_DIR", d)
+            }
+            return launch(merge(options, a.options), a.command).await;
+        }
         Some(Commands::SelfUpdate(a)) => return crate::update::run(a).await,
         Some(Commands::Named(mut args)) => {
             let name = args.remove(0);
+            // `porch lsit` is far more likely a typo than an app named lsit
+            // with no command.
+            // Likewise `porch stpo demo`, when `demo` isn't a program at all.
+            let runnable = |program: &str| {
+                program.contains(['/', '\\'])
+                    || std::env::var_os("PATH").is_some_and(|path| {
+                        std::env::split_paths(&path).any(|dir| {
+                            dir.join(program).is_file()
+                                || (cfg!(windows) && dir.join(format!("{program}.exe")).is_file())
+                        })
+                    })
+                    || program.starts_with('-')
+            };
+            if args.is_empty() || !runnable(&args[0]) {
+                if let Some(close) = closest_subcommand(&name) {
+                    bail!("unknown command `{name}`; did you mean `porch {close}`? (To run an app named {name}, give its command: `porch {name} <command>`.)")
+                }
+            }
             let a = App::parse_from(std::iter::once("porch".into()).chain(args));
+            if let Some(d) = &a.state_dir {
+                std::env::set_var("PORCH_STATE_DIR", d)
+            }
             let mut o = merge(options, a.options);
             o.name = Some(name);
             return launch(o, a.command).await;
@@ -362,20 +548,36 @@ pub async fn run() -> Result<i32> {
             remove,
             force,
             tld,
+            private,
+            upstream,
+            insecure,
         }) => {
+            if private {
+                std::env::set_var("PORCH_PRIVATE", "1")
+            }
             if let Some(n) = remove {
                 remove_alias(&n, &tld)?
             } else {
+                let upstream = upstream
+                    .map(|spec| state::Upstream::parse(&spec, insecure))
+                    .transpose()?;
                 alias(
                     &name.context("name required")?,
                     &target.context("port or HTTP target required")?,
                     force,
                     &tld,
+                    upstream,
                 )
                 .await?
             }
             sync_hosts().await;
         }
+        Some(Commands::Stop { name, all }) => return stop_app(&name, all).await,
+        Some(Commands::Logs {
+            name,
+            follow,
+            lines,
+        }) => return show_logs(&name, follow, lines).await,
         Some(Commands::Remove { name, tld }) => {
             remove_alias(&name, &tld)?;
             sync_hosts().await;
@@ -415,7 +617,16 @@ pub async fn run() -> Result<i32> {
                 if port.is_some_and(|p| state::proxy_settings().is_ok_and(|s| s.port != p)) {
                     bail!("no proxy at requested port in this state directory")
                 }
+                let was_running = proxy_running();
                 stop_proxy().await?;
+                println!(
+                    "{}",
+                    if was_running {
+                        "Proxy stopped"
+                    } else {
+                        "Proxy was not running"
+                    }
+                );
             }
             ProxyCommand::Status => println!(
                 "{}",
@@ -447,7 +658,9 @@ pub async fn run() -> Result<i32> {
         Some(Commands::Lan) => integration("lan", vec![]).await?,
         Some(Commands::Doctor { fix, yes }) => {
             integration("doctor", vec![]).await?;
-            crate::doctor::run(fix, yes).await?;
+            if crate::doctor::run(fix, yes).await? > 0 {
+                return Ok(1);
+            }
         }
         Some(Commands::Setup(args)) => crate::setup::run(args).await?,
         Some(Commands::Trust { system }) => {
@@ -462,7 +675,44 @@ pub async fn run() -> Result<i32> {
         Some(Commands::Workspace) => {
             let cwd = std::env::current_dir()?;
             let root = crate::config::find_workspace_root(&cwd).unwrap_or(cwd);
-            println!("{:#?}", crate::config::discover_workspace_packages(&root));
+            let plans = crate::config::launch_plans(
+                &root,
+                None,
+                options.name.as_deref(),
+                options.script.as_deref(),
+                options.prefix.as_deref(),
+            )?;
+            let p = resolve_settings(&ProxyOptions::default())?;
+            use crate::style::{self, Stream::Stdout};
+            let width = plans
+                .iter()
+                .map(|x| p.url(&x.name).len())
+                .max()
+                .unwrap_or(3);
+            println!(
+                "{}",
+                style::dim(Stdout, &format!("{:<width$}  {:<8} COMMAND", "URL", "DIR"))
+            );
+            for plan in plans {
+                let rel = plan.cwd.strip_prefix(&root).unwrap_or(&plan.cwd);
+                let rel = if rel.as_os_str().is_empty() {
+                    ".".to_owned()
+                } else {
+                    rel.display().to_string()
+                };
+                let url = if plan.proxy {
+                    p.url(&plan.name)
+                } else {
+                    "(task, no URL)".to_owned()
+                };
+                println!(
+                    "{}{}  {:<8} {}",
+                    style::url(Stdout, &url),
+                    " ".repeat(width.saturating_sub(url.len())),
+                    rel,
+                    style::dim(Stdout, &plan.command.join(" "))
+                );
+            }
         }
     }
     Ok(0)
@@ -510,7 +760,38 @@ fn tlds(values: &[String]) -> Result<Vec<String>> {
     if out.is_empty() {
         bail!("at least one TLD required")
     }
+    for t in &out {
+        if let Some(why) = risky_tld(t) {
+            eprintln!("porch: warning: .{t} {why}. Prefer .localhost, .test, or a domain you own such as local.example.com.");
+        }
+    }
     Ok(out)
+}
+/// Why a TLD is a poor choice for local apps, if it is (Portless's list, plus
+/// any public suffix such as co.uk or github.io).
+fn risky_tld(tld: &str) -> Option<&'static str> {
+    let reason = |t: &str| {
+        match t {
+        "local" => Some("conflicts with mDNS/Bonjour on macOS (use --lan for .local names)"),
+        "dev" | "app" => Some("is Google-owned and browsers force HTTPS on it (HSTS preload)"),
+        "com" | "org" | "net" | "io" | "edu" | "gov" | "mil" | "int" => {
+            Some("is a public TLD: lookups leak to the internet, and Porch won't sign certificates for it")
+        }
+        _ => None,
+    }
+    };
+    reason(tld)
+        .or_else(|| {
+            ["dev", "app"]
+                .iter()
+                .find(|r| tld.ends_with(&format!(".{r}")))
+                .and_then(|r| reason(r))
+        })
+        .or_else(|| {
+            (!crate::tls::signable_domain(tld)).then_some(
+                "is a public suffix that many unrelated sites share; Porch won't sign certificates for it",
+            )
+        })
 }
 /// Did the caller choose the proxy port (flag or PORCH_PORT)? Explicit ports never move.
 pub(crate) fn port_explicit(o: &ProxyOptions) -> bool {
@@ -587,22 +868,62 @@ pub(crate) fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
     if state::env("PORT").is_some() && explicit_port.is_none() {
         bail!("invalid proxy port; set a number, e.g. `PORCH_PORT={DEFAULT_PROXY_PORT} porch proxy start`")
     }
-    if let Some(p) = explicit_port {
+    let sync_requested = enabled("SYNC_HOSTS") == Some(true);
+    let fresh = !state::dir().join("proxy.json").exists();
+    let mut clean = false;
+    // Back to the port-free standard port after a temporary fallback.
+    // Only between runs: a running proxy keeps the port it has.
+    if explicit_port.is_none() && crate::ports::clean_urls_enabled() && !proxy_running() {
+        if let Some(p) = saved.preferred_port {
+            if crate::ports::clean_port_bindable(p) && (p == 443) == s.tls {
+                s.port = p;
+                clean = true;
+            }
+        }
+    }
+    if clean {
+        s.preferred_port = None;
+    } else if let Some(p) = explicit_port {
         if p == 0 {
             bail!("proxy port must be 1-65535; run `porch proxy start --port {DEFAULT_PROXY_PORT}`")
         }
         s.port = p
     } else if (s.tls && s.port == 80) || (!s.tls && s.port == 443) {
-        // Switching protocol leaves the other protocol's standard port. HTTPS
-        // keeps the no-sudo high port; 443 takes an explicit `--port 443`.
-        s.port = DEFAULT_PROXY_PORT
+        // Switching protocol leaves the other protocol's standard port. Move to
+        // the new protocol's standard port when no sudo is needed for it,
+        // otherwise to the no-sudo high port; 443 with sudo takes `--port 443`.
+        let standard = if s.tls { 443 } else { 80 };
+        if saved.unprivileged
+            && crate::ports::clean_urls_enabled()
+            && crate::ports::clean_port_bindable(standard)
+        {
+            s.port = standard;
+            clean = true;
+        } else {
+            s.port = DEFAULT_PROXY_PORT
+        }
+    } else if fresh
+        && !sync_requested
+        && unprivileged_choice != Some(false)
+        && crate::ports::clean_urls_enabled()
+    {
+        // First run: serve URLs without a port when this OS lets us bind the
+        // standard port without sudo. Otherwise keep the no-sudo default.
+        let standard = if s.tls { 443 } else { 80 };
+        if crate::ports::clean_port_bindable(standard) {
+            s.port = standard;
+            clean = true;
+        }
+    }
+    if s.preferred_port == Some(s.port) {
+        s.preferred_port = None;
     }
     // Port and privilege mode are one choice: high ports never need sudo or
     // hosts-file edits (browsers resolve *.localhost natively), unless the user
     // explicitly asked for hosts synchronization.
-    let sync_requested = enabled("SYNC_HOSTS") == Some(true);
     s.unprivileged = match unprivileged_choice {
         Some(v) => v,
+        None if clean => true,
         None if s.port >= FIRST_UNPRIVILEGED_PORT => !sync_requested,
         None => saved.unprivileged && saved.port == s.port,
     };
@@ -612,7 +933,7 @@ pub(crate) fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
     }
     if let Some(p) = o.redirect_port {
         s.redirect_port = Some(p)
-    } else if s.tls && s.port == 443 {
+    } else if s.tls && s.port == 443 && (!s.unprivileged || crate::ports::clean_port_bindable(80)) {
         s.redirect_port = Some(80)
     }
     if !s.tls {
@@ -733,6 +1054,20 @@ pub(crate) fn move_off_busy_port(mut s: ProxySettings, explicit: bool) -> Result
         } else {
             next
         };
+        if s.unprivileged {
+            // A no-sudo standard port (port-free URLs) that something else
+            // took: fall back to the high port for now, and remember to come
+            // back to the standard port once it is free again.
+            s.port = fallback;
+            s.redirect_port = None;
+            s.preferred_port = Some(port);
+            state::save_proxy_settings(&s)?;
+            eprintln!(
+                "Port {port} is used by {who}; Porch uses port {fallback} for now (apps: {}) and returns to port {port} on a later start once it's free.",
+                s.url("<name>")
+            );
+            return Ok(s);
+        }
         if s.tls {
             bail!("proxy port {port} unavailable: it is used by {who}. Use HTTPS on a port that needs no sudo instead: `porch proxy start --https --port {fallback}`")
         }
@@ -815,6 +1150,8 @@ pub(crate) async fn start_proxy(
     skip_trust: bool,
     port_explicit: bool,
 ) -> Result<()> {
+    // Starting clears a deliberate stop, so launchers watch over it again.
+    let _ = fs::remove_file(state::dir().join("proxy.stopped"));
     if restart_outdated_proxy().await? {
         return Ok(());
     }
@@ -881,6 +1218,29 @@ pub(crate) async fn start_proxy(
         }
     }
     let mut elevated = false;
+    if needs_privilege
+        && s.unprivileged
+        && !port_explicit
+        && s.port < crate::ports::FIRST_UNPRIVILEGED_PORT
+    {
+        // Saved port-free settings on an OS (or binary) that no longer allows
+        // binding the low port without sudo: fall back instead of failing.
+        let old = s.port;
+        s.port = if crate::ports::available(crate::ports::DEFAULT_PROXY_PORT) {
+            crate::ports::DEFAULT_PROXY_PORT
+        } else {
+            crate::ports::next_free(crate::ports::DEFAULT_PROXY_PORT)
+                .context("no free proxy port found; run `porch proxy start --port <free port>`")?
+        };
+        s.redirect_port = None;
+        state::save_proxy_settings(&s)?;
+        eprintln!(
+            "This computer doesn't allow port {old} without sudo; Porch now uses port {} (saved). Apps: {}",
+            s.port,
+            s.url("<name>")
+        );
+        needs_privilege = false;
+    }
     if needs_privilege {
         if s.unprivileged {
             bail!(
@@ -978,7 +1338,16 @@ pub(crate) async fn start_proxy(
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    eprintln!("Porch proxy ready on {}", s.url("app"));
+    eprintln!(
+        "{}",
+        crate::style::dim(
+            crate::style::Stream::Stderr,
+            &format!(
+                "Porch proxy ready on {}",
+                s.url("<name>").replace("<name>.", "*.")
+            )
+        )
+    );
     trust_if_needed(&s, skip_trust).await?;
     Ok(())
 }
@@ -988,7 +1357,10 @@ async fn trust_if_needed(s: &ProxySettings, skip: bool) -> Result<()> {
         && s.cert.is_none()
         && !skip
         && enabled("SKIP_TRUST") != Some(true)
-        && !state::dir().join("trust.json").exists()
+        && !matches!(
+            crate::integrations::ca_trust(),
+            crate::integrations::CaTrust::Trusted(_) | crate::integrations::CaTrust::Unverified(_)
+        )
     {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() || std::env::var_os("CI").is_some() {
@@ -1011,6 +1383,8 @@ async fn ensure_proxy() -> Result<ProxySettings> {
 }
 pub(crate) async fn stop_proxy() -> Result<()> {
     let _startup = startup_lock().await?;
+    // Tell running launchers this stop is deliberate, so they don't restart it.
+    let _ = state::atomic_write("proxy.stopped", b"1\n");
     if let Some(i) = proxy_identity() {
         if state::matches(&i) {
             #[cfg(unix)]
@@ -1155,7 +1529,8 @@ impl TerminationSignals {
     }
 }
 fn list(json: bool) -> Result<()> {
-    let (_, rows) = crate::health::reconcile()?;
+    // PORCH_READ_ONLY (set by MCP's read-only tools): report, never prune.
+    let (_, rows) = crate::health::reconcile_with(enabled("READ_ONLY") != Some(true))?;
     let s = state::load()?;
     let p = state::proxy_settings()?;
     let routes: Vec<_> = rows
@@ -1169,6 +1544,7 @@ fn list(json: bool) -> Result<()> {
                 "pid": r.pid,
                 "urls": s.shares.get(&r.name),
                 "health": row.health.label(),
+                "private": s.private.contains(&r.name),
                 "stopped_seconds": row.stopped_for.map(|d| d.as_secs()),
             })
         })
@@ -1186,37 +1562,85 @@ fn list(json: bool) -> Result<()> {
     } else if routes.is_empty() {
         println!("No active routes")
     } else {
-        println!("{:<14} URL -> TARGET", "HEALTH");
-        for (row, r) in rows.iter().zip(&routes) {
+        use crate::style::{self, Stream::Stdout};
+        if !proxy_running() {
             println!(
-                "{:<14} {}  -> {}{}",
-                row.health.label(),
-                r["url"].as_str().unwrap_or(""),
-                r["target"].as_str().unwrap_or(""),
-                r["pid"]
-                    .as_u64()
-                    .map(|p| format!(" (pid {p})"))
-                    .unwrap_or_default()
+                "{} {}",
+                style::yellow(Stdout, "!"),
+                style::yellow(
+                    Stdout,
+                    "The proxy isn't running, so these URLs won't answer. Start it with `porch proxy start` (or launch an app)."
+                )
+            );
+        }
+        let width = routes
+            .iter()
+            .map(|r| r["url"].as_str().unwrap_or("").len())
+            .max()
+            .unwrap_or(0)
+            .max(3);
+        println!(
+            "{}",
+            style::dim(
+                Stdout,
+                &format!("  {:<14} {:<width$}  TARGET", "HEALTH", "URL")
+            )
+        );
+        for (row, r) in rows.iter().zip(&routes) {
+            let label = format!("{:<14}", row.health.label());
+            let (dot, label) = match row.health {
+                crate::health::Health::Ok => {
+                    (style::green(Stdout, "●"), style::green(Stdout, &label))
+                }
+                crate::health::Health::NotListening | crate::health::Health::Stopped => {
+                    (style::yellow(Stdout, "●"), style::yellow(Stdout, &label))
+                }
+                crate::health::Health::Dead { .. } => {
+                    (style::red(Stdout, "●"), style::red(Stdout, &label))
+                }
+            };
+            let url = r["url"].as_str().unwrap_or("");
+            println!(
+                "{dot} {label} {}{}  {}",
+                style::url(Stdout, url),
+                " ".repeat(width.saturating_sub(url.len())),
+                style::dim(
+                    Stdout,
+                    &format!(
+                        "{}{}",
+                        r["target"].as_str().unwrap_or(""),
+                        r["pid"]
+                            .as_u64()
+                            .map(|p| format!(" (pid {p})"))
+                            .unwrap_or_default()
+                    )
+                )
             );
             if let Some(urls) = r["urls"].as_object() {
                 for url in urls.values() {
-                    println!("  {}", url.as_str().unwrap_or(""));
+                    println!(
+                        "                   {}",
+                        style::url(Stdout, url.as_str().unwrap_or(""))
+                    );
                 }
             }
-            match row.health {
-                crate::health::Health::Ok => {}
-                crate::health::Health::NotListening => println!(
-                    "  nothing accepts connections on the target; make sure the app uses the PORT env var, then run `porch doctor`"
+            let hint = match row.health {
+                crate::health::Health::Ok => None,
+                crate::health::Health::NotListening => Some(
+                    "nothing accepts connections on the target; make sure the app uses the PORT env var, then run `porch doctor`".to_owned(),
                 ),
-                crate::health::Health::Stopped => println!(
-                    "  processes are stopped{} (frozen by job control); run `porch doctor --fix`",
+                crate::health::Health::Stopped => Some(format!(
+                    "processes are stopped{} (frozen by job control); run `porch doctor --fix`",
                     row.stopped_for
                         .map(|d| format!(" for {}s", d.as_secs()))
                         .unwrap_or_default()
+                )),
+                crate::health::Health::Dead { .. } => Some(
+                    "its launcher exited but app processes remain; run `porch prune --force`".to_owned(),
                 ),
-                crate::health::Health::Dead { .. } => println!(
-                    "  its launcher exited but app processes remain; run `porch prune --force`"
-                ),
+            };
+            if let Some(hint) = hint {
+                println!("  {}", style::dim(Stdout, &hint));
             }
         }
     }
@@ -1254,18 +1678,52 @@ fn conflicting_names(s: &state::State, names: &[String], p: &ProxySettings) -> V
         .map(|r| r.name.clone())
         .collect()
 }
-async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Result<()> {
+async fn alias(
+    name: &str,
+    target: &str,
+    force: bool,
+    selected: &[String],
+    upstream: Option<state::Upstream>,
+) -> Result<()> {
+    if upstream.is_some() && target.parse::<u16>().is_err() {
+        bail!("--upstream needs a port target (it always dials this computer), e.g. `porch alias api 8443 --upstream https`")
+    }
     let target = if let Ok(p) = target.parse::<u16>() {
         if p == 0 {
             bail!("port must be nonzero")
         }
-        format!("http://127.0.0.1:{p}")
+        // `localhost`, like any client: reaches a server on 127.0.0.1 or ::1
+        // (newer Node binds `localhost` to ::1 only).
+        format!("http://localhost:{p}")
+    } else if !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("port {target} is out of range; use 1-65535")
     } else {
-        let u = url::Url::parse(target)?;
+        // `127.0.0.1:5931` or `localhost:3000` mean plain HTTP there.
+        let with_scheme;
+        let target = if !target.contains("://")
+            && target
+                .rsplit_once(':')
+                .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok())
+        {
+            with_scheme = format!("http://{target}");
+            with_scheme.as_str()
+        } else {
+            target
+        };
+        let u = url::Url::parse(target).with_context(|| {
+            format!("target {target:?} must be a port (3000) or a URL (http://127.0.0.1:3000)")
+        })?;
+        if u.query().is_some() || u.fragment().is_some() {
+            bail!("target {target:?} can't have a query or fragment; Porch forwards each request's own path and query")
+        }
         if !["http", "https"].contains(&u.scheme()) || u.host_str().is_none() {
             bail!("target must be an HTTP URL or TCP port")
         }
-        target.to_owned()
+        if !u.username().is_empty() || u.password().is_some() {
+            bail!("target {target:?} can't contain credentials; put them in your app's config instead")
+        }
+        // Store the normalized, percent-encoded form so the proxy can always parse it.
+        u.as_str().trim_end_matches('/').to_owned()
     };
     let names = alias_names(name, selected)?;
     let p = state::proxy_settings()?;
@@ -1283,6 +1741,8 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
         let incoming: Vec<_> = names.iter().flat_map(|n| route_hostnames(n, &p)).collect();
         for n in conflicts {
             let old = s.routes.iter().find(|r| r.name == n).cloned();
+            let was_private = s.private.contains(&n);
+            let old_upstream = s.upstreams.get(&n).cloned();
             state::remove_route(s, &n);
             if !selected.is_empty() {
                 if let Some(old) = old.filter(|r| r.pid.is_none()) {
@@ -1290,6 +1750,12 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
                         .into_iter()
                         .filter(|h| !incoming.contains(h))
                     {
+                        if was_private {
+                            s.private.insert(host.clone());
+                        }
+                        if let Some(up) = &old_upstream {
+                            s.upstreams.insert(host.clone(), up.clone());
+                        }
                         s.routes.push(Route {
                             name: host,
                             target: old.target.clone(),
@@ -1299,16 +1765,27 @@ async fn alias(name: &str, target: &str, force: bool, selected: &[String]) -> Re
                 }
             }
         }
-        for n in names {
-            state::remove_route(s, &n);
+        for n in &names {
+            state::remove_route(s, n);
             s.routes.push(Route {
-                name: n,
+                name: n.clone(),
                 target: target.clone(),
                 pid: None,
             });
+            if enabled("PRIVATE") == Some(true) {
+                s.private.insert(n.clone());
+            }
+            if let Some(up) = &upstream {
+                s.upstreams.insert(n.clone(), up.clone());
+            }
         }
         Ok(())
-    })
+    })?;
+    let shown = resolve_settings(&ProxyOptions::default()).unwrap_or(p);
+    for n in &names {
+        println!("{} -> {target}", shown.url(n));
+    }
+    Ok(())
 }
 fn remove_alias(name: &str, selected: &[String]) -> Result<()> {
     let names = alias_names(name, selected)?;
@@ -1330,11 +1807,19 @@ fn remove_alias(name: &str, selected: &[String]) -> Result<()> {
             bail!("no matching static alias found for {name}")
         }
         for r in old {
+            let was_private = s.private.contains(&r.name);
+            let old_upstream = s.upstreams.get(&r.name).cloned();
             state::remove_route(s, &r.name);
             for host in route_hostnames(&r.name, &p)
                 .into_iter()
                 .filter(|h| !removing.contains(h))
             {
+                if was_private {
+                    s.private.insert(host.clone());
+                }
+                if let Some(up) = &old_upstream {
+                    s.upstreams.insert(host.clone(), up.clone());
+                }
                 s.routes.push(Route {
                     name: host,
                     target: r.target.clone(),
@@ -1463,6 +1948,7 @@ pub(crate) async fn prune(force: bool) -> Result<()> {
         .filter(|r| r.pid.is_some() && !state::route_alive(&old, r))
         .map(|r| r.name.clone())
         .collect();
+    let mut pruned = 0;
     for n in names {
         kill_route(&old, &n, if force { 9 } else { 15 })?;
         if let Some(owner) = old.owners.get(&n) {
@@ -1486,6 +1972,18 @@ pub(crate) async fn prune(force: bool) -> Result<()> {
                 state::remove_route(s, &n);
             }
         })?;
+        pruned += 1;
+        println!(
+            "Removed {n}{}",
+            if force {
+                " and stopped what it left running"
+            } else {
+                ""
+            }
+        );
+    }
+    if pruned == 0 {
+        println!("Nothing to prune");
     }
     Ok(())
 }
@@ -1603,6 +2101,9 @@ fn reserve(
             target: format!("http://127.0.0.1:{port}"),
             pid: Some(owner),
         });
+        if enabled("PRIVATE") == Some(true) {
+            s.private.insert(name.clone());
+        }
         s.owners.insert(name.clone(), identity);
         Ok(listener)
     })?;
@@ -1705,17 +2206,84 @@ async fn spawn_prepared(
                 i.child_started = state::identity(id).map(|p| p.started);
             }
         })?;
-        eprintln!(
-            "{} -> {}",
-            p.env.get("PORCH_URL").unwrap_or(&p.plan.name),
-            p.port.unwrap()
-        );
+        {
+            use crate::style::{self, Stream::Stderr};
+            eprintln!(
+                "{} {}",
+                style::url(Stderr, p.env.get("PORCH_URL").unwrap_or(&p.plan.name)),
+                style::dim(Stderr, &format!("-> {}", p.port.unwrap()))
+            );
+            // Once, in a terminal: HTTPS is one command away and needs no sudo.
+            use std::io::IsTerminal;
+            let tip = state::dir().join("tip-https");
+            if std::io::stderr().is_terminal()
+                && std::env::var_os("CI").is_none()
+                && !p
+                    .env
+                    .get("PORCH_URL")
+                    .is_some_and(|u| u.starts_with("https:"))
+                && !tip.exists()
+            {
+                let _ = state::atomic_write("tip-https", b"shown\n");
+                eprintln!(
+                    "{}",
+                    style::dim(
+                        Stderr,
+                        "Tip: `porch setup --https` serves your apps over HTTPS with a local CA trusted for you only (no sudo)."
+                    )
+                );
+            }
+        }
     }
+    // Keep the proxy up while this app runs: if it dies without a deliberate
+    // `porch proxy stop`, start it again with the saved settings.
+    let supervisor = p.lease.is_some().then(|| {
+        tokio::spawn(async {
+            let mut was_running = proxy_running();
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let running = proxy_running();
+                if was_running && !running && !state::dir().join("proxy.stopped").exists() {
+                    eprintln!("porch: the proxy stopped unexpectedly; restarting it");
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = tokio::process::Command::new(exe)
+                            .args(["proxy", "start"])
+                            .env("PORCH_SKIP_TRUST", "1")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .status()
+                            .await;
+                    }
+                }
+                was_running = proxy_running();
+            }
+        })
+    });
     let listen_check = p.port.filter(|_| p.lease.is_some()).map(|port| {
+        // The suggested rerun keeps this exact name (worktree prefix included).
+        let quote = |a: &str| {
+            if !a.is_empty()
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c))
+            {
+                a.to_owned()
+            } else {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            }
+        };
         tokio::spawn(crate::health::listen_check(
             port,
             id,
-            p.plan.command.join(" "),
+            format!(
+                "--name {} --prefix '' {}",
+                quote(&p.plan.name),
+                p.plan
+                    .command
+                    .iter()
+                    .map(|a| quote(a))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
         ))
     });
     // The child is reaped only at the end (see `process::wait_exit`): until
@@ -1723,6 +2291,9 @@ async fn spawn_prepared(
     // signals.
     let code = tokio::select! {status=crate::process::wait_exit(&mut child)=>child_status(status?),failure=share_failure(&mut p.shares)=>{signal_group(id,15);let _=tokio::time::timeout(Duration::from_secs(3),crate::process::wait_exit(&mut child)).await;failure?;bail!("sharing tunnel stopped")},changed=shutdown.changed()=>{changed?;let sig=(*shutdown.borrow()).unwrap_or(15);signal_group(id,sig);match tokio::time::timeout(Duration::from_secs(3),crate::process::wait_exit(&mut child)).await{Ok(r)=>{r?;},Err(_)=>{signal_group(id,9);crate::process::wait_exit(&mut child).await?;}}128+sig}};
     if let Some(task) = listen_check {
+        task.abort();
+    }
+    if let Some(task) = supervisor {
         task.abort();
     }
     let mut transferred = false;
@@ -1799,11 +2370,234 @@ async fn spawn_prepared(
 async fn launch(options: RunOptions, command: Vec<String>) -> Result<i32> {
     launch_extra(options, command, vec![]).await
 }
+fn log_path(name: &str) -> PathBuf {
+    state::dir().join("logs").join(format!("{name}.log"))
+}
+/// `porch run --detach`: start this same command as a background launcher
+/// writing to a log, wait until its app answers, print the URL and return.
+async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
+    let cwd = std::env::current_dir()?;
+    let plans = crate::config::launch_plans(
+        &cwd,
+        (!command.is_empty()).then(|| command.to_vec()),
+        options.name.as_deref(),
+        options.script.as_deref(),
+        options.prefix.as_deref(),
+    )?;
+    let names: Vec<String> = plans
+        .iter()
+        .filter(|p| p.proxy)
+        .map(|p| p.name.clone())
+        .collect();
+    let log_name = names.first().cloned().unwrap_or_else(|| "workspace".into());
+    let log = log_path(&log_name);
+    // Every app of a workspace launch shares one output stream; the other
+    // names point at it, so `porch logs NAME` works for each of them.
+    let shared_with: Vec<String> = names.iter().skip(1).cloned().collect();
+    // Refuse a second copy up front, before touching the running one's log.
+    if !options.force {
+        let s = state::load()?;
+        let p = resolve_settings(&ProxyOptions::default())?;
+        for n in &names {
+            if let Some(r) = s.routes.iter().find(|r| &r.name == n) {
+                if state::route_alive(&s, r) {
+                    bail!(
+                        "{} is already running; see `porch logs {n}`, stop it with `porch stop {n}`, or replace it with --force",
+                        p.url(n)
+                    );
+                }
+            }
+        }
+    }
+    fs::create_dir_all(log.parent().unwrap())?;
+    let out = fs::File::create(&log)?;
+    for other in &shared_with {
+        let _ = fs::remove_file(log_path(other));
+        fs::write(
+            log.parent().unwrap().join(format!("{other}.logref")),
+            format!("{log_name}\n"),
+        )?;
+    }
+    let mut child = Command::new(std::env::current_exe()?);
+    child
+        .args(std::env::args_os().skip(1))
+        .env("PORCH_DETACHED", "1")
+        .stdin(Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(out);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own session: closing this terminal doesn't stop the app.
+        unsafe {
+            child.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        child.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    let mut child = child.spawn().context("starting the background launcher")?;
+    let launcher = child.id();
+    let timeout = crate::health::listen_timeout().max(Duration::from_secs(5));
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let tail = fs::read_to_string(&log).unwrap_or_default();
+            let tail: Vec<_> = tail.lines().rev().take(20).collect();
+            for line in tail.into_iter().rev() {
+                eprintln!("{line}");
+            }
+            bail!(
+                "the app exited ({status}) before it was ready; full output: {}",
+                log.display()
+            );
+        }
+        let s = state::load()?;
+        // Ready only when *our* launcher owns each route and its app answers.
+        let ready = !names.is_empty()
+            && names.iter().all(|n| {
+                s.owners.get(n).is_some_and(|o| o.pid == launcher)
+                    && s.routes
+                        .iter()
+                        .find(|r| &r.name == n)
+                        .is_some_and(|r| crate::health::target_listening(&r.target))
+            });
+        if ready || names.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "porch: still waiting for the app to answer after {}s; it keeps starting in the background (`porch logs {log_name}`)",
+                timeout.as_secs()
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Read the settings now: the proxy may have moved off a busy port.
+    let settings = state::proxy_settings()?;
+    use crate::style::{self, Stream::Stdout};
+    for n in &names {
+        println!("{}", style::url(Stdout, &settings.url(n)));
+    }
+    eprintln!(
+        "{}",
+        style::dim(
+            crate::style::Stream::Stderr,
+            &format!("Running in the background. Logs: porch logs {log_name} · Stop: porch stop {log_name}")
+        )
+    );
+    Ok(0)
+}
+/// `porch stop NAME`: stop the launcher and app behind a route.
+async fn stop_app(name: &str, all: bool) -> Result<i32> {
+    let n = normalize(name)?;
+    let s = state::load()?;
+    let p = state::proxy_settings()?;
+    let names = conflicting_names(&s, std::slice::from_ref(&n), &p);
+    let launched: Vec<String> = names
+        .into_iter()
+        .filter(|m| s.routes.iter().any(|r| &r.name == m && r.pid.is_some()))
+        .collect();
+    if launched.is_empty() {
+        if s.routes.iter().any(|r| r.name == n) {
+            bail!("{n} is an alias, not an app Porch started; remove it with `porch alias --remove {n}`")
+        }
+        bail!("no running app named {n}; see `porch list`")
+    }
+    // Apps one `porch` run started together (a workspace) share a launcher;
+    // stopping it stops all of them, so say so instead of surprising anyone.
+    let launchers: Vec<u32> = launched
+        .iter()
+        .filter_map(|m| s.owners.get(m).map(|o| o.pid))
+        .collect();
+    let siblings: Vec<String> = s
+        .owners
+        .iter()
+        .filter(|(m, o)| launchers.contains(&o.pid) && !launched.contains(m))
+        .map(|(m, _)| m.clone())
+        .collect();
+    if !siblings.is_empty() && !all {
+        bail!(
+            "{n} was started together with {} by one `porch` run, and they stop together; run `porch stop {n} --all`",
+            siblings.join(", ")
+        )
+    }
+    let mut launched = launched;
+    launched.extend(siblings);
+    evict_conflicts(&launched, &p, true).await?;
+    crate::health::reconcile_quietly();
+    for m in &launched {
+        println!("Stopped {}", p.url(m));
+    }
+    Ok(0)
+}
+/// `porch logs NAME`: print (and with --follow, keep printing) a background app's output.
+async fn show_logs(name: &str, follow: bool, lines: Option<usize>) -> Result<i32> {
+    let n = normalize(name)?;
+    let mut path = log_path(&n);
+    if !path.exists() {
+        // A workspace member: its output is in the launch's shared log.
+        if let Ok(owner) = fs::read_to_string(path.with_extension("logref")) {
+            let owner = owner.trim().to_owned();
+            eprintln!(
+                "{}",
+                crate::style::dim(
+                    crate::style::Stream::Stderr,
+                    &format!("{n} shares its output with {owner} (they were started together)")
+                )
+            );
+            path = log_path(&owner);
+        }
+    }
+    let text = fs::read_to_string(&path).with_context(|| {
+        format!("no log for {n}; logs exist for apps started with `porch run --detach`")
+    })?;
+    let all: Vec<&str> = text.lines().collect();
+    let start = lines.map_or(0, |k| all.len().saturating_sub(k));
+    for line in &all[start..] {
+        println!("{line}");
+    }
+    if !follow {
+        return Ok(0);
+    }
+    let mut offset = text.len() as u64;
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() < offset {
+            offset = 0; // the app was restarted and its log recreated
+        }
+        if meta.len() > offset {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut f = fs::File::open(&path)?;
+            f.seek(SeekFrom::Start(offset))?;
+            let mut chunk = Vec::new();
+            f.read_to_end(&mut chunk)?;
+            offset += chunk.len() as u64;
+            std::io::stdout().write_all(&chunk)?;
+            std::io::stdout().flush()?;
+        }
+    }
+}
 async fn launch_extra(
     options: RunOptions,
     command: Vec<String>,
     extra: Vec<String>,
 ) -> Result<i32> {
+    if options.detach && std::env::var_os("PORCH_DETACHED").is_none() {
+        let mut all = command.clone();
+        all.extend(extra.iter().cloned());
+        return detach(&options, &all).await;
+    }
     // Subscribe before publishing route ownership, so a signal observed by a
     // supervising caller cannot fall into the registration-to-spawn window.
     let mut signals = TerminationSignals::new()?;

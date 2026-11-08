@@ -766,6 +766,82 @@ fn trust_record() -> Result<Option<TrustRecord>> {
         Err(e) => Err(e.into()),
     }
 }
+/// What the trust stores actually say about the current local CA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaTrust {
+    /// No CA has been created yet.
+    NoCa,
+    /// Trusted, in this scope (`user` or `system`), checked in the store itself.
+    Trusted(String),
+    /// Porch never installed trust for this CA.
+    NotInstalled,
+    /// The recorded trust is for a different (older) CA.
+    Stale,
+    /// The record says installed, but the store no longer has it.
+    Removed,
+    /// The store couldn't be checked (tool missing); the record says `scope`.
+    Unverified(String),
+}
+/// Check the current CA against both Porch's record and the real trust store.
+pub fn ca_trust() -> CaTrust {
+    let ca = crate::state::dir().join("ca.pem");
+    let Ok(fingerprint) = ca_fingerprint(&ca) else {
+        return CaTrust::NoCa;
+    };
+    let Ok(Some(record)) = trust_record() else {
+        return CaTrust::NotInstalled;
+    };
+    if record.fingerprint != fingerprint {
+        return CaTrust::Stale;
+    }
+    let ca_arg = ca.to_string_lossy().into_owned();
+    let present: Option<bool> = match (record.platform.as_str(), record.scope.as_str()) {
+        ("macos", _) => {
+            // Evaluates the CA against the user's and system trust settings.
+            Command::new("security")
+                .args(["verify-cert", "-c", &ca_arg, "-p", "basic", "-L", "-q"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()
+                .map(|s| s.success())
+        }
+        ("linux", "user") => {
+            let name = nss_name(&fingerprint);
+            let mut all = Some(true);
+            for db in &record.nss_dbs {
+                let sql = format!("sql:{}", db.display());
+                match exec("certutil", &["-L", "-d", &sql]) {
+                    Ok(listing) if !nss_listing_has(&listing, &name) => all = Some(false),
+                    Ok(_) => {}
+                    Err(_) => {
+                        all = all.and(None);
+                    }
+                }
+            }
+            all
+        }
+        (_, "system") if record.installed.is_some() => {
+            let installed = record.installed.as_ref().unwrap();
+            Some(
+                fs::read(installed)
+                    .ok()
+                    .zip(fs::read(&ca).ok())
+                    .is_some_and(|(a, b)| a == b),
+            )
+        }
+        ("windows", _) => exec("certutil", &["-user", "-verifystore", "Root", &fingerprint])
+            .map(|_| true)
+            .ok(),
+        _ => None,
+    };
+    match present {
+        Some(true) => CaTrust::Trusted(record.scope),
+        Some(false) => CaTrust::Removed,
+        None => CaTrust::Unverified(record.scope),
+    }
+}
 /// Scope of the recorded CA trust (`user` or `system`), if any.
 pub fn trust_scope() -> Option<String> {
     trust_record().ok().flatten().map(|r| r.scope)
@@ -818,7 +894,7 @@ fn trust_platform() -> String {
 /// DER of the first certificate in a PEM file, the same one `openssl x509 -in` reads.
 fn ca_der(ca: &Path) -> Result<Vec<u8>> {
     let pem = fs::read(ca).with_context(|| format!("could not read {}", ca.display()))?;
-    let der = rustls_pemfile::certs(&mut std::io::BufReader::new(pem.as_slice()))
+    let der = crate::pem::certs(&mut std::io::BufReader::new(pem.as_slice()))
         .next()
         .with_context(|| format!("no PEM certificate in {}", ca.display()))?
         .with_context(|| format!("invalid PEM certificate in {}", ca.display()))?;
@@ -888,6 +964,11 @@ fn trust(system: bool) -> Result<()> {
     }
     verify_porch_ca(&ca)?;
     let fingerprint = ca_fingerprint(&ca)?;
+    // A new CA replaced the trusted one (the domains changed): remove the old
+    // CA's trust first, so no retired root stays trusted.
+    if trust_record()?.is_some_and(|r| r.fingerprint != fingerprint) {
+        untrust().context("couldn't remove trust for the previous Porch CA; trust record kept, run `porch trust` again")?;
+    }
     if let Some(existing) = trust_record()? {
         if existing.scope == "system" && !system && existing.fingerprint == fingerprint {
             println!("Porch local CA is already trusted system-wide");
@@ -1045,14 +1126,32 @@ fn untrust() -> Result<()> {
     let Some(r) = trust_record()? else {
         return Ok(());
     };
-    let ca = crate::state::dir().join("ca.pem");
-    verify_porch_ca(&ca)?;
-    if r.fingerprint.len() != 40
-        || !r.fingerprint.bytes().all(|c| c.is_ascii_hexdigit())
-        || ca_fingerprint(&ca)? != r.fingerprint
-    {
-        bail!("recorded trust fingerprint does not match the Porch CA; certificate retained");
+    if r.fingerprint.len() != 40 || !r.fingerprint.bytes().all(|c| c.is_ascii_hexdigit()) {
+        bail!("invalid recorded trust fingerprint; certificate retained");
     }
+    // The trusted CA may be the current one or one retired when the domains
+    // changed (`ca.pem.retired-*`): find the file with the recorded fingerprint.
+    let dir = crate::state::dir();
+    let mut candidates = vec![dir.join("ca.pem")];
+    if let Ok(entries) = fs::read_dir(&dir) {
+        candidates.extend(
+            entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("ca.pem.retired-")
+                })
+                .map(|e| e.path()),
+        );
+    }
+    let Some(ca) = candidates
+        .into_iter()
+        .find(|c| ca_fingerprint(c).is_ok_and(|f| f == r.fingerprint))
+    else {
+        bail!("recorded trust fingerprint does not match any Porch CA; certificate retained");
+    };
+    verify_porch_ca(&ca)?;
     if r.update
         .as_ref()
         .is_some_and(|s| !matches!(s.as_str(), "update-ca-certificates" | "update-ca-trust"))
@@ -1863,7 +1962,13 @@ fn compose_plan(
         if svc["network_mode"] == "host" {
             continue;
         }
-        let labels = svc.get("labels").cloned().unwrap_or(json!({}));
+        let mut labels = svc.get("labels").cloned().unwrap_or(json!({}));
+        // `porch.*` labels win over the Portless names they mirror.
+        for key in ["enable", "name", "ports"] {
+            if let Some(v) = labels.get(format!("porch.{key}")).cloned() {
+                labels[format!("portless.{key}")] = v;
+            }
+        }
         if labels["portless.enable"]
             .as_str()
             .is_some_and(|s| matches!(s.trim(), "0" | "false"))
@@ -2398,18 +2503,59 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         _ => bail!("expected hosts, service, trust, share, lan, compose, or doctor"),
     }
 }
+/// Problems the last `doctor` report marked with ✗, for its exit code.
+pub static DOCTOR_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 async fn doctor() -> Result<()> {
+    use crate::style::{self, Stream::Stdout};
+    let good = |label: &str, detail: &str| {
+        println!(
+            "  {} {label}  {}",
+            style::green(Stdout, "✓"),
+            style::dim(Stdout, detail)
+        )
+    };
+    let bad = |label: &str, detail: &str| {
+        DOCTOR_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        println!("  {} {label}  {detail}", style::red(Stdout, "✗"))
+    };
+    let info = |label: &str, detail: &str| {
+        println!(
+            "  {} {label}  {}",
+            style::dim(Stdout, "·"),
+            style::dim(Stdout, detail)
+        )
+    };
+    let section = |title: &str| println!("\n{}", style::bold(Stdout, title));
     let settings = crate::state::proxy_settings()?;
     let state = crate::state::load()?;
     println!(
-        "state: {}\nproxy: {}\nHTTPS: {}\nTLDs: {}\nLAN: {}\nunprivileged: {}",
-        crate::state::dir().display(),
-        settings.port,
-        settings.tls,
-        settings.tlds.join(","),
-        settings.lan,
-        settings.unprivileged
+        "{}",
+        style::bold(Stdout, &format!("Porch {}", env!("CARGO_PKG_VERSION")))
     );
+    section("Settings");
+    info("state", &crate::state::dir().display().to_string());
+    info(
+        "proxy",
+        &format!(
+            "{} · {} · port {}{}",
+            settings.url("<app>"),
+            if settings.tls { "HTTPS" } else { "HTTP" },
+            settings.port,
+            if settings.unprivileged {
+                " · no sudo"
+            } else {
+                " · uses sudo"
+            }
+        ),
+    );
+    info("domains", &settings.tlds.join(", "));
+    if settings.lan {
+        info(
+            "LAN mode",
+            settings.lan_ip.as_deref().unwrap_or("automatic address"),
+        );
+    }
+    section("Proxy");
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -2425,7 +2571,10 @@ async fn doctor() -> Result<()> {
     let token =
         fs::read_to_string(crate::state::dir().join("proxy.hosts-sync-token")).unwrap_or_default();
     let challenge = "ab".repeat(32);
+    let mut stopped = 0;
+    let mut foreign = false;
     for address in ["127.0.0.1", "[::1]"] {
+        let label = format!("listener {address}");
         let response = client
             .head(format!(
                 "http://{address}:{}/_porch/hosts-sync",
@@ -2447,33 +2596,75 @@ async fn doctor() -> Result<()> {
                     && response.status() == reqwest::StatusCode::CONFLICT
                     && response.headers().contains_key("x-porch");
                 if owned_ready && (authenticated || disabled) {
-                    println!("proxy listener {address}: Porch ready (identity verified)");
+                    good(&label, "Porch is ready (identity verified)");
                 } else {
-                    println!("proxy listener {address}: foreign/unverified listener; port collision or stale daemon state");
+                    let who = crate::ports::describe_owner(settings.port);
+                    let detail = format!(
+                        "foreign/unverified listener ({who}); port collision or stale daemon state"
+                    );
+                    if owned_ready {
+                        bad(&label, &detail);
+                    } else {
+                        // Porch's proxy is stopped and another program holds
+                        // its port: the busy-port check below reports (and
+                        // with --fix resolves) that, so don't count it twice.
+                        println!("  {} {label}  {detail}", style::yellow(Stdout, "!"));
+                    }
                 }
             }
-            Err(e) => {
-                println!("proxy listener {address}: unavailable ({e}); run porch proxy start")
+            Err(e) if e.is_connect() && !owned_ready => stopped += 1,
+            Err(e) if e.is_connect() => bad(
+                &label,
+                "the proxy should be here but nothing answers; run `porch proxy start`",
+            ),
+            Err(e) if owned_ready => bad(
+                &label,
+                &format!("unavailable ({e}); run `porch proxy start`"),
+            ),
+            Err(_) => {
+                foreign = true;
+                println!(
+                    "  {} {label}  another program answers on this port (see Issues)",
+                    style::yellow(Stdout, "!")
+                );
             }
         }
     }
-    #[cfg(unix)]
-    if let Ok(output) = Command::new("lsof")
-        .args(["-nP", &format!("-iTCP:{}", settings.port), "-sTCP:LISTEN"])
-        .output()
+    if foreign {
+    } else if stopped == 2
+        && state
+            .routes
+            .iter()
+            .any(|r| r.pid.is_some() && crate::state::route_alive(&state, r))
     {
-        if output.status.success() {
-            println!(
-                "listeners on proxy port:\n{}",
-                String::from_utf8_lossy(&output.stdout).trim()
-            );
-        }
+        bad(
+            "stopped",
+            "apps are running but their URLs won't answer until the proxy starts; run `porch proxy start`",
+        );
+    } else if stopped == 2 {
+        info(
+            "stopped",
+            "the proxy starts with your next app, or run `porch proxy start`",
+        );
+    } else if stopped == 1 {
+        info(
+            "one listener",
+            "only one loopback address answers (IPv6 may be off)",
+        );
+    }
+    section("Routes");
+    if state.routes.is_empty() {
+        info("none", "start an app with `porch run <command>`");
     }
     for r in state.routes {
         let owner = state.owners.get(&r.name).map(crate::state::matches);
-        println!(
-            "route: {} -> {}{}",
-            settings.url(&r.name),
+        let host = settings.hostname(&r.name);
+        let resolves = tokio::net::lookup_host((host.as_str(), settings.port))
+            .await
+            .is_ok_and(|mut a| a.next().is_some());
+        let label = settings.url(&r.name);
+        let detail = format!(
+            "-> {}{}",
             r.target,
             if owner == Some(false) {
                 " (stale launcher)"
@@ -2481,46 +2672,91 @@ async fn doctor() -> Result<()> {
                 ""
             }
         );
-        let host = settings.hostname(&r.name);
-        match tokio::net::lookup_host((host.as_str(), settings.port)).await {
-            Ok(mut addresses) => {
-                if addresses.next().is_some() {
-                    println!("DNS {host}: resolves");
-                } else {
-                    println!("DNS {host}: unavailable; run porch hosts sync");
-                }
-            }
-            _ => println!("DNS {host}: unavailable; run porch hosts sync"),
-        };
-    }
-    println!(
-        "CA: {}",
-        if crate::state::dir().join("ca.pem").is_file() {
-            "present"
+        let target = r.target.clone();
+        let listening =
+            tokio::task::spawn_blocking(move || crate::health::target_listening(&target))
+                .await
+                .unwrap_or(false);
+        if !resolves && (host == "localhost" || host.ends_with(".localhost")) {
+            // Browsers resolve *.localhost themselves, so the URL works there;
+            // only tools that ask the system resolver (curl, older macOS) miss it.
+            println!(
+                "  {} {label}  {}",
+                style::yellow(Stdout, "!"),
+                style::dim(
+                    Stdout,
+                    &format!("{detail} · browsers open it; for curl and other tools on this computer, run `sudo porch hosts sync`")
+                )
+            );
+        } else if !resolves {
+            bad(
+                &label,
+                &format!("{host} does not resolve on this computer; run `sudo porch hosts sync`"),
+            );
+        } else if !listening {
+            println!(
+                "  {} {label}  {} {}",
+                style::yellow(Stdout, "!"),
+                style::dim(Stdout, &detail),
+                style::yellow(Stdout, "(not listening)")
+            );
+        } else if owner == Some(false) {
+            bad(&label, &detail);
         } else {
-            "missing"
+            good(&label, &detail);
         }
-    );
-    println!(
-        "CA trust: {}",
-        match trust_scope().as_deref() {
-            Some("user") => "installed for this user by Porch (recorded)",
-            Some(_) => "installed system-wide by Porch (recorded)",
-            None => "not recorded; run porch trust",
+    }
+    section("HTTPS");
+    if !settings.tls {
+        info(
+            "off",
+            "turn it on with `porch setup` or `porch proxy start --https`",
+        );
+    } else if settings.cert.is_some() {
+        info("your certificate", "using --cert/--key; trust is up to you");
+    } else {
+        match ca_trust() {
+            CaTrust::NoCa => bad(
+                "local CA",
+                "missing; it is created when the proxy starts with --https",
+            ),
+            CaTrust::Trusted(scope) => good(
+                "local CA",
+                if scope == "user" {
+                    "trusted for this user (checked in the trust store)"
+                } else {
+                    "trusted system-wide (checked in the trust store)"
+                },
+            ),
+            CaTrust::Unverified(_) => info(
+                "local CA",
+                "trust was installed, but the trust store couldn't be checked here",
+            ),
+            CaTrust::NotInstalled => bad("local CA", "not trusted yet; run `porch trust`"),
+            CaTrust::Stale => bad(
+                "local CA",
+                "the trusted CA is an older one; run `porch trust` to trust the current CA",
+            ),
+            CaTrust::Removed => bad(
+                "local CA",
+                "its trust was removed from the trust store; run `porch trust` again",
+            ),
         }
-    );
-    for (tool, flag) in [
-        ("node", "--version"),
-        ("docker", "--version"),
-        ("tailscale", "version"),
-        ("ngrok", "version"),
-        ("cloudflared", "--version"),
+    }
+    section("Tools");
+    for (tool, flag, why) in [
+        ("node", "--version", "Turborepo and Node apps"),
+        ("docker", "--version", "porch compose"),
+        ("tailscale", "version", "--tailscale and --funnel"),
+        ("ngrok", "version", "--ngrok"),
+        ("cloudflared", "--version", "--cloudflare"),
     ] {
         match exec(tool, &[flag]) {
-            Ok(out) => println!("{tool}: {}", out.trim()),
-            Err(e) => println!("{tool}: {e}"),
+            Ok(out) => good(tool, out.lines().next().unwrap_or("").trim()),
+            Err(_) => info(tool, &format!("not installed (only needed for {why})")),
         }
     }
+    println!();
     Ok(())
 }
 
@@ -2639,6 +2875,11 @@ mod tests {
             .get("published")
             .is_none());
         assert_eq!(model["services"]["db"]["ports"][0]["published"], "5432");
+        // porch.* labels work like (and win over) portless.* ones.
+        let source = json!({"name":"shop","services":{"web":{"labels":{"porch.name":"store","portless.name":"old"},"ports":[{"target":3000}]},"db":{"labels":{"porch.enable":"false"},"ports":[{"target":80}]}}});
+        let (_, routes) = compose_plan(source, &crate::state::ProxySettings::default()).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name, "store.shop");
     }
     #[test]
     fn tunnel_output_waits_for_cloudflare_connection() {

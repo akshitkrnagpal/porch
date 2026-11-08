@@ -38,6 +38,7 @@ impl Sandbox {
             .env_remove("PORTLESS_PORT")
             .env_remove("PORCH_HTTPS")
             .env("PORCH_STATE_DIR", self.root.join("state"))
+            .env("PORCH_CLEAN_URLS", "0")
             .env("PORCH_APP_PORTS", common::app_ports(self.apps))
             .env("PORCH_SYNC_HOSTS", "0")
             .env("PORCH_SKIP_TRUST", "1")
@@ -134,6 +135,44 @@ fn default_is_plain_http_on_7462_without_privileges() {
     assert_eq!(v["proxy"]["port"], 7462);
     assert_eq!(v["proxy"]["tls"], false);
     assert_eq!(v["proxy"]["unprivileged"], true);
+}
+
+/// Could a non-root user bind port 80 on every address right now?
+fn port_80_bindable_without_sudo() -> bool {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        return false;
+    }
+    std::net::TcpListener::bind("0.0.0.0:80").is_ok()
+}
+
+#[test]
+fn fresh_install_uses_port_free_urls_only_when_no_sudo_is_needed() {
+    let s = Sandbox::new();
+    let before = port_80_bindable_without_sudo();
+    let out = s
+        .command(&["get", "web", "--no-worktree"])
+        .env("PORCH_CLEAN_URLS", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    // Port 80 can be taken or freed by other programs (or parallel tests)
+    // between Porch's check and ours, so require agreement only when the
+    // answer is the same before and after Porch decided.
+    let after = port_80_bindable_without_sudo();
+    assert!(
+        url == "http://web.localhost" || url == "http://web.localhost:7462",
+        "{url}"
+    );
+    if after && before {
+        assert_eq!(url, "http://web.localhost");
+    } else if !after && !before {
+        assert_eq!(url, "http://web.localhost:7462");
+    }
+    // Opting out keeps the high port.
+    let (url, _) = s.ok(&["get", "web", "--no-worktree"]);
+    assert_eq!(url.trim(), "http://web.localhost:7462");
 }
 
 #[test]
@@ -337,6 +376,30 @@ fn dead_launcher_route_is_pruned_automatically() {
 }
 
 #[test]
+fn a_running_launch_restarts_a_crashed_proxy_but_not_a_stopped_one() {
+    let s = Sandbox::new();
+    s.save_port(quiet_port(), serde_json::json!({}));
+    let (mut launcher, app) = launch_server(&s, "guarded");
+    s.wait_for("ok health", || {
+        health(&s, "guarded").as_deref() == Some("ok")
+    });
+    let crashed: i32 = s.file("proxy.pid").parse().unwrap();
+    unsafe { libc::kill(crashed, libc::SIGKILL) };
+    s.wait_for("proxy restart", || {
+        s.file("proxy.pid")
+            .parse::<i32>()
+            .is_ok_and(|p| p != crashed)
+            && s.ok(&["proxy", "status"]).0.trim() == "running"
+    });
+    // A deliberate stop stays stopped.
+    s.ok(&["proxy", "stop"]);
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert_eq!(s.ok(&["proxy", "status"]).0.trim(), "stopped");
+    unsafe { libc::kill(-(app as i32), libc::SIGTERM) };
+    let _ = launcher.wait();
+}
+
+#[test]
 fn stopped_launch_is_reported_and_doctor_fix_terminates_it() {
     let s = Sandbox::new();
     s.save_port(quiet_port(), serde_json::json!({}));
@@ -349,7 +412,10 @@ fn stopped_launch_is_reported_and_doctor_fix_terminates_it() {
         health(&s, "frozen").as_deref() == Some("stopped")
     });
     // Without consent nothing is terminated.
-    let (out, _) = s.ok(&["doctor", "--fix"]);
+    let o = s.run(&["doctor", "--fix"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    // The problem remains, so doctor fails.
+    assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(out.contains("frozen"), "{out}");
     assert!(out.contains("porch doctor --fix --yes"), "{out}");
     assert_eq!(health(&s, "frozen").as_deref(), Some("stopped"));

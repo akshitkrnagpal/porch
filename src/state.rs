@@ -17,9 +17,68 @@ pub struct State {
     pub shares: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     pub compose_projects: BTreeMap<String, Vec<String>>,
+    /// Aliases that dial a loopback port with their own scheme, Host and TLS
+    /// name (`porch alias NAME PORT --upstream ...`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub upstreams: BTreeMap<String, Upstream>,
+    /// Routes never offered to paired machines (`--private`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub private: std::collections::BTreeSet<String>,
     /// Unix seconds when a route's processes were first seen job-control stopped.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub stopped_since: BTreeMap<String, u64>,
+}
+/// How the proxy talks to an alias's loopback port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Upstream {
+    /// Speak TLS to the backend.
+    pub tls: bool,
+    /// `host[:port]` sent as Host (and, for TLS, the server name checked);
+    /// `None` keeps the browser's Host.
+    pub authority: Option<String>,
+    /// Skip backend certificate verification (explicit `--insecure` only).
+    #[serde(default)]
+    pub insecure: bool,
+}
+impl Upstream {
+    /// Parse `https`, `https://host[:port]` or `http://host[:port]`.
+    pub fn parse(spec: &str, insecure: bool) -> Result<Upstream> {
+        if spec == "https" {
+            return Ok(Upstream {
+                tls: true,
+                authority: None,
+                insecure,
+            });
+        }
+        let u = url::Url::parse(spec).with_context(|| {
+            format!(
+                "--upstream must be https, https://HOST[:PORT] or http://HOST[:PORT], not {spec:?}"
+            )
+        })?;
+        let tls = match u.scheme() {
+            "https" => true,
+            "http" => false,
+            _ => bail!("--upstream must use http or https"),
+        };
+        if u.host_str().is_none()
+            || !u.username().is_empty()
+            || u.password().is_some()
+            || !matches!(u.path(), "" | "/")
+            || u.query().is_some()
+            || u.fragment().is_some()
+            || spec.chars().any(char::is_whitespace)
+        {
+            bail!("--upstream takes only a scheme, host and optional port, like https://api.internal:8443");
+        }
+        if insecure && !tls {
+            bail!("--insecure only applies to an https upstream");
+        }
+        Ok(Upstream {
+            tls,
+            authority: Some(u[url::Position::BeforeHost..url::Position::AfterPort].to_owned()),
+            insecure,
+        })
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
@@ -49,6 +108,10 @@ pub struct ProxySettings {
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
     pub redirect_port: Option<u16>,
+    /// The no-sudo standard port (80/443) to return to when it frees up,
+    /// after a busy moment made this run fall back to a high port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_port: Option<u16>,
 }
 impl Default for ProxySettings {
     fn default() -> Self {
@@ -64,6 +127,7 @@ impl Default for ProxySettings {
             cert: None,
             key: None,
             redirect_port: None,
+            preferred_port: None,
         }
     }
 }
@@ -319,6 +383,8 @@ pub fn remove_route(s: &mut State, name: &str) {
     s.owners.remove(name);
     s.shares.remove(name);
     s.stopped_since.remove(name);
+    s.private.remove(name);
+    s.upstreams.remove(name);
     for names in s.compose_projects.values_mut() {
         names.retain(|n| n != name);
     }
@@ -443,5 +509,114 @@ pub fn group_matches(group: u32, started: Option<&str>) -> bool {
     #[cfg(windows)]
     {
         identity(group).is_some_and(|i| Some(i.started.as_str()) == started)
+    }
+}
+
+/// Routes the proxy can serve, cached between requests.
+///
+/// The proxy used to re-read `state.json` and re-check every route's process on
+/// each request. This keeps the parsed state until the file changes and keeps
+/// the liveness answers for a short window, so a request costs one `stat`.
+pub fn live_routes() -> Result<std::sync::Arc<State>> {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant, SystemTime};
+    #[derive(PartialEq, Clone)]
+    struct Stamp {
+        path: PathBuf,
+        modified: Option<SystemTime>,
+        len: u64,
+        #[cfg(unix)]
+        ino: u64,
+    }
+    struct Cached {
+        stamp: Option<Stamp>,
+        at: Instant,
+        state: Arc<State>,
+    }
+    static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
+    const LIVENESS_TTL: Duration = Duration::from_millis(750);
+    let path = dir().join("state.json");
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let stamp = match fs::metadata(&path) {
+        Ok(m) => Some(Stamp {
+            path: path.clone(),
+            modified: m.modified().ok(),
+            len: m.len(),
+            #[cfg(unix)]
+            ino: std::os::unix::fs::MetadataExt::ino(&m),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(c) = cache.as_ref() {
+        let same_file = match (&c.stamp, &stamp) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => c.state.routes.is_empty(),
+            _ => false,
+        };
+        if same_file && c.at.elapsed() < LIVENESS_TTL {
+            return Ok(c.state.clone());
+        }
+    }
+    let mut state = load()?;
+    let alive: Vec<Route> = state
+        .routes
+        .iter()
+        .filter(|r| route_alive(&state, r))
+        .cloned()
+        .collect();
+    state.routes = alive;
+    let state = Arc::new(state);
+    *cache = Some(Cached {
+        stamp,
+        at: Instant::now(),
+        state: state.clone(),
+    });
+    Ok(state)
+}
+
+#[cfg(test)]
+mod upstream_tests {
+    use super::Upstream;
+    #[test]
+    fn upstream_specs() {
+        assert_eq!(
+            Upstream::parse("https", false).unwrap(),
+            Upstream {
+                tls: true,
+                authority: None,
+                insecure: false
+            }
+        );
+        assert_eq!(
+            Upstream::parse("https://api.internal:8443", true).unwrap(),
+            Upstream {
+                tls: true,
+                authority: Some("api.internal:8443".into()),
+                insecure: true
+            }
+        );
+        assert_eq!(
+            Upstream::parse("http://api.internal", false).unwrap(),
+            Upstream {
+                tls: false,
+                authority: Some("api.internal".into()),
+                insecure: false
+            }
+        );
+        for bad in [
+            "ftp://x",
+            "https://u:p@x",
+            "https://x/path",
+            "https://x?q=1",
+            "https://x#f",
+            "tls",
+        ] {
+            assert!(Upstream::parse(bad, false).is_err(), "{bad}");
+        }
+        assert!(
+            Upstream::parse("http://x", true).is_err(),
+            "--insecure needs https"
+        );
     }
 }

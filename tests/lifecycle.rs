@@ -47,6 +47,7 @@ impl Sandbox {
             .args(args)
             .current_dir(&self.root)
             .env("PORCH_STATE_DIR", self.root.join("state"))
+            .env("PORCH_CLEAN_URLS", "0")
             .env("PORCH_PORT", self.port.to_string())
             .env("PORCH_APP_PORTS", common::app_ports(self.port))
             .env("PORCH_HTTPS", "0")

@@ -1097,6 +1097,12 @@ pub(super) async fn relay_request(
     let browser_auth = req.headers_mut().remove(header::AUTHORIZATION);
     let browser_origin = req.headers_mut().remove(header::ORIGIN);
     let browser_host = req.headers_mut().remove(header::HOST);
+    // Set by the local proxy (this relay only listens on loopback).
+    let browser_proto = req
+        .headers()
+        .get("x-forwarded-proto")
+        .filter(|v| *v == "https" || *v == "http")
+        .cloned();
     strip_hop_headers(req.headers_mut());
     if let Some(v) = browser_auth {
         req.headers_mut().insert("x-porch-app-authorization", v);
@@ -1108,6 +1114,9 @@ pub(super) async fn relay_request(
     }
     if let Some(v) = browser_host {
         req.headers_mut().insert("x-porch-app-host", v);
+    }
+    if let Some(v) = browser_proto {
+        req.headers_mut().insert("x-porch-app-proto", v);
     }
     req.headers_mut().insert(
         header::AUTHORIZATION,

@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/akshitkrnagpal/porch/main/schema/porch.schema.json",
+  "title": "Porch configuration",
+  "description": "porch.json, or the object form of the \"porch\" key in package.json. Porch reads one source per directory: porch.json, then package.json#porch, then portless.json, then package.json#portless. Sources are not merged. Unknown keys are ignored.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Editor hint. Porch ignores it."
+    },
+    "name": {
+      "$ref": "#/$defs/name"
+    },
+    "script": {
+      "$ref": "#/$defs/script"
+    },
+    "appPort": {
+      "$ref": "#/$defs/appPort"
+    },
+    "proxy": {
+      "$ref": "#/$defs/proxy"
+    },
+    "turbo": {
+      "type": "boolean",
+      "default": true,
+      "description": "At a workspace root with turbo.json or turbo.jsonc, run the root Turbo task once and give each package its own PORT and URL. Set to false to start packages directly and concurrently instead. Only read from the workspace root's own configuration."
+    },
+    "worktree": {
+      "$ref": "#/$defs/worktree"
+    },
+    "apps": {
+      "type": "object",
+      "description": "Per-package overrides at a workspace root, keyed by the package's path relative to the root, such as \"apps/web\". A package's own configuration and CLI options take precedence over its entry here.",
+      "propertyNames": {
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/app"
+      },
+      "examples": [
+        {
+          "apps/web": { "name": "shop" },
+          "apps/api": { "name": "api.shop", "appPort": 4500 },
+          "packages/ui": { "proxy": false }
+        }
+      ]
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "Base hostname. \"web\" serves at http://web.localhost:7462; dotted names such as \"api.shop\" are allowed. Inferred from package.json, the Git root or the directory when absent. In a linked Git worktree, a branch prefix is added unless --prefix '' or PORCH_PREFIX= is set.",
+      "examples": ["web", "api.shop"]
+    },
+    "script": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "default": "dev",
+      "description": "package.json script that bare `porch` runs.",
+      "examples": ["dev", "start", "dev:app"]
+    },
+    "appPort": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "description": "Fixed app port instead of a free one from 4000-4999. Must be free and not reserved by another route. --app-port and PORCH_APP_PORT override it."
+    },
+    "proxy": {
+      "type": "boolean",
+      "description": "Whether this app gets a route and an assigned PORT. Defaults to true for a single app; in a workspace, build-only scripts such as tsc or tsup default to false."
+    },
+    "worktree": {
+      "type": "object",
+      "description": "Naming in linked Git worktrees. Merged from the workspace root down to the package.",
+      "properties": {
+        "prefix": {
+          "enum": ["last-segment", "branch"],
+          "default": "last-segment",
+          "description": "Which part of the branch becomes the prefix. Branch fix/login gives \"login\" with last-segment and \"fix-login\" with branch. main, master and detached HEAD get no prefix."
+        },
+        "hostnameTemplate": {
+          "type": "string",
+          "description": "Replaces the default \"{worktree}.{name}\" layout. Must contain {worktree}; {name} is optional. Every dot-separated label must be letters, digits and interior hyphens once placeholders are filled in.",
+          "allOf": [
+            { "pattern": "\\{worktree\\}" },
+            {
+              "pattern": "^(?:[A-Za-z0-9]|\\{worktree\\}|\\{name\\})(?:(?:[A-Za-z0-9-]|\\{worktree\\}|\\{name\\})*(?:[A-Za-z0-9]|\\{worktree\\}|\\{name\\}))?(?:\\.(?:[A-Za-z0-9]|\\{worktree\\}|\\{name\\})(?:(?:[A-Za-z0-9-]|\\{worktree\\}|\\{name\\})*(?:[A-Za-z0-9]|\\{worktree\\}|\\{name\\}))?)*$"
+            }
+          ],
+          "examples": ["{worktree}-{name}", "{worktree}.{name}", "tenant.{worktree}-{name}"]
+        }
+      },
+      "additionalProperties": true
+    },
+    "app": {
+      "type": "object",
+      "description": "Settings for one workspace package.",
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "script": { "$ref": "#/$defs/script" },
+        "appPort": { "$ref": "#/$defs/appPort" },
+        "proxy": { "$ref": "#/$defs/proxy" },
+        "worktree": { "$ref": "#/$defs/worktree" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

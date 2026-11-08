@@ -1,0 +1,7 @@
+{
+  "name": "@shop/web",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js"
+  }
+}

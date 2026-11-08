@@ -1,0 +1,38 @@
+# cargo-deny: known vulnerabilities, unmaintained crates, licenses and sources.
+# CI runs `cargo deny check` on every push.
+[graph]
+all-features = true
+
+[advisories]
+# Fail on vulnerabilities and on crates marked unmaintained or yanked.
+yanked = "deny"
+unmaintained = "all"
+ignore = [
+  # Compile-time only, via gtk-rs 0.18 (glib-macros) in the optional tray
+  # build; never in the porch CLI. Goes away when tray-icon moves off gtk 0.18.
+  { id = "RUSTSEC-2024-0370", reason = "build-time proc macro of the optional GTK tray only" },
+]
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+  "MPL-2.0",
+]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

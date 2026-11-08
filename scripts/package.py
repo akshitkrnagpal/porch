@@ -58,11 +58,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binaries', type=Path, default=ROOT / 'target/release')
     parser.add_argument('--output', type=Path, default=ROOT / 'dist')
-    parser.add_argument('--target', required=True, choices=['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc'])
+    parser.add_argument('--target', required=True, choices=['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl', 'x86_64-pc-windows-msvc'])
     args = parser.parse_args()
     version = next(line.split('"')[1] for line in (ROOT / 'Cargo.toml').read_text().splitlines() if line.startswith('version ='))
     windows = 'windows' in args.target
-    executables = [name + ('.exe' if windows else '') for name in ['porch', 'porch-tray']]
+    # The static musl builds are CLI-only: the tray needs the system GTK.
+    cli_only = 'musl' in args.target
+    executables = [name + ('.exe' if windows else '') for name in ['porch'] + ([] if cli_only else ['porch-tray'])]
     for name in executables:
         if not (args.binaries / name).is_file():
             parser.error(f'missing {args.binaries / name}; build both binaries with --features tray')
@@ -74,13 +76,13 @@ def main():
         for executable in executables:
             shutil.copy2(args.binaries / executable, package / executable)
         # porch-login drives launchd/systemd; Windows has no equivalent yet.
-        for script in ['install.py'] + ([] if windows else ['porch-login']):
+        for script in ['install.py'] + ([] if windows or cli_only else ['porch-login']):
             shutil.copy2(ROOT / 'scripts' / script, package / script)
         shutil.copy2(ROOT / 'packaging/README.md', package / 'README.md')
         shutil.copy2(ROOT / 'LICENSE', package / 'LICENSE')
         shutil.copytree(ROOT / 'packaging', package / 'packaging')
         (package / 'docs').mkdir()
-        for document in ['discovery.md', 'reference.md']:
+        for document in ['discovery.md', 'reference.md', 'troubleshooting.md']:
             source = ROOT / 'docs' / document
             if source.exists():
                 shutil.copy2(source, package / 'docs' / document)

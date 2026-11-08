@@ -167,6 +167,159 @@ fn all_supported_frameworks_receive_only_server_flags() {
     }
 }
 #[test]
+fn non_javascript_dev_servers_get_port_and_host() {
+    for (a, want) in [
+        (
+            vec!["python3", "-m", "http.server"],
+            vec![
+                "python3",
+                "-m",
+                "http.server",
+                "--bind",
+                "127.0.0.1",
+                "4567",
+            ],
+        ),
+        (
+            vec!["python", "manage.py", "runserver"],
+            vec!["python", "manage.py", "runserver", "127.0.0.1:4567"],
+        ),
+        (
+            vec!["uv", "run", "flask", "run"],
+            vec![
+                "uv",
+                "run",
+                "flask",
+                "run",
+                "--port",
+                "4567",
+                "--host",
+                "127.0.0.1",
+            ],
+        ),
+        (
+            vec!["uvicorn", "main:app", "--reload"],
+            vec![
+                "uvicorn",
+                "main:app",
+                "--reload",
+                "--port",
+                "4567",
+                "--host",
+                "127.0.0.1",
+            ],
+        ),
+        (
+            vec!["fastapi", "dev", "main.py"],
+            vec![
+                "fastapi",
+                "dev",
+                "main.py",
+                "--port",
+                "4567",
+                "--host",
+                "127.0.0.1",
+            ],
+        ),
+        (
+            vec!["gunicorn", "app:app"],
+            vec!["gunicorn", "app:app", "--bind", "127.0.0.1:4567"],
+        ),
+        (
+            vec!["poetry", "run", "mkdocs", "serve"],
+            vec![
+                "poetry",
+                "run",
+                "mkdocs",
+                "serve",
+                "--dev-addr",
+                "127.0.0.1:4567",
+            ],
+        ),
+        (
+            vec!["streamlit", "run", "app.py"],
+            vec![
+                "streamlit",
+                "run",
+                "app.py",
+                "--server.port",
+                "4567",
+                "--server.address",
+                "127.0.0.1",
+                "--server.headless",
+                "true",
+            ],
+        ),
+        (
+            vec!["hugo", "server", "-D"],
+            vec![
+                "hugo",
+                "server",
+                "-D",
+                "--port",
+                "4567",
+                "--bind",
+                "127.0.0.1",
+            ],
+        ),
+        (
+            vec!["bundle", "exec", "jekyll", "serve"],
+            vec![
+                "bundle",
+                "exec",
+                "jekyll",
+                "serve",
+                "--port",
+                "4567",
+                "--host",
+                "127.0.0.1",
+            ],
+        ),
+        (
+            vec!["jupyter", "lab"],
+            vec![
+                "jupyter",
+                "lab",
+                "--port=4567",
+                "--ServerApp.port_retries=0",
+                "--no-browser",
+            ],
+        ),
+    ] {
+        let (out, _) = adapt_command(&args(&a), Path::new("/tmp"), 4567, false).unwrap();
+        assert_eq!(out, args(&want), "{a:?}");
+    }
+    // The user's own port, address and subcommands are left alone.
+    for a in [
+        vec!["python3", "-m", "http.server", "8000"],
+        vec!["python", "manage.py", "runserver", "0.0.0.0:8000"],
+        vec!["python", "manage.py", "migrate"],
+        vec!["flask", "routes"],
+        vec!["gunicorn", "-b", "0.0.0.0:9000", "app:app"],
+        vec!["mkdocs", "build"],
+        vec!["hugo"],
+        vec!["python3", "script.py"],
+        vec!["rails", "server"],
+    ] {
+        let a = args(&a);
+        assert_eq!(
+            adapt_command(&a, Path::new("/tmp"), 4567, false).unwrap().0,
+            a
+        );
+    }
+    let (out, _) = adapt_command(
+        &args(&["flask", "run", "--port=5001"]),
+        Path::new("/tmp"),
+        4567,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        args(&["flask", "run", "--port=5001", "--host", "127.0.0.1"])
+    );
+}
+#[test]
 fn package_runner_flags_and_child_separator_are_preserved() {
     for a in [
         vec!["npx", "-y", "vite", "dev"],
@@ -411,6 +564,7 @@ fn turbo_workspace_flow(wrapper: bool) {
             let _ = std::process::Command::new(&self.binary)
                 .args(["proxy", "stop"])
                 .env("PORCH_STATE_DIR", &self.state)
+                .env("PORCH_CLEAN_URLS", "0")
                 .env("PORCH_SYNC_HOSTS", "0")
                 .output();
         }
@@ -455,6 +609,7 @@ fn turbo_workspace_flow(wrapper: bool) {
         .args(["--", "--filter=@org/web"])
         .current_dir(&f.0)
         .env("PORCH_STATE_DIR", &state)
+        .env("PORCH_CLEAN_URLS", "0")
         .env("PORCH_PORT", port.to_string())
         .env("PORCH_APP_PORTS", common::app_ports(port))
         .env("PORCH_HTTPS", "0")
@@ -711,6 +866,7 @@ fn simultaneous_leaf_launches_keep_distinct_workspace_routes_and_ports() {
             let _ = Command::new(env!("CARGO_BIN_EXE_porch"))
                 .args(["proxy", "stop"])
                 .env("PORCH_STATE_DIR", &self.state)
+                .env("PORCH_CLEAN_URLS", "0")
                 .env("PORCH_SYNC_HOSTS", "0")
                 .output();
         }
@@ -733,6 +889,7 @@ fn simultaneous_leaf_launches_keep_distinct_workspace_routes_and_ports() {
             Command::new(env!("CARGO_BIN_EXE_porch"))
                 .current_dir(f.0.join(format!("apps/{app}")))
                 .env("PORCH_STATE_DIR", &running.state)
+                .env("PORCH_CLEAN_URLS", "0")
                 .env("PORCH_PORT", proxy_port.to_string())
                 .env("PORCH_APP_PORTS", common::app_ports(proxy_port))
                 .env("PORCH_HTTPS", "0")

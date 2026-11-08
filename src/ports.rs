@@ -19,6 +19,31 @@ pub const DISCOVERY_PORT: u16 = 7463;
 /// Ports below this need elevation on most systems.
 pub const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
 
+/// Can this user serve `port` (80 or 443) without sudo right now?
+///
+/// macOS (10.14+) and Windows let any user bind low ports on the wildcard
+/// address, and Linux does when `net.ipv4.ip_unprivileged_port_start` is low
+/// enough or the binary has `cap_net_bind_service`. When this holds, Porch
+/// can serve URLs with no port in them (`http://web.localhost`) without
+/// elevation. Root never counts: its proxy would be owned by root.
+pub fn clean_port_bindable(port: u16) -> bool {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        return false;
+    }
+    crate::sockets::reserve(port).is_ok()
+}
+
+/// Port-free URLs are on unless `PORCH_CLEAN_URLS=0` (or `false`, `off`).
+pub fn clean_urls_enabled() -> bool {
+    !crate::state::env("CLEAN_URLS").is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
 /// A process listening on a TCP port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listener {

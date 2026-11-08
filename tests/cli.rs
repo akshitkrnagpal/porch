@@ -34,6 +34,7 @@ impl Sandbox {
         c.args(args)
             .current_dir(&self.root)
             .env("PORCH_STATE_DIR", self.root.join("state"))
+            .env("PORCH_CLEAN_URLS", "0")
             .env("PORCH_PORT", self.port.to_string())
             .env("PORCH_APP_PORTS", common::app_ports(self.port))
             .env("PORCH_HTTPS", "0")
@@ -121,7 +122,7 @@ fn aliases_public_urls_scoping_force_and_json() {
     assert!(!s.run(&["alias", "api.demo", "43122"]).status.success());
     s.ok(&["alias", "api.demo", "43122", "--force"]);
     let v: serde_json::Value = serde_json::from_str(&s.ok(&["list", "--json"])).unwrap();
-    assert_eq!(v["routes"][0]["target"], "http://127.0.0.1:43122");
+    assert_eq!(v["routes"][0]["target"], "http://localhost:43122");
     assert!(s.ok(&["list"]).contains("api.demo.localhost"));
     s.ok(&["alias", "--remove", "api.demo"]);
     assert_eq!(s.state()["routes"].as_array().unwrap().len(), 0);
@@ -587,7 +588,7 @@ fn proxy_recovers_after_accept_fd_exhaustion() {
 import os,resource,socket,subprocess,sys,tempfile,time
 with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
  port=int(sys.argv[2])
- env=os.environ.copy();env.update(PORCH_STATE_DIR=root,PORCH_SYNC_HOSTS='0',PORCH_SKIP_TRUST='1')
+ env=os.environ.copy();env.update(PORCH_STATE_DIR=root,PORCH_SYNC_HOSTS='0',PORCH_SKIP_TRUST='1',PORCH_CLEAN_URLS='0')
  def limit():resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
  with open(root+'/log','w+') as log:
   child=subprocess.Popen([sys.argv[1],'proxy','start','--foreground','--no-tls','--bind','127.0.0.1','--port',str(port)],env=env,stdout=log,stderr=log,preexec_fn=limit)
@@ -699,4 +700,257 @@ fn saved_proxy_ports_survive_the_https_default_change() {
         url(r#"{"port":8080,"tls":false,"tlds":["localhost"]}"#, "1"),
         "https://web.localhost:8080"
     );
+}
+
+#[test]
+fn bare_domain_serves_a_dashboard_and_app_list() {
+    let s = Sandbox::new();
+    let up = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let up_port = up.local_addr().unwrap().port();
+    s.ok(&["alias", "web", &up_port.to_string()]);
+    s.ok(&["alias", "--private", "secret", "1"]);
+    s.ok(&["proxy", "start"]);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let get = |path: &str, accept: &str| {
+            client
+                .get(format!("http://127.0.0.1:{}{path}", s.port))
+                .header("host", "localhost")
+                .header("accept", accept.to_owned())
+                .send()
+        };
+        let page = get("/", "text/html").await.unwrap();
+        assert_eq!(page.status(), 200);
+        let html = page.text().await.unwrap();
+        assert!(
+            html.contains("Your apps") && html.contains("web.localhost"),
+            "{html}"
+        );
+        let json: serde_json::Value = get("/_porch/apps.json", "*/*")
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let apps = json["apps"].as_array().unwrap();
+        let web = apps.iter().find(|a| a["name"] == "web").unwrap();
+        assert_eq!(web["health"], "ok");
+        let secret = apps.iter().find(|a| a["name"] == "secret").unwrap();
+        assert_eq!(secret["private"], true);
+        assert_eq!(secret["health"], "not listening");
+        // An unknown name is still a 404, not the dashboard.
+        let missing = client
+            .get(format!("http://127.0.0.1:{}/", s.port))
+            .header("host", "nope.localhost")
+            .header("accept", "text/html")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
+    });
+    drop(up);
+}
+
+#[test]
+fn private_survives_partial_alias_edits_and_urls_are_stored_canonically() {
+    let s = Sandbox::new();
+    std::fs::create_dir_all(s.root.join("state")).unwrap();
+    std::fs::write(
+        s.root.join("state/proxy.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "port": s.port, "tls": false, "tlds": ["localhost", "test"], "unprivileged": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    s.ok(&["alias", "hidden", "3000", "--private"]);
+    s.ok(&["remove", "hidden", "--tld", "test"]);
+    let state = s.state();
+    let private: Vec<_> = state["private"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    let routes: Vec<_> = state["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(routes, ["hidden.localhost"]);
+    assert_eq!(private, ["hidden.localhost"]);
+    // Scoped replacement keeps the untouched domain private too.
+    s.ok(&["alias", "both", "3001", "--private"]);
+    s.ok(&["alias", "both", "3002", "--tld", "test", "--force"]);
+    let state = s.state();
+    let private = state["private"].to_string();
+    assert!(private.contains("both.localhost"), "{state}");
+    // URLs are stored percent-encoded, credentials refused.
+    s.ok(&["alias", "spaced", "http://127.0.0.1:3003/hello world"]);
+    assert!(s
+        .state()
+        .to_string()
+        .contains("http://127.0.0.1:3003/hello%20world"));
+    assert!(!s
+        .run(&["alias", "creds", "http://u:p@127.0.0.1:3004"])
+        .status
+        .success());
+}
+
+#[test]
+fn upstream_alias_dials_loopback_with_its_own_host_and_verifies_tls() {
+    let s = Sandbox::new();
+    let dir = s.root.join("backend");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "k.pem",
+            "-out",
+            "c.pem",
+            "-subj",
+            "/CN=api.internal",
+            "-addext",
+            "subjectAltName=DNS:api.internal",
+            "-days",
+            "1",
+        ])
+        .current_dir(&dir)
+        .output();
+    if !cert.is_ok_and(|o| o.status.success()) {
+        eprintln!("skipping: openssl unavailable");
+        return;
+    }
+    let tls_port = common::free_port();
+    let plain_port = common::free_port();
+    let script = "import http.server,ssl,sys\nclass H(http.server.BaseHTTPRequestHandler):\n def do_GET(self):\n  b=('host='+str(self.headers.get('Host'))).encode();self.send_response(200);self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)\n def log_message(self,*a):pass\ns=http.server.HTTPServer(('127.0.0.1',int(sys.argv[1])),H)\nif sys.argv[2]=='tls':\n c=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);c.load_cert_chain('c.pem','k.pem');s.socket=c.wrap_socket(s.socket,server_side=True)\nprint('ready',flush=True)\ns.serve_forever()\n";
+    struct Servers(Vec<std::process::Child>);
+    impl Drop for Servers {
+        fn drop(&mut self) {
+            for server in &mut self.0 {
+                let _ = server.kill();
+                let _ = server.wait();
+            }
+        }
+    }
+    let mut servers: Vec<_> = [(tls_port, "tls"), (plain_port, "plain")]
+        .into_iter()
+        .map(|(port, mode)| {
+            Command::new("python3")
+                .args(["-c", script, &port.to_string(), mode])
+                .current_dir(&dir)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for server in &mut servers {
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(server.stdout.as_mut().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+    }
+    let servers = Servers(servers);
+    s.ok(&[
+        "alias",
+        "verified",
+        &tls_port.to_string(),
+        "--upstream",
+        "https://api.internal",
+    ]);
+    s.ok(&[
+        "alias",
+        "insecure",
+        &tls_port.to_string(),
+        "--upstream",
+        "https://api.internal",
+        "--insecure",
+    ]);
+    s.ok(&[
+        "alias",
+        "plain",
+        &plain_port.to_string(),
+        "--upstream",
+        "http://api.internal:8080",
+    ]);
+    s.ok(&["proxy", "start"]);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let get = |name: &str| {
+            client
+                .get(format!("http://127.0.0.1:{}/", s.port))
+                .header("host", format!("{name}.localhost"))
+                .send()
+        };
+        // A self-signed backend is refused unless the alias opted out.
+        let verified = get("verified").await.unwrap();
+        assert_eq!(verified.status(), 502);
+        assert!(verified
+            .text()
+            .await
+            .unwrap()
+            .contains("upstream_certificate"));
+        assert_eq!(
+            get("insecure").await.unwrap().text().await.unwrap(),
+            "host=api.internal"
+        );
+        assert_eq!(
+            get("plain").await.unwrap().text().await.unwrap(),
+            "host=api.internal:8080"
+        );
+    });
+    drop(servers);
+}
+
+#[test]
+fn detached_runs_answer_log_and_stop() {
+    let s = Sandbox::new();
+    let o = s.run(&[
+        "run", "--detach", "--name", "bg", "python3", "-c",
+        "import os,socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',int(os.environ['PORT'])))\ns.listen()\nprint('hello from bg',flush=True)\nwhile True: time.sleep(1)",
+    ]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        o.status.success(),
+        "{out}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(out.trim(), format!("http://bg.localhost:{}", s.port));
+    // Ready means answering: the route is healthy as soon as run returns.
+    let list: serde_json::Value = serde_json::from_str(&s.ok(&["list", "--json"])).unwrap();
+    assert_eq!(list["routes"][0]["health"], "ok", "{list}");
+    let logs = s.ok(&["logs", "bg"]);
+    assert!(logs.contains("hello from bg"), "{logs}");
+    // A second copy is refused without touching the running one or its log.
+    let again = s.run(&["run", "--detach", "--name", "bg", "python3", "-c", "pass"]);
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already running"));
+    assert!(s.ok(&["logs", "bg"]).contains("hello from bg"));
+    assert!(s.ok(&["stop", "bg"]).contains("Stopped"));
+    let list: serde_json::Value = serde_json::from_str(&s.ok(&["list", "--json"])).unwrap();
+    assert!(list["routes"].as_array().unwrap().is_empty(), "{list}");
+    assert!(!s.run(&["stop", "bg"]).status.success());
+    // A command that dies before answering reports it instead of hanging.
+    let o = s.run(&[
+        "run",
+        "--detach",
+        "--name",
+        "dies",
+        "python3",
+        "-c",
+        "raise SystemExit(3)",
+    ]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("exited"));
 }

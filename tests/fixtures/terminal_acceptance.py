@@ -69,7 +69,7 @@ class Fixture:
                         PORCH_PORT=str(slot), PORCH_HTTPS='0',
                         PORCH_APP_PORTS=f'{slot + APP_OFFSET}-{slot + SLOT_SIZE - 1}',
                         PORCH_SYNC_HOSTS='0', PORCH_SKIP_TRUST='1',
-                        PORCH_PREFIX='', TERM='xterm-256color')
+                        PORCH_PREFIX='', PORCH_CLEAN_URLS='0', TERM='xterm-256color')
         self.pid = None
         self.fd = None
         self.status = None
