@@ -2,7 +2,7 @@
 
 All notable changes to Porch. Versions follow [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.5.0 (2026-11-08)
 
 ### Security
 - Requests from other devices (LAN mode) can no longer set `X-Forwarded-*` headers, so they can't change the scheme or host your app sees.
