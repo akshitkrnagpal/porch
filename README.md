@@ -138,7 +138,7 @@ To keep sharing on after a reboot, run `porch discovery autostart enable` on the
 ## Menu bar and tray app
 
 <p align="center">
-  <img src="assets/screenshots/menu-bar.png" alt="The Porch menu bar app listing this machine's running apps (docs, api, web) and a paired Mac mini" width="430">
+  <img src="assets/screenshots/menu-bar.png" alt="The Porch menu bar app showing three local apps and two apps on a paired Mac mini" width="430">
 </p>
 
 On macOS, open `Porch.app`. On Linux, run `porch tray` (needs GTK 3 and an AppIndicator host). On Windows, run `porch tray` or `porch-tray.exe` to add Porch to the notification area.
