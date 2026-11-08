@@ -29,23 +29,19 @@
 
 Porch runs your dev command on a free port and gives it a name that stays the same across restarts. Pair another machine and open its apps from your terminal or the menu bar.
 
-Your app receives its port as `PORT`. The image uses demo apps; the commands below are ready to copy.
+Your app receives its port as `PORT`. The image uses demo apps.
 
 ## Install
+
+**macOS and Linux:**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.sh | sh
 ```
 
-Installing on macOS and Linux needs no sudo or Python. The installer verifies the checksum and, if the GitHub CLI is installed, the signed build attestation.
+Installing needs no sudo or Python. The installer verifies the checksum and, if the GitHub CLI is installed, the signed build attestation. If `porch` is not found, run `export PATH="$HOME/.local/bin:$PATH"` and add that line to your shell profile.
 
-**Windows (PowerShell):**
-
-```powershell
-irm https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.ps1 | iex
-```
-
-On macOS, the script also installs `Porch.app`. Open the menu with `open ~/Applications/Porch.app`. If `porch` is not found, run `export PATH="$HOME/.local/bin:$PATH"` and add that line to your shell profile.
+On macOS, the script also installs `Porch.app`. Open the menu with `open ~/Applications/Porch.app`.
 
 On Linux, the default install is CLI only. For the tray on x86_64 Linux (glibc 2.39+, GTK 3 and an AppIndicator host):
 
@@ -53,9 +49,15 @@ On Linux, the default install is CLI only. For the tray on x86_64 Linux (glibc 2
 curl -fsSL https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.sh | PORCH_TRAY=1 sh
 ```
 
-There is no prebuilt tray for ARM64 Linux. On Windows, open a new terminal after installing to pick up the updated `PATH`; run `porch-tray.exe` for the tray.
+There is no prebuilt tray for ARM64 Linux.
 
-Run `porch setup` for a guided first run, or continue with [Quick start](#quick-start).
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.ps1 | iex
+```
+
+Open a new terminal after installing to pick up the updated `PATH`; run `porch-tray.exe` for the tray.
 
 **Homebrew** (macOS and Linux, CLI only): `brew install akshitkrnagpal/tap/porch`.
 
@@ -64,7 +66,7 @@ Update with `porch self-update`. Running apps and the proxy keep running while y
 <details>
 <summary>Release archives, platform requirements and building from source</summary>
 
-**Release archive** (CLI plus the menu bar or tray app). Download `porch-<version>-<target>.tar.gz` from the [latest release](https://github.com/akshitkrnagpal/porch/releases/latest). Every archive has a signed build-provenance attestation, so you can check that this repository's release workflow built it: `gh attestation verify porch-*.tar.gz --repo akshitkrnagpal/porch`. Then, on macOS or Linux:
+**Release archive** (CLI plus the menu bar or tray app). Download `porch-<version>-<target>.tar.gz` from the [latest release](https://github.com/akshitkrnagpal/porch/releases/latest). Every archive has a signed build-provenance attestation, so you can check that this repository's release workflow built it: `gh attestation verify porch-*.tar.gz --repo akshitkrnagpal/porch`. For example, on an Apple Silicon Mac:
 
 ```sh
 tar -xzf porch-*-aarch64-apple-darwin.tar.gz
@@ -90,8 +92,8 @@ cargo install --git https://github.com/akshitkrnagpal/porch porch
 ## Quick start
 
 ```sh
-cd my-app
-porch                      # runs the package's "dev" script at http://my-app.localhost
+cd web                    # a package named web
+porch                      # runs the package's "dev" script at http://web.localhost
 porch run pnpm dev         # any command; the name comes from package.json or the folder
 porch api node server.js   # choose the name: http://api.localhost
 porch alias storybook 6006 # name an existing HTTP server (not a database or other TCP service)

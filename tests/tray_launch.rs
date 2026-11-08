@@ -1,4 +1,5 @@
 //! Exercise the installed CLI layout without opening a real desktop tray.
+//! Keep this file to one test: its copied binary also runs as the tray stub.
 use std::{
     fs,
     process::Command,
@@ -36,6 +37,7 @@ fn tray_launches_sibling_and_preserves_cli_and_state_paths() {
     let tray = temp.join(format!("porch-tray{suffix}"));
     let state = temp.join("state");
     let record = temp.join("launched.json");
+    fs::create_dir(&state).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_porch"), &cli).unwrap();
     // The child test binary acts as the tray and records the launch environment.
     fs::copy(current, tray).unwrap();
@@ -60,8 +62,15 @@ fn tray_launches_sibling_and_preserves_cli_and_state_paths() {
         assert!(Instant::now() < deadline, "tray did not record its launch");
         thread::sleep(Duration::from_millis(25));
     };
-    assert_eq!(launched["cli"], cli.to_string_lossy().as_ref());
-    assert_eq!(launched["state"], state.to_string_lossy().as_ref());
+    // Windows may expand a short TEMP path or add an extended-path prefix.
+    assert_eq!(
+        fs::canonicalize(launched["cli"].as_str().unwrap()).unwrap(),
+        fs::canonicalize(&cli).unwrap()
+    );
+    assert_eq!(
+        fs::canonicalize(launched["state"].as_str().unwrap()).unwrap(),
+        fs::canonicalize(&state).unwrap()
+    );
     // The detached child may still be exiting on Windows; cleanup is best effort.
     let _ = fs::remove_dir_all(temp);
 }
