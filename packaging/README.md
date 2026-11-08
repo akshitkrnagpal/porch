@@ -33,7 +33,8 @@ Installing doesn't touch running apps, the proxy, sharing, trust stores, the hos
 
 ```sh
 open ~/Applications/Porch.app    # macOS
-porch tray                       # macOS, Linux or Windows; same as running porch-tray directly
+porch tray                       # macOS or Linux, with the tray installed
+porch-tray.exe                   # Windows (including the 0.5.0 release)
 ```
 
 The roof icon opens a menu that lists each app's URL, this machine's first and then each paired machine's, split by separators. Click a URL to open it; on macOS hold Option to copy it instead (Linux and Windows show **Open in browser** and **Copy URL** in a small submenu). The menu also has **Refresh apps**, **Reconnect discovery** and a switch to start or stop the proxy. **Quit Porch menu** closes only the menu: apps, the proxy and the discovery agent keep running. If a CLI action fails, the error appears in the menu. Actions that need sudo have to be run in a terminal.
@@ -56,7 +57,7 @@ At runtime, Ubuntu 24.04 needs `libgtk-3-0t64` and `libayatana-appindicator3-1` 
 
 ## Start the menu at login
 
-Nothing starts at login unless you ask. On macOS and Linux:
+Nothing starts at login unless you ask. The `porch-login` helper needs Python 3 and an installed tray. On macOS and Linux:
 
 ```sh
 porch-login enable

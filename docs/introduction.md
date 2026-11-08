@@ -7,7 +7,7 @@ $ porch run pnpm dev
 http://web.localhost -> 4480
 ```
 
-Your app gets the port as `PORT`, and `web.localhost` keeps pointing at it however many times you restart. Pair two machines and each can open the other's apps the same way, at `http://web.mac-mini.localhost`.
+Your app gets the port as `PORT`, and `web.localhost` keeps pointing at it however many times you restart. Pair two machines and each can open the other's apps the same way, at `http://storybook.mac-mini.localhost`.
 
 ## 1. Install
 

@@ -518,7 +518,8 @@ pub fn print_snapshot(snapshot: Snapshot, json: bool) -> Result<()> {
     Ok(())
 }
 pub fn launch_tray() -> Result<()> {
-    let sibling = std::env::current_exe()?.with_file_name("porch-tray");
+    let sibling = std::env::current_exe()?
+        .with_file_name(format!("porch-tray{}", std::env::consts::EXE_SUFFIX));
     if !sibling.is_file() {
         bail!("porch-tray is not installed beside porch; install the desktop package or build with --features tray --bin porch-tray")
     }
