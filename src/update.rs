@@ -1626,6 +1626,7 @@ mod tests {
     }
 
     /// A provenance setting whose gh does not exist.
+    #[cfg(unix)]
     fn auto() -> Provenance {
         Provenance {
             mode: VerifyMode::Auto,
@@ -2084,7 +2085,7 @@ mod tests {
             .spawn()
             .unwrap();
         std::thread::sleep(Duration::from_millis(500));
-        let result = (|| {
+        let while_running = || {
             let first = dir.0.join("first.exe");
             fs::write(&first, b"first build").unwrap();
             replace_executable(&first, &dest, |_| Ok(())).unwrap();
@@ -2107,7 +2108,8 @@ mod tests {
             assert!(format!("{err:#}").contains("verification"), "{err:#}");
             assert_eq!(fs::read(&dest).unwrap(), b"second build");
             aside
-        })();
+        };
+        let result = while_running();
         let _ = running.kill();
         let _ = running.wait();
         std::thread::sleep(Duration::from_millis(200));
