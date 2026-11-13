@@ -48,9 +48,24 @@ fn file(platform: &str) -> Result<PathBuf> {
     })
 }
 
+/// A quoted systemd `Environment=` assignment. Unlike command lines, systemd
+/// does not expand `$` there, so it must not be doubled; `%` specifiers are.
+fn systemd_env(assignment: &str) -> Result<String> {
+    if assignment.contains(['\n', '\r', '\0']) {
+        bail!("invalid service environment");
+    }
+    Ok(format!(
+        "\"{}\"",
+        assignment
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    ))
+}
+
 /// The line that ties a startup file to one Porch state directory.
 fn state_marker(platform: &str, state: &Path) -> Result<String> {
-    use crate::integrations::{systemd_quote, windows_quote, xml};
+    use crate::integrations::{windows_quote, xml};
     Ok(match platform {
         "macos" => format!(
             "<key>PORCH_STATE_DIR</key><string>{}</string>",
@@ -62,7 +77,7 @@ fn state_marker(platform: &str, state: &Path) -> Result<String> {
         ),
         _ => format!(
             "Environment={}",
-            systemd_quote(&format!("PORCH_STATE_DIR={}", state.display()))?
+            systemd_env(&format!("PORCH_STATE_DIR={}", state.display()))?
         ),
     })
 }
@@ -75,10 +90,70 @@ fn installed_here(platform: &str, path: &Path) -> bool {
         _ => false,
     }
 }
-/// Whether login startup is installed for this user and state directory.
+/// The program a startup file runs, as written by [`render`].
+fn recorded_program(platform: &str, body: &str) -> Option<PathBuf> {
+    fn unxml(s: &str) -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    }
+    let between = |start: &str, end: &str| {
+        let rest = &body[body.find(start)? + start.len()..];
+        Some(unxml(&rest[..rest.find(end)?]))
+    };
+    let program = match platform {
+        "macos" => between("<key>ProgramArguments</key><array><string>", "</string>")?,
+        "windows" => between("<Command>", "</Command>")?,
+        _ => {
+            let line = body.lines().find_map(|l| l.strip_prefix("ExecStart="))?;
+            let quoted = line.strip_prefix('"')?;
+            let mut out = String::new();
+            let mut chars = quoted.chars();
+            loop {
+                match chars.next()? {
+                    '"' => break,
+                    '\\' => out.push(chars.next()?),
+                    '%' | '$' => {
+                        let c = chars.next()?;
+                        out.push(c);
+                    }
+                    c => out.push(c),
+                }
+            }
+            out
+        }
+    };
+    Some(PathBuf::from(program))
+}
+/// The program an installed startup file runs, when it no longer exists
+/// (a package manager removed that version): login startup is then broken.
+pub fn missing_program() -> Option<PathBuf> {
+    let platform = platform();
+    let path = file(&platform).ok()?;
+    if !installed_here(&platform, &path) {
+        return None;
+    }
+    let program = recorded_program(&platform, &fs::read_to_string(&path).ok()?)?;
+    (!program.exists()).then_some(program)
+}
+/// Whether working login startup is installed for this user and state
+/// directory. A startup file whose program is gone does not count.
 pub fn installed() -> bool {
     let platform = platform();
-    file(&platform).is_ok_and(|p| installed_here(&platform, &p))
+    file(&platform).is_ok_and(|p| installed_here(&platform, &p)) && missing_program().is_none()
+}
+/// One line for `porch discovery autostart status`.
+pub fn status() -> String {
+    match missing_program() {
+        Some(program) => format!(
+            "broken: {} no longer exists; run `porch discovery autostart enable` again",
+            program.display()
+        ),
+        None if installed() => "enabled".into(),
+        None => "disabled".into(),
+    }
 }
 
 /// Refuse to touch a file at our path that Porch did not write.
@@ -92,9 +167,42 @@ fn check_owned(path: &Path) -> Result<()> {
     }
 }
 
+/// The path to record in the startup file. Package managers (Nix, Homebrew,
+/// version managers) install each version at its own path and point a stable
+/// link at the current one, and upgrades delete the old version: keep the
+/// link Porch was started through rather than the file it resolves to.
+fn program() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let invoked = std::env::args_os()
+        .next()
+        .map(PathBuf::from)
+        .and_then(|argv0| {
+            if argv0.components().count() > 1 {
+                std::env::current_dir().ok().map(|cwd| cwd.join(argv0))
+            } else {
+                std::env::split_paths(&std::env::var_os("PATH")?)
+                    .map(|dir| dir.join(&argv0))
+                    .find(|p| p.is_file())
+            }
+        });
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    let chosen = match invoked {
+        Some(p) if p.is_absolute() && same(&p, &exe) => p,
+        _ => exe,
+    };
+    Ok(stable_exe(
+        &chosen.canonicalize().unwrap_or(chosen.clone()),
+        &chosen,
+    ))
+}
+
 /// Homebrew upgrades delete the versioned Cellar path, so point the startup
-/// file at the stable `<prefix>/bin/porch` link when one exists.
-pub(super) fn stable_exe(exe: &Path) -> PathBuf {
+/// file at the stable `<prefix>/bin/porch` link when one exists. Otherwise
+/// `fallback`, the path Porch was started through.
+pub(super) fn stable_exe(exe: &Path, fallback: &Path) -> PathBuf {
     let parts: Vec<_> = exe.components().collect();
     if let Some(i) = parts
         .windows(2)
@@ -105,7 +213,7 @@ pub(super) fn stable_exe(exe: &Path) -> PathBuf {
             return link;
         }
     }
-    exe.to_path_buf()
+    fallback.to_path_buf()
 }
 
 pub(super) fn render(platform: &str, exe: &Path, state: &Path) -> Result<String> {
@@ -141,7 +249,7 @@ pub(super) fn render(platform: &str, exe: &Path, state: &Path) -> Result<String>
         "linux" => Ok(format!(
             "# {LABEL}: managed by `porch discovery autostart`\n[Unit]\nDescription=Porch discovery agent\nAfter=network-online.target\n[Service]\nExecStart={} discovery serve --autostart\nEnvironment={}\nRestart=on-failure\nRestartSec=30\n[Install]\nWantedBy=default.target\n",
             systemd_quote(&exe)?,
-            systemd_quote(&format!("PORCH_STATE_DIR={}", state.display()))?,
+            systemd_env(&format!("PORCH_STATE_DIR={}", state.display()))?,
         )),
         "windows" => render_task(&exe, state, &windows_user()?),
         _ => bail!("discovery autostart supports macOS, Linux and Windows"),
@@ -202,6 +310,13 @@ fn write_atomic(path: &Path, body: &str) -> Result<()> {
     let temporary = parent.join(format!(".{LABEL}.{}.tmp", std::process::id()));
     let result = (|| {
         let mut f = fs::File::create(&temporary)?;
+        // launchd refuses agents that others can modify; do not inherit a
+        // permissive umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(0o644))?;
+        }
         f.write_all(body.as_bytes())?;
         f.sync_all()?;
         fs::rename(&temporary, path)
@@ -272,8 +387,7 @@ pub async fn enable() -> Result<bool> {
             path.display()
         )
     }
-    let exe = std::env::current_exe()?;
-    let exe = stable_exe(&exe.canonicalize().unwrap_or(exe));
+    let exe = program()?;
     let state = crate::state::dir();
     let body = render(&platform, &exe, &state)?;
     // launchd/systemd append to the log; keep it private like every other agent log.
@@ -281,17 +395,15 @@ pub async fn enable() -> Result<bool> {
     write_atomic(&path, &body)?;
     // From here on launchd/systemd supervise the agent: stop a hand-started one.
     if let Some(identity) = super::process_identity("discovery") {
-        super::stop_identity(&identity).await?;
+        if let Err(e) = super::stop_identity(&identity).await {
+            // Nothing was loaded: leave no file that says otherwise.
+            let _ = fs::remove_file(&path);
+            return Err(e);
+        }
     }
     let p = path.to_string_lossy();
     let started = match platform.as_str() {
-        "macos" => {
-            let _ = crate::integrations::exec(
-                "launchctl",
-                &["bootout", &format!("{}/{LABEL}", gui_domain())],
-            );
-            crate::integrations::exec("launchctl", &["bootstrap", &gui_domain(), &p])
-        }
+        "macos" => reload_launch_agent(&p).await,
         "linux" => crate::integrations::exec("systemctl", &["--user", "daemon-reload"])
             .and_then(|_| crate::integrations::exec("systemctl", &["--user", "enable", UNIT]))
             .and_then(|_| crate::integrations::exec("systemctl", &["--user", "restart", UNIT])),
@@ -315,6 +427,28 @@ pub async fn enable() -> Result<bool> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(false)
+}
+
+/// Replace a loaded LaunchAgent with the file at `plist`. `bootout` returns
+/// before the old job is gone, and `bootstrap` fails (error 5) until it is,
+/// so wait for it, and retry briefly in case it lingers.
+async fn reload_launch_agent(plist: &str) -> Result<String> {
+    use crate::integrations::exec;
+    let target = format!("{}/{LABEL}", gui_domain());
+    let _ = exec("launchctl", &["bootout", &target]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while exec("launchctl", &["print", &target]).is_ok() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut result = exec("launchctl", &["bootstrap", &gui_domain(), plist]);
+    for _ in 0..5 {
+        if result.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        result = exec("launchctl", &["bootstrap", &gui_domain(), plist]);
+    }
+    result
 }
 
 /// Remove login startup. Sharing stays on: the agent keeps running unsupervised.
@@ -373,6 +507,15 @@ mod tests {
         assert!(body.starts_with("# dev.porch.discovery"));
         assert!(body.contains("ExecStart=\"/home/me/my bin/porch\" discovery serve --autostart"));
         assert!(body.contains("Environment=\"PORCH_STATE_DIR=/home/me/.porch\""));
+        // systemd expands `$` in ExecStart= but not in Environment=.
+        let body = render(
+            "linux",
+            Path::new("/home/me/$bin/porch"),
+            Path::new("/home/me/$state 100%"),
+        )
+        .unwrap();
+        assert!(body.contains("ExecStart=\"/home/me/$$bin/porch\""));
+        assert!(body.contains("Environment=\"PORCH_STATE_DIR=/home/me/$state 100%%\""));
         assert!(body.contains("Restart=on-failure"));
         assert!(body.contains("WantedBy=default.target"));
         assert!(render("freebsd", Path::new("p"), Path::new("s")).is_err());
@@ -398,18 +541,36 @@ mod tests {
     }
 
     #[test]
+    fn the_recorded_program_is_read_back_from_every_format() {
+        for (platform, exe) in [
+            ("macos", r"/Users/a&b/my bin/porch"),
+            ("linux", r#"/home/me/$x "q" \ 100%/porch"#),
+        ] {
+            let body = render(platform, Path::new(exe), Path::new("/s")).unwrap();
+            assert_eq!(recorded_program(platform, &body), Some(PathBuf::from(exe)));
+        }
+        let body = render_task(r"C:\P&Q\porch.exe", Path::new(r"C:\s"), "u").unwrap();
+        assert_eq!(
+            recorded_program("windows", &body),
+            Some(PathBuf::from(r"C:\P&Q\porch.exe"))
+        );
+    }
+
+    #[test]
     fn homebrew_cellar_binaries_use_the_stable_prefix_link() {
         let root = std::env::temp_dir().join(format!("porch-autostart-{}", std::process::id()));
         let cellar = root.join("Cellar/porch/0.3.0/bin/porch");
         fs::create_dir_all(cellar.parent().unwrap()).unwrap();
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::write(&cellar, "").unwrap();
-        // No link yet: keep the real path rather than invent one.
-        assert_eq!(stable_exe(&cellar), cellar);
+        // No link yet: keep the path Porch was started through.
+        assert_eq!(stable_exe(&cellar, &cellar), cellar);
         fs::write(root.join("bin/porch"), "").unwrap();
-        assert_eq!(stable_exe(&cellar), root.join("bin/porch"));
-        let plain = Path::new("/Users/me/.local/bin/porch");
-        assert_eq!(stable_exe(plain), plain);
+        assert_eq!(stable_exe(&cellar, &cellar), root.join("bin/porch"));
+        // Elsewhere (a Nix profile link to a store path) the link is kept.
+        let store = Path::new("/nix/store/abc-porch-0.5.2/bin/porch");
+        let profile = Path::new("/home/me/.nix-profile/bin/porch");
+        assert_eq!(stable_exe(store, profile), profile);
         let _ = fs::remove_dir_all(root);
     }
 }

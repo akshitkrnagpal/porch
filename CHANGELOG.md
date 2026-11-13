@@ -56,6 +56,19 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - "Waiting for the app to start" now appears only when an app on this computer isn't listening. A remote alias that can't be reached, a timeout, or an app that crashes mid-request gets an accurate error page that doesn't reload every two seconds, and a remote alias with an untrusted certificate says so.
 - Proxy loops are detected when only one of the two hop-count headers is valid.
 - Checking whether port 80 or 443 is free without sudo no longer opens a listener on it.
+- The first page load after a paired machine restarts, your laptop wakes or the connection sits idle opens one connection to that machine instead of one per request. Pages with many requests no longer fail some of them with "Remote Porch app is unavailable" on that first load.
+- A paused video or download from a paired machine no longer stalls every other request to it, and an app that doesn't read an upload no longer blocks other uploads to that machine (both machines need this version for uploads).
+- When a paired machine is unreachable, a page's requests all report it after one attempt instead of each waiting out its own timeout.
+- Paired machines' requests cost the discovery agent much less: it reuses its app list for up to a second instead of running `ps` and probing every app for each request, and rereads its state files only when they change. Revoking access, turning sharing off and starting an app still apply to the next request.
+- The proxy reads the list of paired machines only when it changes, instead of on every request with no local app, including 404s.
+- Long-polls, slow page renders and slow uploads through a paired machine no longer fail with 502 after 15 or 30 seconds. A response may now take up to 5 minutes from the end of the upload, then gets 504.
+- Uploads over 16 MB to an app on a paired machine get a 413 that says so, instead of 502 "registered app is unavailable". A route that points to another host gets 403 instead of 500.
+- Redirects and cookies containing non-ASCII characters are relayed correctly. Such redirects are now checked like any other (redirects to other loopback services were passed through), and cookies with UTF-8 values are no longer dropped.
+- A paired machine whose address was stored without a trailing slash (`https://10.0.0.5:7463`) works for opening apps, not just for listing them.
+- An app on a paired machine can call another app on the same machine, such as `web.mac-mini.localhost` calling `api.mac-mini.localhost`. Pages from other machines and other sites are still refused.
+- `porch discovery relay` keeps running after a transient error accepting a connection.
+- A connection left over from a refused WebSocket upgrade no longer holds one of the paired machine's connection slots.
+- Start at login (`porch discovery autostart`) records the link you run Porch through (a Nix profile, `~/.local/bin`) rather than the versioned file behind it, so upgrades don't break it. `autostart status` reports when the recorded program is gone. On Linux a state directory containing `$` is passed correctly. On macOS, enabling again waits for the old agent to unload instead of failing; a failed enable no longer leaves a startup file that says it's on; the LaunchAgent is always written with mode 0644.
 
 ### Improved
 - The proxy no longer reads the process table every 5 seconds when no app is running, nor connects to every app each time.

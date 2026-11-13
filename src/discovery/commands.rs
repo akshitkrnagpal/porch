@@ -319,14 +319,7 @@ pub async fn run(command: Command) -> Result<()> {
                 super::autostart::disable().await?;
                 eprintln!("Porch discovery no longer starts at login. Sharing is unchanged.");
             }
-            AutostartAction::Status => println!(
-                "{}",
-                if super::autostart::installed() {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            ),
+            AutostartAction::Status => println!("{}", super::autostart::status()),
         },
         Command::Disable => {
             disable().await?;
