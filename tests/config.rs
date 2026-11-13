@@ -1042,7 +1042,9 @@ fn child_path_takes_bins_from_the_project_only() {
     assert_eq!(dirs[..2], [app_bin, root_bin], "{dirs:?}");
     assert!(!dirs.contains(&planted), "{dirs:?}");
     // Outside any project and outside the home directory: this directory only.
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
     if !home.is_some_and(|h| f.0.starts_with(h)) {
         let loose = f.0.join("loose");
         let own = bin("loose");

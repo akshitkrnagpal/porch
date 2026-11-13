@@ -1698,8 +1698,9 @@ fn project_ancestors(cwd: &Path) -> Vec<&Path> {
     }
     out
 }
-/// The directory, and the `node_modules` holding it, belong to this user (or
-/// root). Always true on Windows, where ownership isn't a simple uid.
+/// The directory exists and, on Unix, it and the `node_modules` holding it
+/// belong to this user (or root). Windows ownership isn't a simple uid, so
+/// there only the project boundary applies.
 fn owned_by_user(bin: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -1710,8 +1711,7 @@ fn owned_by_user(bin: &Path) -> bool {
     }
     #[cfg(not(unix))]
     {
-        let _ = bin;
-        true
+        bin.is_dir()
     }
 }
 
