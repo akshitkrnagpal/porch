@@ -393,15 +393,10 @@ async fn relay_fixture() -> (
         address.port()
     ))
     .unwrap();
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config(&peer.fingerprint).unwrap())
-        .https_only()
-        .enable_http1()
-        .build();
     let context = RelayContext {
+        client: relay_client(&peer.fingerprint).unwrap(),
         peer,
         app_id: "web".into(),
-        client: Client::builder(TokioExecutor::new()).build(https),
         relay_url: relay_url.clone(),
         local_app: Url::parse(&fixture_catalog().apps[0].local_url).unwrap(),
     };

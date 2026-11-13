@@ -283,7 +283,7 @@ pub async fn app_url(app: &str, peer: Option<&str>) -> Result<String> {
         let local = server::local_catalog()?;
         // Query only the selected machine: another paired peer being offline
         // must not delay opening this one.
-        let remote = client::refresh_peer(&local.machine.id, peer_id).await?;
+        let remote = client::open_peer(&local.machine.id, peer_id).await?;
         let catalog = remote.catalog.as_ref().with_context(|| {
             remote
                 .error

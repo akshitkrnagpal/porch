@@ -423,12 +423,12 @@ pub async fn peers(command: Peers) -> Result<()> {
             client::remove_peer(&id)?;
         }
         Some(PeerCommand::Refresh { json: sub }) => {
-            print_snapshot(client::snapshot(true).await?, json || sub)?
+            print_snapshot(client::list(true).await?, json || sub)?
         }
         Some(PeerCommand::List { json: sub }) => {
-            print_snapshot(client::snapshot(false).await?, json || sub)?
+            print_snapshot(client::list(false).await?, json || sub)?
         }
-        None => print_snapshot(client::snapshot(false).await?, json)?,
+        None => print_snapshot(client::list(false).await?, json)?,
     }
     Ok(())
 }

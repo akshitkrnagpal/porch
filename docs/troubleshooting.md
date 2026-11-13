@@ -244,6 +244,12 @@ Codes last 5 minutes, work once, and are cancelled after 5 wrong guesses. Show a
 
 **Fix.** Pair again. `porch list --all` shows each paired machine and any connection error.
 
+### An app on another machine loads much more slowly than locally
+
+**Cause.** Every request crosses the network. Over plain HTTP a browser fetches at most six files at a time from one host, so a dev server that serves hundreds of separate modules (Vite, for example) waits for that many round trips to the other machine.
+
+**Fix.** Turn on HTTPS on the machine you browse from: `porch setup --https` (no sudo). Over HTTPS the browser uses HTTP/2 and fetches the modules in parallel, so the page waits for a few round trips instead of dozens. Paired-machine URLs then start with `https://`.
+
 ### Linux: the tray icon doesn't appear
 
 **Cause.** The tray needs GTK 3 and an AppIndicator host. GNOME doesn't ship one by default.

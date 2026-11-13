@@ -8,19 +8,29 @@ use axum::body::Body;
 use hyper::{body::Incoming, header, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
 const PREFIX: &str = "/_porch_peer/";
+/// A catalog this young is used as is.
 const CATALOG_TTL: Duration = Duration::from_secs(10);
+/// An older one (up to this age) still answers at once while a single
+/// background refresh replaces it, so page loads never wait on the catalog.
+/// It only maps names to app IDs: the agent checks every request itself.
+const CATALOG_STALE: Duration = Duration::from_secs(300);
+/// A name missing from a catalog at least this old triggers one fresh fetch.
+const CATALOG_RECHECK: Duration = Duration::from_secs(1);
 static PORT: OnceLock<u16> = OnceLock::new();
+/// The gateway of this process, when it is the proxy.
+static GATEWAY: OnceLock<Arc<Gateway>> = OnceLock::new();
 
 struct Gateway {
     tlds: Vec<String>,
     catalogs: Mutex<HashMap<String, (Instant, String, Catalog)>>,
+    refreshing: Mutex<HashSet<String>>,
     clients: Mutex<HashMap<String, client::RelayClient>>,
 }
 
@@ -77,9 +87,24 @@ pub fn start(tlds: Vec<String>) {
     let gateway = Arc::new(Gateway {
         tlds,
         catalogs: Mutex::default(),
+        refreshing: Mutex::default(),
         clients: Mutex::default(),
     });
+    let _ = GATEWAY.set(gateway.clone());
     tokio::spawn(accept(listener, gateway));
+}
+
+/// A peer's catalog fetched by this proxy's gateway, when this process is the
+/// proxy: over the connection its relay uses, which the fetch keeps warm, and
+/// into the cache a browser's first request then finds. `None` elsewhere.
+pub(super) async fn fetch_shared(peer: &Peer, endpoint: &str) -> Option<anyhow::Result<Catalog>> {
+    let gateway = GATEWAY.get()?.clone();
+    let mut peer = peer.clone();
+    peer.endpoint = endpoint.to_owned();
+    Some(match gateway.client(&peer.fingerprint) {
+        Ok(relay) => gateway.fetch(&peer, &relay).await,
+        Err(e) => Err(e),
+    })
 }
 
 /// Called by the proxy when no local route matches. Only loopback browsers may
@@ -139,24 +164,60 @@ fn page(status: StatusCode, message: &str) -> Response<Body> {
     r
 }
 
+fn catalog_key(peer: &Peer) -> String {
+    format!("{}\0{}\0{}", peer.endpoint, peer.fingerprint, peer.token)
+}
 impl Gateway {
-    async fn catalog(&self, peer: &Peer) -> anyhow::Result<Catalog> {
-        let key = format!("{}\0{}\0{}", peer.endpoint, peer.fingerprint, peer.token);
-        if let Ok(cache) = self.catalogs.lock() {
-            if let Some((at, k, c)) = cache.get(&peer.machine.id) {
-                if *k == key && at.elapsed() < CATALOG_TTL {
-                    return Ok(c.clone());
+    /// The peer's catalog and its age. Fresh or recently stale copies return
+    /// at once (stale ones start a background refresh); otherwise this fetches.
+    async fn catalog(
+        self: &Arc<Self>,
+        peer: &Peer,
+        relay: &client::RelayClient,
+    ) -> anyhow::Result<(Catalog, Duration)> {
+        let key = catalog_key(peer);
+        let cached = self.catalogs.lock().ok().and_then(|cache| {
+            cache
+                .get(&peer.machine.id)
+                .filter(|(_, k, _)| *k == key)
+                .map(|(at, _, c)| (c.clone(), at.elapsed()))
+        });
+        match cached {
+            Some((catalog, age)) if age < CATALOG_TTL => Ok((catalog, age)),
+            Some((catalog, age)) if age < CATALOG_STALE => {
+                let first = self
+                    .refreshing
+                    .lock()
+                    .is_ok_and(|mut r| r.insert(peer.machine.id.clone()));
+                if first {
+                    let (gateway, peer, relay) = (self.clone(), peer.clone(), relay.clone());
+                    tokio::spawn(async move {
+                        // Unreachable now: drop the copy so the next request
+                        // reports why instead of relaying to a dead link.
+                        if gateway.fetch(&peer, &relay).await.is_err() {
+                            if let Ok(mut cache) = gateway.catalogs.lock() {
+                                cache.remove(&peer.machine.id);
+                            }
+                        }
+                        if let Ok(mut r) = gateway.refreshing.lock() {
+                            r.remove(&peer.machine.id);
+                        }
+                    });
                 }
+                Ok((catalog, age))
             }
+            _ => Ok((self.fetch(peer, relay).await?, Duration::ZERO)),
         }
-        let catalog = client::fetch_catalog(peer, &peer.endpoint).await?;
+    }
+    async fn fetch(&self, peer: &Peer, relay: &client::RelayClient) -> anyhow::Result<Catalog> {
+        let catalog = client::relay_catalog(peer, relay).await?;
         if let Ok(mut cache) = self.catalogs.lock() {
             if cache.len() > 256 {
                 cache.clear();
             }
             cache.insert(
                 peer.machine.id.clone(),
-                (Instant::now(), key, catalog.clone()),
+                (Instant::now(), catalog_key(peer), catalog.clone()),
             );
         }
         Ok(catalog)
@@ -215,43 +276,68 @@ async fn handle(
             &format!("No paired machine is called {slug}. Run porch peers list."),
         ));
     };
-    let catalog = match gateway.catalog(&peer).await {
-        Ok(c) => c,
-        Err(e) => {
+    let Ok(relay) = gateway.client(&peer.fingerprint) else {
+        return Ok(page(StatusCode::BAD_GATEWAY, "Cannot build relay client"));
+    };
+    let unreachable = |e: anyhow::Error| {
+        page(
+            StatusCode::BAD_GATEWAY,
+            &format!("{} is unreachable: {e:#}", peer.machine.name),
+        )
+    };
+    let shared = |catalog: &Catalog| {
+        catalog
+            .apps
+            .iter()
+            .find(|a| hostname_app(&a.name).as_deref() == Some(app.as_str()))
+            .filter(|a| a.remote_access)
+            .cloned()
+    };
+    let catalog = match gateway.catalog(&peer, &relay).await {
+        Ok((c, age)) => {
+            // An app started (or shared) since this copy was taken is reachable at once.
+            if shared(&c).is_none() && age >= CATALOG_RECHECK {
+                match gateway.fetch(&peer, &relay).await {
+                    Ok(c) => c,
+                    Err(e) => return Ok(unreachable(e)),
+                }
+            } else {
+                c
+            }
+        }
+        Err(e) => return Ok(unreachable(e)),
+    };
+    let found = match shared(&catalog) {
+        Some(found) => found,
+        None => {
+            let Some(found) = catalog
+                .apps
+                .iter()
+                .find(|a| hostname_app(&a.name).as_deref() == Some(app.as_str()))
+            else {
+                let names: Vec<_> = catalog.apps.iter().map(|a| a.name.as_str()).collect();
+                return Ok(page(
+                    StatusCode::NOT_FOUND,
+                    &format!(
+                        "No app named {app} on {}. Apps: {}",
+                        peer.machine.name,
+                        if names.is_empty() {
+                            "none".into()
+                        } else {
+                            names.join(", ")
+                        }
+                    ),
+                ));
+            };
             return Ok(page(
-                StatusCode::BAD_GATEWAY,
-                &format!("{} is unreachable: {e:#}", peer.machine.name),
-            ))
+                StatusCode::FORBIDDEN,
+                found
+                    .unavailable_reason
+                    .as_deref()
+                    .unwrap_or("App sharing is off on that machine"),
+            ));
         }
     };
-    let found = catalog
-        .apps
-        .iter()
-        .find(|a| hostname_app(&a.name).as_deref() == Some(app.as_str()));
-    let Some(found) = found else {
-        let names: Vec<_> = catalog.apps.iter().map(|a| a.name.as_str()).collect();
-        return Ok(page(
-            StatusCode::NOT_FOUND,
-            &format!(
-                "No app named {app} on {}. Apps: {}",
-                peer.machine.name,
-                if names.is_empty() {
-                    "none".into()
-                } else {
-                    names.join(", ")
-                }
-            ),
-        ));
-    };
-    if !found.remote_access {
-        return Ok(page(
-            StatusCode::FORBIDDEN,
-            found
-                .unavailable_reason
-                .as_deref()
-                .unwrap_or("App sharing is off on that machine"),
-        ));
-    }
     let scheme = match req
         .headers()
         .get("x-forwarded-proto")
@@ -274,9 +360,6 @@ async fn handle(
         return Ok(page(StatusCode::BAD_REQUEST, "Invalid request path"));
     };
     *req.uri_mut() = uri;
-    let Ok(relay) = gateway.client(&peer.fingerprint) else {
-        return Ok(page(StatusCode::BAD_GATEWAY, "Cannot build relay client"));
-    };
     let context = client::RelayContext {
         app_id: found.id.clone(),
         peer,

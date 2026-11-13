@@ -286,6 +286,88 @@ fn local_authority(host: &str) -> bool {
         .ok()
         .is_some_and(|a| matches!(a.host(), "localhost" | "127.0.0.1" | "[::1]" | "::1"))
 }
+/// Paired machines and their apps, for the CLI and tray. The proxy fetches
+/// them over the connections its relay keeps, so listing a machine's apps also
+/// prepares opening one. Only Porch on this computer may ask: loopback, the
+/// proxy's private token, and never a browser page.
+async fn peers_request(
+    req: &Request<Incoming>,
+    peer: SocketAddr,
+    host: &str,
+    token: &str,
+) -> Option<Response<Body>> {
+    if req.uri().path() != PEERS_PATH || !local_authority(host) {
+        return None;
+    }
+    let supplied = req
+        .headers()
+        .get(PEERS_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !peer.ip().is_loopback()
+        || req.method() != Method::GET
+        || req.headers().contains_key(header::ORIGIN)
+        || req.headers().contains_key("sec-fetch-site")
+        || !crate::integrations::constant_eq(token, supplied)
+    {
+        return Some(error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Paired machines are only listed for Porch on this computer",
+            host,
+            false,
+        ));
+    }
+    let query = req.uri().query().unwrap_or("");
+    let param = |key: &str| {
+        query
+            .split('&')
+            .find_map(|p| p.strip_prefix(key)?.strip_prefix('='))
+    };
+    let body = match param("peer") {
+        Some(id) => {
+            async {
+                let local = crate::discovery::server::local_catalog()?;
+                let peer = crate::discovery::client::refresh_peer(&local.machine.id, id).await?;
+                Ok::<_, anyhow::Error>(serde_json::to_vec(&peer)?)
+            }
+            .await
+        }
+        None => crate::discovery::client::snapshot(param("refresh") == Some("1"))
+            .await
+            .and_then(|s| Ok(serde_json::to_vec(&s)?)),
+    };
+    Some(match body {
+        Ok(body) => {
+            let mut r = Response::new(
+                Full::new(Bytes::from(body))
+                    .map_err(|e: Infallible| match e {})
+                    .boxed_unsync(),
+            );
+            r.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
+            );
+            r.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+            marker(&mut r);
+            r
+        }
+        Err(e) => error(
+            StatusCode::BAD_GATEWAY,
+            "peers_unavailable",
+            &format!("{e:#}"),
+            host,
+            false,
+        ),
+    })
+}
+/// Where the CLI asks the proxy for paired machines, and the header carrying
+/// the proxy's private token (`proxy.hosts-sync-token`).
+pub(crate) const PEERS_PATH: &str = "/_porch/peers.json";
+pub(crate) const PEERS_TOKEN_HEADER: &str = "x-porch-token";
 fn hosts_request(
     req: &Request<Incoming>,
     peer: SocketAddr,
@@ -443,6 +525,9 @@ async fn forward(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.to_ascii_lowercase().contains("text/html"));
     if let Some(r) = hosts_request(&req, peer, &host, &token, settings.unprivileged) {
+        return Ok(r);
+    }
+    if let Some(r) = peers_request(&req, peer, &host, &token).await {
         return Ok(r);
     }
     let hostname = host
