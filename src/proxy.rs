@@ -9,25 +9,210 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder,
 };
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
-type Body = UnsyncBoxBody<Bytes, hyper::Error>;
-/// Open client connections the proxy serves at once; more are refused.
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::Poll,
+    time::Duration,
+};
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type Body = UnsyncBoxBody<Bytes, BoxError>;
+/// Most client connections (WebSockets included) the proxy serves at once,
+/// across all its listeners; fewer when the file-descriptor limit is lower.
 const MAX_CONNECTIONS: usize = 4096;
-/// Time a client gets to send a complete HTTP/1 request head.
+/// Fewest connections a very low descriptor limit still allows.
+#[cfg(any(unix, test))]
+const MIN_CONNECTIONS: usize = 16;
+/// Most connections one other device (LAN mode) may hold open at once.
+const MAX_PER_CLIENT: usize = 64;
+/// Time a client gets to send a complete HTTP/1 request head, and to start
+/// its first request on a new connection.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long another device's connection may sit with no request in flight.
+const LAN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long another device may pause while sending a request body.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a stopping proxy lets requests in flight finish.
+/// `porch proxy stop` waits 5 s before it kills the process.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the dashboard reuses one listing of paired machines.
+const PEERS_TTL: Duration = Duration::from_secs(5);
 type Upstream = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 type LoopbackUpstream = crate::upstream::LoopbackClient<Body>;
+type PeersCache = tokio::sync::Mutex<Option<(tokio::time::Instant, serde_json::Value)>>;
 #[derive(Clone)]
 struct ProxyContext {
     client: Upstream,
     /// Dials every name on loopback, for `--upstream` aliases: the URI host is
-    /// the TLS server name, the connection still goes to this computer.
+    /// the TLS server name, the connection still goes to this computer. Also
+    /// used for apps Porch launched, which may listen on [::1] alone.
     loopback: LoopbackUpstream,
     /// The same, without certificate verification (`--insecure` aliases only).
     loopback_insecure: LoopbackUpstream,
     settings: Arc<ProxySettings>,
+    routing: Arc<Routing>,
     token: Arc<String>,
+    limits: Arc<Limits>,
+    peers: Arc<PeersCache>,
     stopped: tokio::sync::watch::Receiver<bool>,
+}
+/// The TLDs a request's host is matched against, computed once per proxy:
+/// longest first, so overlapping suffixes (`dev.example.com`, `example.com`)
+/// resolve to the most specific.
+struct Routing {
+    tlds: Vec<String>,
+    wildcard: bool,
+}
+impl Routing {
+    fn new(settings: &ProxySettings) -> Self {
+        let mut tlds = settings.tlds.clone();
+        if settings.lan && !tlds.iter().any(|t| t == "local") {
+            tlds.push("local".into());
+        }
+        tlds.sort_by_key(|t| std::cmp::Reverse(t.len()));
+        Self {
+            tlds,
+            wildcard: settings.wildcard,
+        }
+    }
+}
+/// Connection slots shared by every listener, sized to the descriptor limit.
+struct Limits {
+    slots: Arc<tokio::sync::Semaphore>,
+    clients: Arc<ClientSlots>,
+}
+impl Limits {
+    fn new(connections: usize) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(connections)),
+            clients: Arc::new(ClientSlots::new((connections / 4).clamp(4, MAX_PER_CLIENT))),
+        }
+    }
+    /// A slot for a connection from `peer`, if it may open one: every client
+    /// within the shared cap, another device also within its own share.
+    fn acquire(&self, peer: IpAddr) -> Option<Slot> {
+        let client = if peer.is_loopback() {
+            None
+        } else {
+            Some(self.clients.acquire(peer)?)
+        };
+        let permit = self.slots.clone().try_acquire_owned().ok()?;
+        Some(Slot {
+            _permit: permit,
+            _client: client,
+        })
+    }
+}
+struct Slot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _client: Option<ClientSlot>,
+}
+/// Open connections per other device, so one device can't take every slot.
+struct ClientSlots {
+    limit: usize,
+    open: Mutex<HashMap<IpAddr, usize>>,
+}
+struct ClientSlot {
+    slots: Arc<ClientSlots>,
+    key: IpAddr,
+}
+impl ClientSlots {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            open: Mutex::new(HashMap::new()),
+        }
+    }
+    /// One device: an IPv4 address, or an IPv6 /64 (a device picks new
+    /// addresses within its prefix at will).
+    fn key(ip: IpAddr) -> IpAddr {
+        match ip.to_canonical() {
+            IpAddr::V6(v6) => {
+                let s = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+            v4 => v4,
+        }
+    }
+    fn acquire(self: &Arc<Self>, ip: IpAddr) -> Option<ClientSlot> {
+        let key = Self::key(ip);
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        let count = open.entry(key).or_insert(0);
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(ClientSlot {
+            slots: self.clone(),
+            key,
+        })
+    }
+}
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        let mut open = self.slots.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = open.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.key);
+            }
+        }
+    }
+}
+/// Raise the soft open-file limit toward the hard limit and return the limit
+/// in force. Each proxied connection needs two descriptors (client and app),
+/// and the usual defaults (256 on macOS, 1024 on Linux) would run out after a
+/// few hundred connections.
+#[cfg(unix)]
+fn raise_fd_limit() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return 256;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let (current, hard) = (limit.rlim_cur as u64, limit.rlim_max as u64);
+    // macOS rejects values above kern.maxfilesperproc: step down until one fits.
+    for want in [65536u64, 10240, 4096, 2048, 1024] {
+        let want = want.min(hard);
+        if want <= current {
+            break;
+        }
+        let raised = libc::rlimit {
+            rlim_cur: want as libc::rlim_t,
+            rlim_max: limit.rlim_max,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            return want;
+        }
+    }
+    current
+}
+/// Connections that fit in `fds` descriptors: two each, after a reserve for
+/// listeners, state files, discovery and the apps' health checks.
+#[cfg(any(unix, test))]
+fn connections_for(fds: u64) -> usize {
+    let reserve = (fds / 8).max(64);
+    usize::try_from(fds.saturating_sub(reserve) / 2)
+        .unwrap_or(usize::MAX)
+        .clamp(MIN_CONNECTIONS, MAX_CONNECTIONS)
+}
+fn connection_limit() -> usize {
+    #[cfg(unix)]
+    {
+        connections_for(raise_fd_limit())
+    }
+    #[cfg(not(unix))]
+    {
+        MAX_CONNECTIONS
+    }
 }
 fn empty() -> Body {
     Full::new(Bytes::new())
@@ -44,7 +229,7 @@ fn escape(s: &str) -> String {
 const PAGE_CSS: &str = ":root{color-scheme:light dark;--bg:#faf8f2;--fg:#242421;--muted:#6b675e;--card:#fff;--line:#e6e1d6;--accent:#b4532a;--code:#efeadf}@media (prefers-color-scheme:dark){:root{--bg:#161513;--fg:#ece9e1;--muted:#a19c90;--card:#1f1e1b;--line:#33312c;--accent:#f08a5d;--code:#2a2925}}*{box-sizing:border-box}body{margin:0;font:16px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg)}main{max-width:46rem;margin:0 auto;padding:12vh 1rem 4rem}.status{font:600 .8rem ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}h1{font-size:1.75rem;line-height:1.2;margin:.4rem 0 1rem}p{margin:.6rem 0}code{font:.9em ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--code);padding:.1rem .35rem;border-radius:4px}.muted{color:var(--muted)}h2{font-size:.95rem;margin:2.5rem 0 .75rem;color:var(--muted);font-weight:600}ul.apps{list-style:none;padding:0;margin:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}ul.apps li{border-top:1px solid var(--line);display:flex;align-items:center}ul.apps li[hidden]{display:none}ul.apps li>a{flex:1;min-width:0}button.copy{font:.8rem inherit;margin-right:.75rem;padding:.25rem .6rem;border:1px solid var(--line);border-radius:6px;background:transparent;color:var(--muted);cursor:pointer}button.copy:hover,button.copy:focus-visible{color:var(--fg);border-color:var(--muted)}ul.apps li:first-child{border-top:0}ul.apps a{display:flex;justify-content:space-between;gap:1rem;padding:.75rem 1rem;color:inherit;text-decoration:none}ul.apps a:hover,ul.apps a:focus-visible{background:var(--code);outline:none}.name{font-weight:600}.target{color:var(--muted);font:.85em ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}input[type=search]{width:100%;font:inherit;padding:.55rem .75rem;margin:0 0 .75rem;border:1px solid var(--line);border-radius:8px;background:var(--card);color:inherit}.spinner{display:inline-block;width:.8em;height:.8em;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;vertical-align:-.05em;margin-right:.4rem}@keyframes spin{to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.spinner{animation:none}}footer{margin-top:3rem;font-size:.85rem;color:var(--muted)}.dot{display:inline-block;width:.55rem;height:.55rem;border-radius:50%;margin-right:.55rem;vertical-align:.08em}.dot.up{background:#2f9e44}.dot.down{background:#e0a100}";
 /// Live data for the dashboard at the bare domain: this machine's apps with
 /// health and, with `peers`, every paired machine's apps (loopback only).
-async fn dashboard_json(settings: &ProxySettings, peers: bool) -> serde_json::Value {
+async fn dashboard_json(settings: &ProxySettings, peers: Option<&PeersCache>) -> serde_json::Value {
     let state = crate::state::live_routes().unwrap_or_default();
     let routes = state.routes.clone();
     let health = tokio::task::spawn_blocking(move || {
@@ -71,46 +256,66 @@ async fn dashboard_json(settings: &ProxySettings, peers: bool) -> serde_json::Va
         })
         .collect();
     let mut out = serde_json::json!({ "apps": apps });
-    if peers {
-        let snapshot = tokio::time::timeout(
-            Duration::from_secs(10),
-            crate::discovery::client::snapshot(false),
-        )
-        .await;
-        let machines: Vec<_> = match snapshot {
-            Ok(Ok(snap)) => snap
-                .peers
-                .iter()
-                .map(|p| {
-                    let apps: Vec<_> = p
-                        .catalog
-                        .iter()
-                        .flat_map(|c| c.apps.iter())
-                        .map(|a| {
-                            let url = (a.remote_access && !p.slug.is_empty())
-                                .then(|| crate::discovery::gateway::hostname_app(&a.name))
-                                .flatten()
-                                .map(|n| settings.url(&format!("{n}.{}", p.slug)));
-                            serde_json::json!({
-                                "name": a.name,
-                                "url": url,
-                                "health": a.health,
-                                "note": a.unavailable_reason,
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({
-                        "machine": p.machine.name,
-                        "error": p.error,
-                        "apps": apps,
-                    })
-                })
-                .collect(),
-            _ => vec![],
-        };
-        out["machines"] = serde_json::json!(machines);
+    if let Some(cache) = peers {
+        out["machines"] = peer_machines(settings, cache).await;
     }
     out
+}
+/// Every paired machine's apps for the dashboard. Each listing asks every
+/// paired machine, so one runs at a time and its answer is reused briefly.
+async fn peer_machines(settings: &ProxySettings, cache: &PeersCache) -> serde_json::Value {
+    let mut cached = cache.lock().await;
+    if let Some((at, machines)) = cached.as_ref() {
+        if at.elapsed() < PEERS_TTL {
+            return machines.clone();
+        }
+    }
+    let snapshot = tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::discovery::client::snapshot(false),
+    )
+    .await;
+    let machines: Vec<_> = match snapshot {
+        Ok(Ok(snap)) => snap
+            .peers
+            .iter()
+            .map(|p| {
+                let apps: Vec<_> = p
+                    .catalog
+                    .iter()
+                    .flat_map(|c| c.apps.iter())
+                    .map(|a| {
+                        let url = (a.remote_access && !p.slug.is_empty())
+                            .then(|| crate::discovery::gateway::hostname_app(&a.name))
+                            .flatten()
+                            .map(|n| settings.url(&format!("{n}.{}", p.slug)));
+                        serde_json::json!({
+                            "name": a.name,
+                            "url": url,
+                            "health": a.health,
+                            "note": a.unavailable_reason,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "machine": p.machine.name,
+                    "error": p.error,
+                    "apps": apps,
+                })
+            })
+            .collect(),
+        _ => vec![],
+    };
+    let machines = serde_json::json!(machines);
+    *cached = Some((tokio::time::Instant::now(), machines.clone()));
+    machines
+}
+/// A request a page on another site made (`Sec-Fetch-Site: cross-site` or
+/// `same-site`). Browsers send this header on every request they make.
+fn cross_site(req: &Request<Incoming>) -> bool {
+    req.headers()
+        .get("sec-fetch-site")
+        .is_some_and(|v| !matches!(v.as_bytes(), b"same-origin" | b"none"))
 }
 const COPY_SCRIPT: &str = "document.addEventListener('click',e=>{const b=e.target.closest('button.copy');if(!b)return;navigator.clipboard.writeText(b.dataset.url).then(()=>{b.textContent='Copied';setTimeout(()=>b.textContent='Copy',1200)})});";
 const DASHBOARD_SCRIPT: &str = r#"<script>
@@ -216,56 +421,163 @@ fn strip(headers: &mut header::HeaderMap) {
         headers.remove(name);
     }
 }
-/// Score includes the matched TLD length so overlapping suffixes are unambiguous.
-fn score(
-    name: &str,
-    host: &str,
-    path: &str,
-    settings: &ProxySettings,
-) -> Option<(usize, usize, usize, usize)> {
-    let (domain, prefix) = name
-        .split_once('/')
-        .map(|(h, p)| (h, format!("/{p}")))
-        .unwrap_or((name, String::new()));
-    if !(prefix.is_empty()
-        || path == prefix
-        || path
-            .strip_prefix(&prefix)
-            .is_some_and(|s| s.starts_with('/')))
-    {
-        return None;
+/// Headers that tell an app who the client is or which URL it asked for.
+/// Only a client on this computer (another proxy, a tunnel) may set them;
+/// another device could otherwise spoof its address, the scheme or the path
+/// the app trusts.
+fn client_forwarding_header(name: &str) -> bool {
+    name.starts_with("x-forwarded-")
+        || name.starts_with("x-original-")
+        || matches!(
+            name,
+            "forwarded" | "x-real-ip" | "x-client-ip" | "true-client-ip" | "x-rewrite-url"
+        )
+}
+fn strip_client_forwarding(headers: &mut header::HeaderMap) {
+    let names: Vec<header::HeaderName> = headers
+        .keys()
+        .filter(|n| client_forwarding_header(n.as_str()))
+        .cloned()
+        .collect();
+    for name in names {
+        headers.remove(name);
     }
-    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-    let mut tlds = settings.tlds.clone();
-    if settings.lan {
-        tlds.push("local".into());
-    }
-    tlds.sort_by_key(|t| std::cmp::Reverse(t.len()));
-    let matched_tld = tlds.iter().find(|t| host.ends_with(&format!(".{t}")));
-    let explicit = tlds.iter().any(|t| domain.ends_with(&format!(".{t}")));
-    let candidates = if explicit || domain.starts_with("*.") {
-        vec![domain.clone()]
-    } else {
-        tlds.iter()
-            .filter(|t| matched_tld.is_none_or(|m| m == *t))
-            .map(|t| format!("{domain}.{t}"))
-            .collect()
+}
+/// HTTP/2 lets a browser split cookies across several `cookie` fields; an
+/// HTTP/1.1 app expects one. Join them with "; " (RFC 9113 section 8.2.3).
+fn merge_cookies(headers: &mut header::HeaderMap) {
+    let mut values = headers.get_all(header::COOKIE).iter();
+    let Some(first) = values.next() else {
+        return;
     };
-    candidates
-        .into_iter()
-        .filter_map(|candidate| {
-            let wildcard = candidate.strip_prefix("*.");
-            let exact = candidate == host;
-            let parent = wildcard.unwrap_or(&candidate);
-            let fallback =
-                (wildcard.is_some() || settings.wildcard) && host.ends_with(&format!(".{parent}"));
-            (exact || fallback).then_some((
-                usize::from(exact),
-                matched_tld.map_or(0, |t| t.len()),
-                parent.len(),
-                prefix.len(),
-            ))
+    let mut joined = first.as_bytes().to_vec();
+    let mut merged = false;
+    for v in values {
+        joined.extend_from_slice(b"; ");
+        joined.extend_from_slice(v.as_bytes());
+        merged = true;
+    }
+    if merged {
+        if let Ok(v) = header::HeaderValue::from_bytes(&joined) {
+            headers.insert(header::COOKIE, v);
+        }
+    }
+}
+/// How many times this request already passed through Porch. Only a proxy on
+/// this computer can have forwarded it before; another device's hop count is
+/// ignored so it can't force a 508.
+fn hop_count(headers: &header::HeaderMap, trusted: bool) -> u32 {
+    if !trusted {
+        return 0;
+    }
+    ["x-porch-hops", "x-portless-hops"]
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)?
+                .to_str()
+                .ok()?
+                .trim()
+                .parse::<u32>()
+                .ok()
         })
+        .max()
+        .unwrap_or(0)
+}
+fn is_websocket(upgrade: &header::HeaderValue) -> bool {
+    upgrade.to_str().is_ok_and(|v| {
+        v.split(',')
+            .any(|p| p.trim().eq_ignore_ascii_case("websocket"))
+    })
+}
+/// The `Location` to send for a backend redirect. `absolute` is the redirect
+/// already moved from the backend's own origin onto `public_origin`, if it
+/// pointed there. An alias to `http://host/base` serves the backend's `/base`
+/// at the Porch URL's root, so that prefix is dropped from its redirects.
+fn redirect_location(
+    location: &str,
+    absolute: Option<String>,
+    base: &str,
+    public_origin: &str,
+) -> Option<String> {
+    let loc = absolute.clone().unwrap_or_else(|| location.to_owned());
+    let (prefix, path) = if let Some(p) = loc.strip_prefix(public_origin) {
+        (public_origin, p)
+    } else if loc.starts_with('/') && !loc.starts_with("//") {
+        ("", loc.as_str())
+    } else {
+        return absolute;
+    };
+    match path.strip_prefix(base) {
+        Some(rest)
+            if !base.is_empty() && (rest.is_empty() || rest.starts_with(['/', '?', '#'])) =>
+        {
+            // `/base//evil.example` must not become `//evil.example`, which a
+            // browser reads as another site (as it does `/\evil.example`).
+            let rest = if rest.starts_with('/') {
+                format!("/{}", rest.trim_start_matches(['/', '\\']))
+            } else {
+                format!("/{rest}")
+            };
+            Some(format!("{prefix}{rest}"))
+        }
+        _ => absolute,
+    }
+}
+/// `name.tld` (or `name` alone without a TLD) equals `host`, ignoring ASCII
+/// case. Compared as bytes: a hand-edited name need not be ASCII.
+fn is_name(host: &str, name: &str, tld: Option<&str>) -> bool {
+    let (host, name) = (host.as_bytes(), name.as_bytes());
+    match tld.map(str::as_bytes) {
+        None => host.eq_ignore_ascii_case(name),
+        Some(tld) => {
+            host.len() == name.len() + 1 + tld.len()
+                && host[name.len()] == b'.'
+                && host[..name.len()].eq_ignore_ascii_case(name)
+                && host[name.len() + 1..].eq_ignore_ascii_case(tld)
+        }
+    }
+}
+/// `host` is a subdomain of `name.tld` (or of `name`), ignoring ASCII case.
+fn is_under(host: &str, name: &str, tld: Option<&str>) -> bool {
+    let len = name.len() + tld.map_or(0, |t| t.len() + 1);
+    let bytes = host.as_bytes();
+    bytes.len() > len + 1
+        && bytes[bytes.len() - len - 1] == b'.'
+        && std::str::from_utf8(&bytes[bytes.len() - len..])
+            .is_ok_and(|parent| is_name(parent, name, tld))
+}
+/// `host` ends with `.tld`, ignoring ASCII case.
+fn has_tld(host: &str, tld: &str) -> bool {
+    let (host, tld) = (host.as_bytes(), tld.as_bytes());
+    host.len() > tld.len()
+        && host[host.len() - tld.len() - 1] == b'.'
+        && host[host.len() - tld.len()..].eq_ignore_ascii_case(tld)
+}
+/// How well route `name` matches `host`: an exact name beats a parent
+/// (wildcard mode), then the longer matched TLD, then the longer name.
+fn score(name: &str, host: &str, routing: &Routing) -> Option<(bool, usize, usize)> {
+    let name = name.trim_end_matches('.');
+    let matched = routing.tlds.iter().find(|t| has_tld(host, t));
+    let matched_len = matched.map_or(0, |t| t.len());
+    let candidate = |tld: Option<&str>| {
+        let exact = is_name(host, name, tld);
+        (exact || (routing.wildcard && is_under(host, name, tld))).then(|| {
+            (
+                exact,
+                matched_len,
+                name.len() + tld.map_or(0, |t| t.len() + 1),
+            )
+        })
+    };
+    if routing.tlds.iter().any(|t| has_tld(name, t)) {
+        return candidate(None);
+    }
+    routing
+        .tlds
+        .iter()
+        .filter(|t| matched.is_none_or(|m| m == *t))
+        .filter_map(|t| candidate(Some(t)))
         .max()
 }
 fn authority(req: &Request<Incoming>) -> String {
@@ -368,7 +680,7 @@ async fn peers_request(
 /// the proxy's private token (`proxy.hosts-sync-token`).
 pub(crate) const PEERS_PATH: &str = "/_porch/peers.json";
 pub(crate) const PEERS_TOKEN_HEADER: &str = "x-porch-token";
-fn hosts_request(
+async fn hosts_request(
     req: &Request<Incoming>,
     peer: SocketAddr,
     host: &str,
@@ -452,34 +764,35 @@ fn hosts_request(
         })
         .flatten()
         .unwrap_or("");
-    Some(
-        match crate::integrations::authenticated_hosts_sync(supplied) {
-            Ok(()) => {
-                let mut r = Response::new(empty());
-                marker(&mut r);
-                r
-            }
-            Err(e) => error(
-                if e.downcast_ref::<crate::integrations::InvalidHostsToken>()
-                    .is_some()
-                {
-                    StatusCode::FORBIDDEN
-                } else {
-                    StatusCode::CONFLICT
-                },
-                if e.downcast_ref::<crate::integrations::InvalidHostsToken>()
-                    .is_some()
-                {
-                    "forbidden"
-                } else {
-                    "hosts_sync_unavailable"
-                },
-                &e.to_string(),
-                host,
-                false,
-            ),
-        },
-    )
+    // The token is the one this proxy loaded at start (the challenge proof
+    // above uses it too), and the hosts-file write blocks: keep both off the
+    // runtime's threads.
+    if !crate::integrations::constant_eq(token, supplied) {
+        return Some(error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            &crate::integrations::InvalidHostsToken.to_string(),
+            host,
+            false,
+        ));
+    }
+    let synced = tokio::task::spawn_blocking(crate::integrations::auto_hosts_sync)
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("hosts synchronization failed: {e}")));
+    Some(match synced {
+        Ok(()) => {
+            let mut r = Response::new(empty());
+            marker(&mut r);
+            r
+        }
+        Err(e) => error(
+            StatusCode::CONFLICT,
+            "hosts_sync_unavailable",
+            &e.to_string(),
+            host,
+            false,
+        ),
+    })
 }
 fn redirect(req: &Request<Incoming>, host: &str, port: u16) -> Response<Body> {
     let hostname = host
@@ -515,7 +828,10 @@ async fn forward(
         loopback,
         loopback_insecure,
         settings,
+        routing,
         token,
+        limits,
+        peers,
         mut stopped,
     } = context;
     let host = authority(&req);
@@ -524,7 +840,7 @@ async fn forward(
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.to_ascii_lowercase().contains("text/html"));
-    if let Some(r) = hosts_request(&req, peer, &host, &token, settings.unprivileged) {
+    if let Some(r) = hosts_request(&req, peer, &host, &token, settings.unprivileged).await {
         return Ok(r);
     }
     if let Some(r) = peers_request(&req, peer, &host, &token).await {
@@ -545,7 +861,9 @@ async fn forward(
     }
     let dashboard_host = settings.tlds.contains(&hostname) || hostname == "porch.localhost";
     if dashboard_host && req.uri().path() == "/_porch/apps.json" {
-        if !peer.ip().is_loopback() {
+        // Only the dashboard itself may ask: another site's page could
+        // otherwise make the proxy query every paired machine in a loop.
+        if !peer.ip().is_loopback() || cross_site(&req) {
             return Ok(error(
                 StatusCode::FORBIDDEN,
                 "forbidden",
@@ -554,11 +872,13 @@ async fn forward(
                 false,
             ));
         }
-        let peers = req
+        let with_peers = req
             .uri()
             .query()
             .is_some_and(|q| q.split('&').any(|p| p == "peers=1"));
-        let body = dashboard_json(&settings, peers).await.to_string();
+        let body = dashboard_json(&settings, with_peers.then_some(&*peers))
+            .await
+            .to_string();
         let mut r = Response::new(
             Full::new(Bytes::from(body))
                 .map_err(|e: Infallible| match e {})
@@ -590,7 +910,9 @@ async fn forward(
                     .any(|v| v.trim().eq_ignore_ascii_case("upgrade"))
             })
     });
-    if redirect_plain && upgrade.is_none() {
+    // Only a WebSocket handshake can't follow a redirect to HTTPS; any other
+    // upgrade (h2c, for one) would otherwise skip it.
+    if redirect_plain && !upgrade.as_ref().is_some_and(is_websocket) {
         return Ok(redirect(&req, &host, settings.port));
     }
     if req.method() == Method::CONNECT && !extended {
@@ -602,16 +924,7 @@ async fn forward(
             html,
         ));
     }
-    // Only a proxy on this machine can have forwarded this request before; a
-    // LAN client's hop count is ignored so it can't force a 508.
-    let hops = req
-        .headers()
-        .get("x-porch-hops")
-        .or_else(|| req.headers().get("x-portless-hops"))
-        .filter(|_| peer.ip().is_loopback())
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0);
+    let hops = hop_count(req.headers(), peer.ip().is_loopback());
     if hops >= 5 {
         return Ok(error(StatusCode::LOOP_DETECTED,"loop_detected","Request passed through Porch too many times. Add changeOrigin: true to your dev server proxy config.",&host,html));
     }
@@ -630,7 +943,7 @@ async fn forward(
     let route = state
         .routes
         .iter()
-        .filter_map(|r| score(&r.name, &hostname, req.uri().path(), &settings).map(|s| (s, r)))
+        .filter_map(|r| score(&r.name, &hostname, &routing).map(|s| (s, r)))
         .max_by_key(|(s, _)| *s)
         .map(|(_, r)| r)
         .or_else(|| {
@@ -693,7 +1006,7 @@ async fn forward(
             ));
         }
         if dashboard_host && !html && peer.ip().is_loopback() {
-            let body = dashboard_json(&settings, false).await.to_string();
+            let body = dashboard_json(&settings, None).await.to_string();
             let mut r = Response::new(
                 Full::new(Bytes::from(body))
                     .map_err(|e: Infallible| match e {})
@@ -813,22 +1126,17 @@ async fn forward(
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or("/");
-    // Dial the address the route records. Only for an app Porch launched on
-    // 127.0.0.1 that turned out to listen on ::1 alone does the proxy use ::1
-    // (an alias never moves: another user could be listening there).
-    let launched = route.is_some_and(|r| r.pid.is_some());
-    let target_authority = match (target.host(), target.port_u16()) {
-        (Some("127.0.0.1"), Some(port))
-            if launched && target.scheme_str() == Some("http") && ipv6_only(port) =>
-        {
-            format!("[::1]:{port}")
-        }
-        _ => target.authority().unwrap().to_string(),
-    };
+    // Dial the address the route records. An app Porch launched on
+    // 127.0.0.1 may listen on [::1] alone; it's dialed there only when
+    // nothing listens on 127.0.0.1 (see `upstream::ToLoopback`). A plain
+    // alias never moves: another user could be listening on the other one.
+    let launched = route.is_some_and(|r| r.pid.is_some())
+        && target.host() == Some("127.0.0.1")
+        && target.scheme_str() == Some("http");
     let uri = format!(
         "{}://{}{}{}",
         target.scheme_str().unwrap_or("http"),
-        target_authority,
+        target.authority().unwrap(),
         target.path().trim_end_matches('/'),
         path
     );
@@ -872,20 +1180,12 @@ async fn forward(
         );
     }
     // Only a client on this machine (another proxy, a tunnel) may set its own
-    // forwarding headers. Anyone else on the LAN could otherwise spoof the
-    // scheme or host the app sees.
-    let trust_forwarded = peer.ip().is_loopback();
-    if !trust_forwarded {
-        for name in [
-            "x-forwarded-for",
-            "x-forwarded-host",
-            "x-forwarded-proto",
-            "x-forwarded-port",
-            "forwarded",
-        ] {
-            req.headers_mut().remove(name);
-        }
+    // forwarding headers. Anyone else on the LAN could otherwise spoof its
+    // address, or the scheme, host or path the app sees.
+    if !peer.ip().is_loopback() {
+        strip_client_forwarding(req.headers_mut());
     }
+    merge_cookies(req.headers_mut());
     let forwarded_for = req
         .headers()
         .get("x-forwarded-for")
@@ -957,13 +1257,17 @@ async fn forward(
         parts,
         if extended {
             empty()
+        } else if peer.ip().is_loopback() {
+            body.map_err(BoxError::from).boxed_unsync()
         } else {
-            body.boxed_unsync()
+            // Another device can't hold the request open by pausing its body.
+            ReadTimeout::new(body, BODY_READ_TIMEOUT).boxed_unsync()
         },
     );
     let sent = match &upstream_spec {
         Some(up) if up.insecure => loopback_insecure.request(req).await,
         Some(_) => loopback.request(req).await,
+        None if launched => loopback.request(req).await,
         None => client.request(req).await,
     };
     match sent {
@@ -990,8 +1294,8 @@ async fn forward(
                 }
                 if let Some(downstream) = downstream {
                     // Upgraded sockets outlive their connection task, so they
-                    // count against their own cap for their whole lifetime.
-                    let Ok(permit) = upgrade_slots().clone().try_acquire_owned() else {
+                    // take their own slot for their whole lifetime.
+                    let Some(slot) = limits.acquire(peer.ip()) else {
                         return Ok(error(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "too_many_websockets",
@@ -1002,11 +1306,14 @@ async fn forward(
                     };
                     let upstream = hyper::upgrade::on(&mut response);
                     tokio::spawn(async move {
-                        let _permit = permit;
+                        let _slot = slot;
                         if let Ok((a, b)) = tokio::try_join!(downstream, upstream) {
                             let mut a = TokioIo::new(a);
                             let mut b = TokioIo::new(b);
-                            tokio::select! { _ = tokio::io::copy_bidirectional(&mut a, &mut b) => {}, _ = stopped.changed() => {} };
+                            tokio::select! {
+                                _ = tokio::io::copy_bidirectional(&mut a, &mut b) => {},
+                                _ = stopped.wait_for(|stop| *stop) => {},
+                            };
                         }
                     });
                 }
@@ -1060,60 +1367,142 @@ async fn forward(
                         }
                     }
                 }
-                // An alias to `http://host/base` serves the backend's `/base` at
-                // the Porch URL's root: drop that prefix from its redirects.
-                let base = target.path().trim_end_matches('/').to_owned();
+                let base = target.path().trim_end_matches('/');
                 let rewritten = response
                     .headers()
                     .get(header::LOCATION)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|l| {
-                        let absolute = crate::upstream::rewrite_location(l, &origins, &public_origin);
-                        let loc = absolute.clone().unwrap_or_else(|| l.to_owned());
-                        let (prefix, path) = if let Some(p) = loc.strip_prefix(&public_origin) {
-                            (public_origin.as_str(), p)
-                        } else if loc.starts_with('/') && !loc.starts_with("//") {
-                            ("", loc.as_str())
-                        } else {
-                            return absolute;
-                        };
-                        match path.strip_prefix(base.as_str()) {
-                            Some(rest)
-                                if !base.is_empty()
-                                    && (rest.is_empty() || rest.starts_with(['/', '?', '#'])) =>
-                            {
-                                let rest = if rest.starts_with('/') { rest.to_owned() } else { format!("/{rest}") };
-                                Some(format!("{prefix}{rest}"))
-                            }
-                            _ => absolute,
-                        }
+                        let absolute =
+                            crate::upstream::rewrite_location(l, &origins, &public_origin);
+                        redirect_location(l, absolute, base, &public_origin)
                     })
                     .and_then(|l| header::HeaderValue::from_str(&l).ok());
                 if let Some(v) = rewritten {
                     response.headers_mut().insert(header::LOCATION, v);
                 }
             }
-            let mut r = response.map(|b| b.boxed_unsync());
+            let mut r = response.map(|b| b.map_err(BoxError::from).boxed_unsync());
             marker(&mut r);
             Ok(r)
         }
-        Err(e) if upstream_spec.as_ref().is_some_and(|u| u.tls) && certificate_error(&e) =>
-        {
-            Ok(error(
-                StatusCode::BAD_GATEWAY,
-                "upstream_certificate",
-                "The app's TLS certificate isn't trusted for this name. Trust its CA, or re-register the alias with --insecure.",
-                &host,
-                html,
-            ))
+        Err(e) => {
+            let (code, kind, message) =
+                upstream_failure(&e, remote_origin.is_none(), upstream_spec.is_some());
+            Ok(error(code, kind, message, &host, html))
         }
-        Err(_) => Ok(error(
+    }
+}
+/// Why a request to the app failed. Only an app on this computer that isn't
+/// listening yet gets the self-reloading "Waiting for the app to start" page.
+/// The messages name no target, since other devices (LAN mode) see them too.
+fn upstream_failure(
+    e: &hyper_util::client::legacy::Error,
+    loopback_target: bool,
+    upstream_alias: bool,
+) -> (StatusCode, &'static str, &'static str) {
+    use std::io::ErrorKind;
+    if chain(e).any(|e| e.is::<BodyReadTimeout>()) {
+        return (
+            StatusCode::REQUEST_TIMEOUT,
+            "request_timeout",
+            "The request body stopped arriving.",
+        );
+    }
+    if certificate_error(e) {
+        return (
+            StatusCode::BAD_GATEWAY,
+            "upstream_certificate",
+            if upstream_alias {
+                "The app's TLS certificate isn't trusted for this name. Trust its CA, or re-register the alias with --insecure."
+            } else {
+                "The site's TLS certificate isn't trusted for its name. Check the alias's URL, or trust the CA that issued the certificate."
+            },
+        );
+    }
+    let gateway = |message| (StatusCode::BAD_GATEWAY, "upstream_error", message);
+    if !e.is_connect() {
+        return gateway("The app closed the connection before sending a complete response. Check its output: it may have crashed.");
+    }
+    match crate::upstream::io_error_kind(e) {
+        Some(ErrorKind::ConnectionRefused) if loopback_target => (
             StatusCode::BAD_GATEWAY,
             "upstream_unavailable",
             "The target app is not accepting connections. Check its output and PORT setting.",
-            &host,
-            html,
-        )),
+        ),
+        Some(ErrorKind::ConnectionRefused) => gateway("The backend refused the connection."),
+        Some(ErrorKind::TimedOut) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream_timeout",
+            "The backend didn't accept the connection in time.",
+        ),
+        _ if chain(e).any(|e| e.to_string().starts_with("dns error")) => {
+            gateway("The backend's hostname could not be resolved.")
+        }
+        _ => gateway("Couldn't connect to the backend."),
+    }
+}
+fn chain<'a>(
+    e: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(e), |e| e.source())
+}
+/// A pause longer than [`BODY_READ_TIMEOUT`] while sending a request body.
+#[derive(Debug)]
+struct BodyReadTimeout;
+impl std::fmt::Display for BodyReadTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request body read timed out")
+    }
+}
+impl std::error::Error for BodyReadTimeout {}
+/// A request body that fails when the client pauses longer than `limit`
+/// between frames while the app is waiting for more.
+struct ReadTimeout<B> {
+    inner: B,
+    limit: Duration,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+impl<B> ReadTimeout<B> {
+    fn new(inner: B, limit: Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            sleep: None,
+        }
+    }
+}
+impl<B> hyper::body::Body for ReadTimeout<B>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        let this = &mut *self;
+        if let Poll::Ready(frame) = Pin::new(&mut this.inner).poll_frame(cx) {
+            this.sleep = None;
+            return Poll::Ready(frame.map(|f| f.map_err(Into::into)));
+        }
+        let limit = this.limit;
+        let sleep = this
+            .sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        if sleep.as_mut().poll(cx).is_ready() {
+            this.sleep = None;
+            return Poll::Ready(Some(Err(Box::new(BodyReadTimeout))));
+        }
+        Poll::Pending
+    }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
     }
 }
 fn listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
@@ -1149,6 +1538,92 @@ fn listen_if_available(
         Err(error) => Err(error),
     }
 }
+/// Requests in flight on one client connection, and when it was last busy.
+struct Activity {
+    state: Mutex<(usize, u64, tokio::time::Instant)>,
+}
+impl Activity {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new((0, 0, tokio::time::Instant::now())),
+        })
+    }
+    fn begin(self: &Arc<Self>) -> InFlight {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.0 += 1;
+        s.1 += 1;
+        InFlight(self.clone())
+    }
+    /// (requests in flight, requests started, last busy)
+    fn snapshot(&self) -> (usize, u64, tokio::time::Instant) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Resolves once the connection has had no request in flight for too
+    /// long: `first` until a request starts, then `after` (never, if `None`).
+    async fn idle(&self, first: Duration, after: Option<Duration>) {
+        loop {
+            let (in_flight, started, last) = self.snapshot();
+            let limit = match (started, after) {
+                (0, _) => first,
+                (_, Some(after)) => after,
+                (_, None) => return std::future::pending().await,
+            };
+            if in_flight == 0 && last.elapsed() >= limit {
+                return;
+            }
+            let wake = if in_flight == 0 {
+                last + limit
+            } else {
+                tokio::time::Instant::now() + limit
+            };
+            tokio::time::sleep_until(wake).await;
+        }
+    }
+}
+/// One request in flight; it ends when its response body is dropped.
+struct InFlight(Arc<Activity>);
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.0 -= 1;
+        s.2 = tokio::time::Instant::now();
+    }
+}
+/// A response body that keeps its request counted as in flight.
+struct Tracked {
+    body: Body,
+    _in_flight: InFlight,
+}
+impl hyper::body::Body for Tracked {
+    type Data = Bytes;
+    type Error = BoxError;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        Pin::new(&mut self.body).poll_frame(cx)
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
+/// Probes a vanished client (LAN mode: a device that left without closing
+/// its connections) so its connection, WebSocket included, is closed.
+fn keepalive(stream: &tokio::net::TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(60));
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    let keepalive = keepalive.with_interval(Duration::from_secs(10));
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
+}
+async fn stop_requested(stopped: &mut tokio::sync::watch::Receiver<bool>) {
+    // A dropped sender means the proxy is gone: stop as well.
+    let _ = stopped.wait_for(|stop| *stop).await;
+}
 async fn listen(
     listener: tokio::net::TcpListener,
     context: ProxyContext,
@@ -1156,8 +1631,13 @@ async fn listen(
     redirect_only: bool,
 ) -> Result<()> {
     let mut connections = tokio::task::JoinSet::new();
+    let mut stopped = context.stopped.clone();
     loop {
-        let accepted = tokio::select! { result=listener.accept()=>result, _=connections.join_next(), if !connections.is_empty()=>continue };
+        let accepted = tokio::select! {
+            result = listener.accept() => result,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
+            _ = stop_requested(&mut stopped) => break,
+        };
         let (stream, peer) = match accepted {
             Ok(connection) => connection,
             Err(e) => {
@@ -1166,57 +1646,143 @@ async fn listen(
                 continue;
             }
         };
-        // Bound the work a flood of (or a LAN full of) idle clients can pin.
-        if connections.len() >= MAX_CONNECTIONS {
-            drop(stream);
+        // Wildcard low-port binding in unprivileged mode still rejects
+        // non-loopback peers, before reading a byte.
+        if !context.settings.lan && !peer.ip().is_loopback() {
             continue;
         }
-        let context = context.clone();
-        let acceptor = acceptor.clone();
-        connections.spawn(async move {
-            // Wildcard low-port binding in unprivileged mode still rejects non-loopback peers.
-            if !context.settings.lan && !peer.ip().is_loopback() {
-                return;
+        // Bound the work a flood of (or a LAN full of) idle clients can pin.
+        let Some(slot) = context.limits.acquire(peer.ip()) else {
+            continue;
+        };
+        keepalive(&stream);
+        connections.spawn(serve_connection(
+            stream,
+            peer,
+            context.clone(),
+            acceptor.clone(),
+            redirect_only,
+            slot,
+        ));
+    }
+    // Stop accepting at once, so a restarted proxy can bind the port, and let
+    // requests in flight finish for a moment.
+    drop(listener);
+    let drained = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        connections.abort_all();
+    }
+    Ok(())
+}
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    context: ProxyContext,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+    redirect_only: bool,
+    _slot: Slot,
+) {
+    let mut stopped = context.stopped.clone();
+    let mut first = [0u8; 1];
+    let tls = if acceptor.is_some() {
+        matches!(tokio::time::timeout(Duration::from_secs(10),stream.peek(&mut first)).await,Ok(Ok(n)) if n>0 && first[0]==0x16)
+    } else {
+        false
+    };
+    let redirect_plain = redirect_only || (acceptor.is_some() && !tls);
+    let io: Box<dyn Io> = match acceptor.filter(|_| tls) {
+        Some(acceptor) => {
+            match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
+                Ok(Ok(stream)) => Box::new(stream),
+                _ => return,
             }
-            let mut first = [0u8; 1];
-            let tls = if acceptor.is_some() {
-                matches!(tokio::time::timeout(Duration::from_secs(10),stream.peek(&mut first)).await,Ok(Ok(n)) if n>0 && first[0]==0x16)
-            } else {
-                false
-            };
-            let redirect_plain = redirect_only || (acceptor.is_some() && !tls);
-            let service = hyper::service::service_fn(move |req| {
-                forward(req,peer,tls,redirect_plain,context.clone())
-            });
-            let mut builder = Builder::new(TokioExecutor::new());
-            // Slow or silent clients can't hold a connection open forever
-            // before sending a full request head.
-            builder
-                .http1()
-                .timer(TokioTimer::new())
-                .header_read_timeout(HEADER_READ_TIMEOUT);
-            builder
-                .http2()
-                .timer(TokioTimer::new())
-                .enable_connect_protocol()
-                .keep_alive_interval(Some(Duration::from_secs(30)))
-                .keep_alive_timeout(Duration::from_secs(20));
-            if tls {
-                if let Some(acceptor) = acceptor {
-                    if let Ok(Ok(stream)) =
-                        tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await
-                    {
-                        let _ = builder
-                            .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                            .await;
-                    }
-                }
-            } else {
-                let _ = builder
-                    .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                    .await;
-            }
-        });
+        }
+        None => Box::new(stream),
+    };
+    let activity = Activity::new();
+    let requests = activity.clone();
+    let service = hyper::service::service_fn(move |req| {
+        let in_flight = requests.begin();
+        let response = forward(req, peer, tls, redirect_plain, context.clone());
+        async move {
+            let response = response.await?;
+            Ok::<_, Infallible>(response.map(|body| Tracked {
+                body,
+                _in_flight: in_flight,
+            }))
+        }
+    });
+    let mut builder = Builder::new(TokioExecutor::new());
+    // Slow or silent clients can't hold a connection open forever
+    // before sending a full request head.
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .enable_connect_protocol()
+        .keep_alive_interval(Some(Duration::from_secs(30)))
+        .keep_alive_timeout(Duration::from_secs(20));
+    let connection = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
+    tokio::pin!(connection);
+    // Every client must start a request soon after connecting. Another device
+    // (LAN mode) also can't keep a connection that is doing nothing, such as
+    // an HTTP/2 connection that only answers pings; long-lived responses
+    // (event streams, WebSockets) count as busy.
+    let idle = activity.idle(
+        HEADER_READ_TIMEOUT,
+        (!peer.ip().is_loopback()).then_some(LAN_IDLE_TIMEOUT),
+    );
+    tokio::select! {
+        _ = connection.as_mut() => return,
+        _ = stop_requested(&mut stopped) => {},
+        _ = idle => {},
+    }
+    // Finish the requests in flight, then close; the listener bounds how long.
+    connection.as_mut().graceful_shutdown();
+    let _ = connection.await;
+}
+/// Run `task` again whenever it fails or ends, logging why and waiting
+/// longer after each quick failure. For helpers (LAN announcements) whose
+/// failure must not take down a healthy proxy.
+async fn supervise<F, Fut>(
+    name: &'static str,
+    mut task: F,
+    first_delay: Duration,
+    max_delay: Duration,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let mut delay = first_delay;
+    loop {
+        let began = tokio::time::Instant::now();
+        let mut run = AbortOnDrop(tokio::spawn(task()));
+        let reason = match (&mut run.0).await {
+            Ok(Ok(())) => "it stopped".to_owned(),
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(e) => format!("it crashed: {e}"),
+        };
+        if began.elapsed() >= max_delay {
+            delay = first_delay;
+        }
+        eprintln!(
+            "Porch {name} failed: {reason}; restarting in {}s",
+            delay.as_secs_f32()
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(max_delay);
+    }
+}
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 /// Retained for embedding and existing callers; an explicit bind selects one interface.
@@ -1238,7 +1804,17 @@ pub async fn serve(
     })
     .await
 }
+/// Serve until a listener fails.
 pub async fn serve_config(settings: ProxySettings) -> Result<()> {
+    serve_until(settings, std::future::pending::<Result<()>>()).await
+}
+/// Serve until a listener fails or `stop` completes. On stop, the proxy closes
+/// its listeners at once and gives requests in flight a few seconds to finish;
+/// then it returns `stop`'s error, if any.
+pub async fn serve_until<T>(
+    settings: ProxySettings,
+    stop: impl Future<Output = Result<T>>,
+) -> Result<()> {
     // Check every interface before opening our own listeners. A listener on an
     // unrelated family/interface must never be mistaken for this proxy.
     drop(crate::sockets::reserve(settings.port).context("proxy port unavailable")?);
@@ -1283,18 +1859,108 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
     let client = Client::builder(TokioExecutor::new()).build::<_, Body>(connector);
     let loopback = crate::upstream::client(tls_config.clone());
     let loopback_insecure = crate::upstream::client(crate::upstream::insecure_tls()?);
-    let binds = if let Some(bind) = &settings.bind {
-        vec![bind.clone()]
-    } else if settings.lan
-        || (settings.unprivileged && settings.port < crate::ports::FIRST_UNPRIVILEGED_PORT)
-    {
-        // Wildcard binds permit unprivileged low ports on macOS; high ports stay on loopback.
-        vec!["0.0.0.0".into(), "::".into()]
-    } else {
-        vec!["127.0.0.1".into(), "::1".into()]
+    let listeners = open_listeners(&settings)?;
+    crate::state::atomic_write(
+        "proxy.hosts-capability",
+        &serde_json::to_vec(&serde_json::json!({
+            "pid": std::process::id(), "writable": crate::integrations::hosts_sync_capable()
+        }))?,
+    )?;
+    let token = Arc::new(crate::integrations::hosts_sync_token()?);
+    let routing = Arc::new(Routing::new(&settings));
+    let settings = Arc::new(settings);
+    let mut tasks = tokio::task::JoinSet::new();
+    let (shutdown, stopped) = tokio::sync::watch::channel(false);
+    let context = ProxyContext {
+        client,
+        loopback,
+        loopback_insecure,
+        settings: settings.clone(),
+        routing,
+        token,
+        // One budget for every listener and WebSocket: each holds two
+        // descriptors (client and app) for as long as it is open.
+        limits: Arc::new(Limits::new(connection_limit())),
+        peers: Arc::new(tokio::sync::Mutex::new(None)),
+        stopped,
     };
+    for (socket, redirect_only) in listeners {
+        tasks.spawn(listen(
+            socket,
+            context.clone(),
+            if redirect_only {
+                None
+            } else {
+                acceptor.clone()
+            },
+            redirect_only,
+        ));
+    }
+    crate::discovery::gateway::start(settings.tlds.clone());
+    crate::state::atomic_write("proxy.ready", std::process::id().to_string().as_bytes())?;
+    // LAN announcements run beside the listeners: if mDNS fails, the proxy
+    // keeps serving and the announcements restart.
+    let _announcements = settings.lan.then(|| {
+        let settings = (*settings).clone();
+        AbortOnDrop(tokio::spawn(supervise(
+            "LAN announcements",
+            move || crate::integrations::lan_watch(settings.clone()),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        )))
+    });
+    let stopped = tokio::select! {
+        ended = tasks.join_next() => match ended {
+            Some(result) => { result??; anyhow::bail!("a proxy listener stopped") }
+            None => anyhow::bail!("proxy has no listeners"),
+        },
+        stopped = stop => stopped,
+    };
+    let _ = shutdown.send(true);
+    // Each listener bounds its own drain; this only backs that up.
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT + Duration::from_secs(1), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    stopped.map(drop)
+}
+/// The proxy's listeners: (listener, serves only the HTTP-to-HTTPS redirect).
+fn open_listeners(settings: &ProxySettings) -> Result<Vec<(tokio::net::TcpListener, bool)>> {
+    let loopback = || vec!["127.0.0.1".to_owned(), "::1".to_owned()];
+    let wildcard = || vec!["0.0.0.0".to_owned(), "::".to_owned()];
+    let low_port = settings.unprivileged && settings.port < crate::ports::FIRST_UNPRIVILEGED_PORT;
+    let choices = if let Some(bind) = &settings.bind {
+        vec![vec![bind.clone()]]
+    } else if settings.lan {
+        vec![wildcard()]
+    } else if low_port {
+        // macOS lets any user bind ports below 1024 on the wildcard address
+        // only. Elsewhere (Linux with a lowered ip_unprivileged_port_start,
+        // Windows) loopback works and keeps the port off the network.
+        vec![loopback(), wildcard()]
+    } else {
+        vec![loopback()]
+    };
+    let last = choices.len() - 1;
+    for (i, binds) in choices.into_iter().enumerate() {
+        match listeners_on(&binds, settings) {
+            Ok(listeners) => return Ok(listeners),
+            Err(e) if i < last && permission_denied(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the last choice returns")
+}
+fn permission_denied(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+}
+fn listeners_on(
+    binds: &[String],
+    settings: &ProxySettings,
+) -> Result<Vec<(tokio::net::TcpListener, bool)>> {
     let mut listeners = Vec::new();
-    for bind in &binds {
+    for bind in binds {
         let ip: std::net::IpAddr = bind.parse().context("--bind must be an IP address")?;
         let Some(primary) =
             listen_if_available(SocketAddr::new(ip, settings.port), settings.bind.is_none())?
@@ -1312,76 +1978,7 @@ pub async fn serve_config(settings: ProxySettings) -> Result<()> {
             }
         }
     }
-    crate::state::atomic_write(
-        "proxy.hosts-capability",
-        &serde_json::to_vec(&serde_json::json!({
-            "pid": std::process::id(), "writable": crate::integrations::hosts_sync_capable()
-        }))?,
-    )?;
-    let token = Arc::new(crate::integrations::hosts_sync_token()?);
-    let settings = Arc::new(settings);
-    let mut tasks = tokio::task::JoinSet::new();
-    let (_shutdown, stopped) = tokio::sync::watch::channel(false);
-    let context = ProxyContext {
-        client,
-        loopback,
-        loopback_insecure,
-        settings: settings.clone(),
-        token,
-        stopped,
-    };
-    for (socket, redirect_only) in listeners {
-        tasks.spawn(listen(
-            socket,
-            context.clone(),
-            if redirect_only {
-                None
-            } else {
-                acceptor.clone()
-            },
-            redirect_only,
-        ));
-    }
-    crate::discovery::gateway::start(settings.tlds.clone());
-    crate::state::atomic_write("proxy.ready", std::process::id().to_string().as_bytes())?;
-    if settings.lan {
-        let settings = (*settings).clone();
-        tasks.spawn(crate::integrations::lan_watch(settings));
-    }
-    match tasks.join_next().await {
-        Some(result) => result??,
-        None => anyhow::bail!("proxy has no listeners"),
-    };
-    Ok(())
-}
-/// Open upgraded (WebSocket) connections across all listeners.
-fn upgrade_slots() -> &'static Arc<tokio::sync::Semaphore> {
-    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)))
-}
-/// Is a launched app on `port` reachable on ::1 but not 127.0.0.1? Probed at
-/// most every two seconds per port.
-fn ipv6_only(port: u16) -> bool {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::time::Instant;
-    static SEEN: Mutex<Option<HashMap<u16, (bool, Instant)>>> = Mutex::new(None);
-    if let Ok(mut seen) = SEEN.lock() {
-        if let Some((v6, at)) = seen.get_or_insert_with(HashMap::new).get(&port) {
-            if at.elapsed() < Duration::from_secs(2) {
-                return *v6;
-            }
-        }
-    }
-    let v6 = crate::ports::accepts_ipv6_only(port);
-    if let Ok(mut seen) = SEEN.lock() {
-        let map = seen.get_or_insert_with(HashMap::new);
-        if map.len() > 4096 {
-            map.clear();
-        }
-        map.insert(port, (v6, Instant::now()));
-    }
-    v6
+    Ok(listeners)
 }
 /// Did the upstream TLS handshake fail on the backend's certificate?
 fn certificate_error(e: &(dyn std::error::Error + 'static)) -> bool {
@@ -1412,28 +2009,331 @@ fn certificate_error(e: &(dyn std::error::Error + 'static)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn routing_for(tlds: &[&str], lan: bool, wildcard: bool) -> Routing {
+        Routing::new(&ProxySettings {
+            tlds: tlds.iter().map(|t| (*t).to_owned()).collect(),
+            lan,
+            wildcard,
+            ..ProxySettings::default()
+        })
+    }
     #[test]
     fn routing() {
-        let mut s = ProxySettings {
-            tlds: vec![
-                "example.com".into(),
-                "dev.example.com".into(),
-                "localhost".into(),
-            ],
-            ..ProxySettings::default()
-        };
-        assert!(score("api.web", "api.web.localhost", "/", &s).is_some());
-        assert!(score("app", "app.dev.example.com", "/", &s).is_some());
-        assert!(score("app.dev", "app.dev.example.com", "/", &s).is_none());
-        assert!(score("app.localhost", "app.example.com", "/", &s).is_none());
-        assert!(score("*.example.test", "x.example.test", "/", &s).is_some());
-        assert!(score("app", "x.app.localhost", "/", &s).is_none());
-        s.wildcard = true;
-        assert!(score("app", "x.app.localhost", "/", &s).is_some());
+        let tlds = ["example.com", "dev.example.com", "localhost"];
+        let s = routing_for(&tlds, false, false);
+        assert!(score("api.web", "api.web.localhost", &s).is_some());
+        assert!(score("app", "app.dev.example.com", &s).is_some());
+        assert!(score("app.dev", "app.dev.example.com", &s).is_none());
+        assert!(score("app.localhost", "app.example.com", &s).is_none());
+        assert!(score("app.localhost", "app.localhost", &s).is_some());
+        assert!(score("App", "app.localhost", &s).is_some());
+        assert!(score("app", "x.app.localhost", &s).is_none());
+        assert!(score("app", "app.local", &s).is_none());
+        assert!(score("app", "app.local", &routing_for(&tlds, true, false)).is_some());
+        let s = routing_for(&tlds, false, true);
+        assert!(score("app", "x.app.localhost", &s).is_some());
+        assert!(score("app", "xapp.localhost", &s).is_none());
         assert!(
-            score("api.app", "x.api.app.localhost", "/", &s)
-                > score("app", "x.api.app.localhost", "/", &s)
+            score("api.app", "x.api.app.localhost", &s) > score("app", "x.api.app.localhost", &s)
         );
+        assert!(score("app", "app.localhost", &s) > score("localhost", "app.localhost", &s));
+        // A hand-edited name that isn't ASCII never matches, and never panics.
+        assert!(score("é", "a.localhost", &s).is_none());
+        assert!(score("aé.localhost", "b.localhost", &s).is_none());
+    }
+    #[test]
+    fn longest_tld_wins_for_overlapping_suffixes() {
+        let s = routing_for(&["example.com", "dev.example.com"], false, false);
+        assert_eq!(s.tlds, ["dev.example.com", "example.com"]);
+        // `app.dev.example.com` is app under dev.example.com, not app.dev
+        // under example.com.
+        assert!(score("app", "app.dev.example.com", &s).is_some());
+        assert!(score("app.dev", "app.dev.example.com", &s).is_none());
+    }
+    #[test]
+    fn other_devices_cannot_set_forwarding_headers() {
+        let mut h = header::HeaderMap::new();
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "x-forwarded-scheme",
+            "x-forwarded-ssl",
+            "x-forwarded-server",
+            "forwarded",
+            "x-real-ip",
+            "x-client-ip",
+            "true-client-ip",
+            "x-original-url",
+            "x-original-host",
+            "x-rewrite-url",
+        ] {
+            h.insert(name, "spoofed".parse().unwrap());
+        }
+        h.insert("x-request-id", "kept".parse().unwrap());
+        h.insert("cookie", "kept".parse().unwrap());
+        strip_client_forwarding(&mut h);
+        let mut kept: Vec<_> = h.keys().map(|k| k.as_str()).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["cookie", "x-request-id"]);
+    }
+    #[test]
+    fn split_cookies_are_joined() {
+        let mut h = header::HeaderMap::new();
+        h.append("cookie", "a=1".parse().unwrap());
+        h.append("cookie", "b=2".parse().unwrap());
+        h.append("cookie", "c=3".parse().unwrap());
+        merge_cookies(&mut h);
+        assert_eq!(
+            h.get_all("cookie").iter().collect::<Vec<_>>(),
+            ["a=1; b=2; c=3"]
+        );
+        let mut single = header::HeaderMap::new();
+        single.insert("cookie", "a=1".parse().unwrap());
+        merge_cookies(&mut single);
+        assert_eq!(single["cookie"], "a=1");
+        let mut none = header::HeaderMap::new();
+        merge_cookies(&mut none);
+        assert!(none.is_empty());
+    }
+    #[test]
+    fn hop_counts() {
+        let mut h = header::HeaderMap::new();
+        h.insert("x-porch-hops", "junk".parse().unwrap());
+        h.insert("x-portless-hops", "4".parse().unwrap());
+        assert_eq!(hop_count(&h, true), 4);
+        assert_eq!(hop_count(&h, false), 0);
+        h.insert("x-porch-hops", "2".parse().unwrap());
+        assert_eq!(hop_count(&h, true), 4);
+        h.insert("x-porch-hops", "6".parse().unwrap());
+        assert_eq!(hop_count(&h, true), 6);
+        assert_eq!(hop_count(&header::HeaderMap::new(), true), 0);
+    }
+    #[test]
+    fn only_websockets_skip_the_https_redirect() {
+        for v in ["websocket", "WebSocket", "foo, websocket"] {
+            assert!(is_websocket(&v.parse().unwrap()), "{v}");
+        }
+        for v in ["h2c", "websocketx", "TLS/1.2"] {
+            assert!(!is_websocket(&v.parse().unwrap()), "{v}");
+        }
+    }
+    #[test]
+    fn redirects_drop_the_alias_base_path() {
+        let origin = "http://app.localhost";
+        let loc = |l: &str| redirect_location(l, None, "/base", origin);
+        assert_eq!(loc("/base/login?x=1"), Some("/login?x=1".into()));
+        assert_eq!(loc("/base"), Some("/".into()));
+        assert_eq!(loc("/base?x"), Some("/?x".into()));
+        assert_eq!(loc("/basement"), None);
+        assert_eq!(loc("/other"), None);
+        // Never a protocol-relative URL, which would leave the Porch name.
+        assert_eq!(loc("/base//evil.example/"), Some("/evil.example/".into()));
+        assert_eq!(loc("/base/\\evil.example/"), Some("/evil.example/".into()));
+        assert_eq!(loc("/base///"), Some("/".into()));
+        assert_eq!(loc("//evil.example/"), None);
+        // Rewritten absolute redirects keep the public origin.
+        assert_eq!(
+            redirect_location(
+                "https://backend/base//x",
+                Some(format!("{origin}/base//x")),
+                "/base",
+                origin
+            ),
+            Some(format!("{origin}/x"))
+        );
+        assert_eq!(
+            redirect_location("https://other/", None, "/base", origin),
+            None
+        );
+        // No base: only a rewritten origin changes anything.
+        assert_eq!(redirect_location("/a", None, "", origin), None);
+    }
+    #[test]
+    fn connection_budget_follows_the_descriptor_limit() {
+        assert_eq!(connections_for(64), MIN_CONNECTIONS);
+        assert_eq!(connections_for(256), 96);
+        assert_eq!(connections_for(1024), 448);
+        assert_eq!(connections_for(1 << 20), MAX_CONNECTIONS);
+        assert_eq!(connections_for(u64::MAX), MAX_CONNECTIONS);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_limit_is_raised() {
+        let limit = raise_fd_limit();
+        let mut now = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut now) }, 0);
+        #[allow(clippy::unnecessary_cast)]
+        let (current, hard) = (now.rlim_cur as u64, now.rlim_max as u64);
+        assert_eq!(limit, current);
+        assert!(current >= hard.min(1024), "{current} of {hard}");
+    }
+    #[test]
+    fn one_device_cannot_take_every_slot() {
+        let limits = Limits::new(MIN_CONNECTIONS);
+        let lan: IpAddr = "192.168.1.20".parse().unwrap();
+        let held: Vec<_> = std::iter::from_fn(|| limits.acquire(lan))
+            .take(100)
+            .collect();
+        assert_eq!(held.len(), 4);
+        // Other devices, and this computer, still get slots.
+        let other = limits.acquire("192.168.1.21".parse().unwrap());
+        assert!(other.is_some());
+        let local: Vec<_> = std::iter::from_fn(|| limits.acquire(IpAddr::from([127, 0, 0, 1])))
+            .take(100)
+            .collect();
+        assert_eq!(local.len(), MIN_CONNECTIONS - 5);
+        drop(local);
+        // An IPv6 device is one /64, whatever address it picks.
+        let a = limits.acquire("2001:db8::1".parse().unwrap());
+        let b: Vec<_> = std::iter::from_fn(|| limits.acquire("2001:db8::2:3".parse().unwrap()))
+            .take(10)
+            .collect();
+        assert!(a.is_some());
+        assert_eq!(b.len(), 3);
+        drop(held);
+        assert!(limits.acquire(lan).is_some());
+        drop((a, b));
+        assert_eq!(
+            limits.clients.open.lock().unwrap().len(),
+            1,
+            "released devices are forgotten"
+        );
+    }
+    // Real time, scaled down: tokio's paused clock needs its test-util feature.
+    const TICK: Duration = Duration::from_millis(100);
+    #[tokio::test]
+    async fn idle_connections_time_out_but_busy_ones_do_not() {
+        // No request at all: closed after the first-request deadline.
+        let silent = Activity::new();
+        let start = tokio::time::Instant::now();
+        silent.idle(TICK, None).await;
+        assert!(start.elapsed() >= TICK);
+        // Another device: a request in flight (an event stream) keeps the
+        // connection busy; once it ends, the idle limit applies.
+        let lan = Activity::new();
+        let request = lan.begin();
+        let busy = tokio::time::timeout(TICK * 5, lan.idle(TICK, Some(TICK * 2))).await;
+        assert!(busy.is_err());
+        drop(request);
+        let start = tokio::time::Instant::now();
+        lan.idle(TICK, Some(TICK * 2)).await;
+        assert!(start.elapsed() >= TICK * 2);
+        // This computer: after the first request, never closed for idling.
+        let local = Activity::new();
+        drop(local.begin());
+        let kept = tokio::time::timeout(TICK * 5, local.idle(TICK, None)).await;
+        assert!(kept.is_err());
+    }
+    #[tokio::test]
+    async fn request_bodies_from_other_devices_cannot_stall() {
+        let (sender, rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+        let frames = futures_util::stream::unfold(rx, |mut rx| async move {
+            let data = rx.recv().await?;
+            Some((Ok::<_, Infallible>(hyper::body::Frame::data(data)), rx))
+        });
+        let body = http_body_util::StreamBody::new(Box::pin(frames));
+        let mut body = ReadTimeout::new(body, TICK * 3);
+        sender.send(Bytes::from_static(b"a")).await.unwrap();
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.into_data().unwrap(), "a");
+        // Data that keeps arriving within the limit is fine...
+        let late = sender.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(TICK).await;
+            late.send(Bytes::from_static(b"b")).await.unwrap();
+        });
+        assert!(body.frame().await.unwrap().is_ok());
+        // ...a pause longer than it is not.
+        let start = tokio::time::Instant::now();
+        let e = body.frame().await.unwrap().unwrap_err();
+        assert!(e.is::<BodyReadTimeout>());
+        assert!(start.elapsed() >= TICK * 3);
+        drop(sender);
+    }
+    #[tokio::test]
+    async fn a_failing_helper_is_restarted() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = runs.clone();
+        let (running, mut third) = tokio::sync::mpsc::channel::<()>(1);
+        let supervisor = tokio::spawn(supervise(
+            "test helper",
+            move || {
+                let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let running = running.clone();
+                async move {
+                    match n {
+                        0 => anyhow::bail!("mDNS daemon failed"),
+                        1 => panic!("helper panicked"),
+                        _ => {
+                            let _ = running.send(()).await;
+                            std::future::pending().await
+                        }
+                    }
+                }
+            },
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), third.recv())
+            .await
+            .expect("helper restarted after an error and a panic");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(!supervisor.is_finished());
+        supervisor.abort();
+    }
+    async fn failure_for(port: u16) -> hyper_util::client::legacy::Error {
+        let client = Client::builder(TokioExecutor::new()).build_http::<Body>();
+        let req = Request::builder()
+            .uri(format!("http://127.0.0.1:{port}/"))
+            .body(empty())
+            .unwrap();
+        // Windows takes about two seconds to report a refused connection.
+        tokio::time::timeout(Duration::from_secs(20), client.request(req))
+            .await
+            .unwrap()
+            .unwrap_err()
+    }
+    #[tokio::test]
+    async fn only_a_local_app_that_is_not_listening_gets_the_waiting_page() {
+        // A private port nothing is bound to: connections are refused.
+        let refused = crate::test_support::free_port();
+        let e = failure_for(refused).await;
+        assert_eq!(upstream_failure(&e, true, false).1, "upstream_unavailable");
+        let (code, kind, _) = upstream_failure(&e, false, false);
+        assert_eq!((code, kind), (StatusCode::BAD_GATEWAY, "upstream_error"));
+        // An app that drops the connection mid-request: no auto-reload.
+        let app = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = app.local_addr().unwrap().port();
+        let crash = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let (mut s, _) = app.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf).await;
+        });
+        let e = failure_for(port).await;
+        crash.await.unwrap();
+        let (code, kind, message) = upstream_failure(&e, true, false);
+        assert_eq!((code, kind), (StatusCode::BAD_GATEWAY, "upstream_error"));
+        assert!(message.contains("closed the connection"), "{message}");
+        let page = error(code, kind, message, "app.localhost", true);
+        let html = page.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(!html.contains("http-equiv=\"refresh\""), "{html}");
+        let waiting = error(
+            StatusCode::BAD_GATEWAY,
+            "upstream_unavailable",
+            "x",
+            "app.localhost",
+            true,
+        );
+        let html = waiting.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&html).contains("http-equiv=\"refresh\""));
     }
     #[test]
     fn ipv6_fallback_accepts_only_unavailable_address_family_errors() {

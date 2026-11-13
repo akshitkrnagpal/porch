@@ -16,6 +16,12 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - Porch no longer keeps the private key of a CA it has replaced, and deletes ones older versions kept.
 - A web page that requests made-up `*.localhost` HTTPS names can no longer use up the certificate budget your apps need: names that serve something (routes, the dashboard, apps on paired machines) have their own budget and stay cached.
 - The Tailscale sharing lock no longer sits under a guessable name in a shared `/tmp`, where another user on a Linux machine could create it first and make `--tailscale` fail.
+- Other devices (LAN mode) can no longer set any forwarding header your app might trust: every `X-Forwarded-*` header (including `X-Forwarded-Prefix` and `X-Forwarded-Ssl`), `Forwarded`, `X-Real-IP`, `X-Client-IP`, `True-Client-IP`, `X-Original-*` and `X-Rewrite-URL` are removed.
+- One device on your network can no longer tie up the proxy (LAN mode). Each device gets a share of the connections, connections doing nothing are closed after a minute, a request body that stalls for a minute is cut off, and connections from devices that left the network are detected and closed. Event streams and WebSockets keep working.
+- An alias to a URL with a path (`http://host/base`) could turn a backend redirect to `/base//other.site` into a redirect to another site. Such redirects now stay on the Porch URL.
+- A plain-HTTP request with an `Upgrade` header other than `websocket` (such as `h2c`) no longer skips the redirect to HTTPS.
+- Web pages on other sites can no longer make the dashboard's app list ask every paired machine for its apps.
+- A port below 1024 without sudo is bound on loopback where the OS allows it (Linux, Windows), not on every network interface.
 
 ### Fixed
 - Launch options before `--name` (`-d`, `--detach`, `--private`, `--prefix=…`, `--app-port=…`, `--framework`, `--state-dir`) no longer make Porch treat the command as the app's name, and `porch --private -- --filter=web` passes `--filter=web` to the dev script. `porch web --name api …` is refused instead of quietly ignoring `--name`.
@@ -43,11 +49,20 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - Ending a shared app gives ngrok and cloudflared a moment to close their tunnels before they are killed, without blocking the app's other work.
 - LAN mode keeps announcing your apps when one route can't be announced or the mDNS service hiccups, instead of stopping until the proxy restarts.
 - `porch-login enable` no longer turns off an already enabled menu bar login item when launchd is slow to unload the old one.
+- The proxy no longer runs out of file descriptors after a few hundred connections, which showed up as "Waiting for the app to start" pages and failed requests under load. It raises its open-file limit at start and sizes its connection limit to fit, shared by all its listeners and WebSockets.
+- Stopping or restarting the proxy lets requests in flight finish (for up to three seconds) instead of cutting them off.
+- In LAN mode, a failure in network announcements (mDNS) no longer stops the whole proxy; announcements restart on their own.
+- Browsers that send cookies over HTTP/2 in several fields now reach HTTP/1.1 apps with all their cookies in one `Cookie` header.
+- "Waiting for the app to start" now appears only when an app on this computer isn't listening. A remote alias that can't be reached, a timeout, or an app that crashes mid-request gets an accurate error page that doesn't reload every two seconds, and a remote alias with an untrusted certificate says so.
+- Proxy loops are detected when only one of the two hop-count headers is valid.
+- Checking whether port 80 or 443 is free without sudo no longer opens a listener on it.
 
 ### Improved
 - The proxy no longer reads the process table every 5 seconds when no app is running, nor connects to every app each time.
 - Stopping, replacing and pruning apps check processes without running `ps` for each check, and look for a free app port without blocking other porch commands on `lsof`.
 - Launching in a workspace looks up the Git worktree and the workspace's packages once instead of once per package, and `porch run --detach` doesn't repeat it in the background launcher. A command that exits without handing its port to a daemon no longer runs `lsof` for a second.
+- Requests no longer wait on each other while the proxy re-reads routes or checks whether apps are alive, and route matching does less work per request.
+- An app Porch launched that listens only on IPv6 loopback is reached without a blocking check on every request. An `--upstream` alias moves to IPv6 loopback only when nothing listens on IPv4, never because the app was slow.
 
 ## 0.5.2 (2026-11-14)
 

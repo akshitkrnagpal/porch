@@ -83,8 +83,19 @@ async fn actual_http_tls_h2_ws_streaming_routing_and_redirects() {
     let up = upstream.local_addr().unwrap().port();
     let first_seen = Arc::new(tokio::sync::Notify::new());
     let sse_first_seen = first_seen.clone();
+    let slow_started = Arc::new(tokio::sync::Notify::new());
+    let slow_release = Arc::new(tokio::sync::Notify::new());
+    let (started, release) = (slow_started.clone(), slow_release.clone());
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { "hello" }))
+        .route("/cookie", axum::routing::get(|h: header::HeaderMap| async move {
+            h.get_all("cookie").iter().map(|v| v.to_str().unwrap()).collect::<Vec<_>>().join("|")
+        }))
+        .route("/slow", axum::routing::get(move || { let (started, release) = (started.clone(), release.clone()); async move {
+            started.notify_one();
+            release.notified().await;
+            "slow done"
+        }}))
         .route("/headers", axum::routing::get(|h:header::HeaderMap| async move {
             serde_json::json!({"host":h.get("host").unwrap().to_str().unwrap(),"proto":h.get("x-forwarded-proto").unwrap().to_str().unwrap(),"hops":h.get("x-portless-hops").unwrap().to_str().unwrap(),"porch_hops":h.get("x-porch-hops").unwrap().to_str().unwrap(),"port":h.get("x-forwarded-port").unwrap().to_str().unwrap()}).to_string()
         }))
@@ -397,6 +408,19 @@ with context.wrap_socket(socket.create_connection(('127.0.0.1',int(sys.argv[2]))
                 h2response.into_body().collect().await.unwrap().to_bytes(),
                 "hello"
             );
+            // Browsers split cookies into separate fields over HTTP/2; the
+            // HTTP/1.1 app gets them as one header (RFC 9113 8.2.3).
+            let cookies = Request::builder()
+                .uri(format!("https://app.localhost:{port}/cookie"))
+                .header("cookie", "a=1")
+                .header("cookie", "b=2")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let cookies = sender.send_request(cookies).await.unwrap();
+            assert_eq!(
+                cookies.into_body().collect().await.unwrap().to_bytes(),
+                "a=1; b=2"
+            );
             let mut request = Request::builder()
                 .method("CONNECT")
                 .uri(format!("https://app.localhost:{port}/ws"))
@@ -590,13 +614,64 @@ with context.wrap_socket(socket.create_connection(('127.0.0.1',int(sys.argv[2]))
     }
     proxy.abort();
     let _ = proxy.await;
+    // Stopping the proxy closes its listener at once and lets a request in
+    // flight finish.
+    let port = free_port();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let proxy = tokio::spawn(porch::proxy::serve_until(
+        ProxySettings {
+            port,
+            tls: false,
+            ..ProxySettings::default()
+        },
+        async move {
+            let _ = stopped.await;
+            anyhow::Ok(())
+        },
+    ));
+    ready(port).await;
+    let slow = tokio::spawn(
+        client
+            .get(format!("http://127.0.0.1:{port}/slow"))
+            .header("host", "app.localhost")
+            .send(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), slow_started.notified())
+        .await
+        .expect("slow request reached the app");
+    stop.send(()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_ok()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "listener still open after stop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!proxy.is_finished(), "stopped without draining");
+    slow_release.notify_one();
+    let r = tokio::time::timeout(Duration::from_secs(10), slow)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "slow done");
+    tokio::time::timeout(Duration::from_secs(10), proxy)
+        .await
+        .expect("proxy returned after draining")
+        .unwrap()
+        .unwrap();
     // A supplied certificate/key pair is served and verified without replacing the local CA.
     let pair = rcgen::generate_simple_self_signed(vec!["app.localhost".into()]).unwrap();
     let cert = dir.join("custom.pem");
     let key = dir.join("custom-key.pem");
     std::fs::write(&cert, pair.cert.pem()).unwrap();
     std::fs::write(&key, pair.key_pair.serialize_pem()).unwrap();
-    let port = free_port();
+    // The stopped proxy's port, free again (a test may claim eight ports).
     let proxy = tokio::spawn(porch::proxy::serve_config(ProxySettings {
         port,
         tls: true,

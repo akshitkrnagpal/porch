@@ -587,50 +587,62 @@ fn proxy_and_app_refuse_wildcard_port_collisions() {
 
 #[cfg(unix)]
 #[test]
-fn proxy_recovers_after_accept_fd_exhaustion() {
+fn proxy_stays_within_its_descriptor_limit() {
+    // Two daemons with a soft limit of 64 descriptors and 110 clients that
+    // never finish a request head. With a hard limit of 64 the proxy can't
+    // raise its limit: it serves what fits, sheds the rest without running
+    // out of descriptors, and recovers. With room to raise it, it serves all
+    // of them and still answers a new client.
     let script = r#"
 import os,resource,socket,subprocess,sys,tempfile,time
-with tempfile.TemporaryDirectory(prefix='porch-accept-') as root:
- port=int(sys.argv[2])
- env=os.environ.copy();env.update(PORCH_STATE_DIR=root,PORCH_SYNC_HOSTS='0',PORCH_SKIP_TRUST='1',PORCH_CLEAN_URLS='0')
- def limit():resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
- with open(root+'/log','w+') as log:
-  child=subprocess.Popen([sys.argv[1],'proxy','start','--foreground','--no-tls','--bind','127.0.0.1','--port',str(port)],env=env,stdout=log,stderr=log,preexec_fn=limit)
-  sockets=[]
-  try:
-   deadline=time.monotonic()+10
-   while not os.path.exists(root+'/proxy.ready'):
-    assert child.poll() is None,'proxy exited before ready'
-    assert time.monotonic()<deadline,'proxy never ready'
-    time.sleep(.02)
-   for i in range(110):
-    c=socket.create_connection(('127.0.0.1',port),timeout=2)
-    c.sendall(b'GET / HTTP/1.1\r\n');sockets.append(c)
-   # Hold every connection until the daemon has run out of descriptors.
-   deadline=time.monotonic()+10
-   while True:
-    # A separate handle: seeking `log` would move the daemon's write offset.
-    if 'accept failed' in open(root+'/log').read():break
-    assert child.poll() is None,'accept error terminated daemon'
-    assert time.monotonic()<deadline,'fixture failed to exhaust accept descriptors'
-    time.sleep(.02)
-   for c in sockets:c.close()
+exe,port=sys.argv[1],int(sys.argv[2])
+_,parent_hard=resource.getrlimit(resource.RLIMIT_NOFILE)
+def run(hard):
+ with tempfile.TemporaryDirectory(prefix='porch-fds-') as root:
+  env=os.environ.copy();env.update(PORCH_STATE_DIR=root,PORCH_SYNC_HOSTS='0',PORCH_SKIP_TRUST='1',PORCH_CLEAN_URLS='0')
+  def limit():resource.setrlimit(resource.RLIMIT_NOFILE,(64,hard))
+  def fresh(timeout):
+   with socket.create_connection(('127.0.0.1',port),timeout=timeout) as c:
+    c.sendall(b'GET / HTTP/1.1\r\nHost: unknown.localhost\r\nConnection: close\r\n\r\n')
+    c.settimeout(timeout);return c.recv(4096)
+  with open(root+'/log','w+') as log:
+   child=subprocess.Popen([exe,'proxy','start','--foreground','--no-tls','--bind','127.0.0.1','--port',str(port)],env=env,stdout=log,stderr=log,preexec_fn=limit)
    sockets=[]
-   assert child.poll() is None,'accept error terminated daemon'
-   deadline=time.monotonic()+5
-   while True:
-    try:
-     with socket.create_connection(('127.0.0.1',port),timeout=1) as c:
-      c.sendall(b'GET / HTTP/1.1\r\nHost: unknown.localhost\r\nConnection: close\r\n\r\n')
-      c.settimeout(1);reply=c.recv(4096)
-      if b'404' in reply:break
-    except (OSError,TimeoutError):pass
-    assert time.monotonic()<deadline,'listener did not recover after freeing descriptors'
-  finally:
-   for c in sockets:c.close()
-   if child.poll() is None:child.terminate()
-   try:child.wait(timeout=5)
-   except subprocess.TimeoutExpired:child.kill();child.wait()
+   try:
+    deadline=time.monotonic()+10
+    while not os.path.exists(root+'/proxy.ready'):
+     assert child.poll() is None,'proxy exited before ready'
+     assert time.monotonic()<deadline,'proxy never ready'
+     time.sleep(.02)
+    for i in range(110):
+     c=socket.create_connection(('127.0.0.1',port),timeout=2)
+     c.sendall(b'GET / HTTP/1.1\r\n');sockets.append(c)
+    if hard==64:
+     # Connections are accepted in order: once the last one is shed, the
+     # proxy has handled every one.
+     sockets[-1].settimeout(10)
+     try:assert sockets[-1].recv(1)==b'','connection beyond the cap was served'
+     except ConnectionResetError:pass
+    else:
+     assert b'404' in fresh(5),'no room for a new client'
+    # A separate handle: seeking `log` would move the daemon's write offset.
+    assert 'accept failed' not in open(root+'/log').read(),'proxy ran out of descriptors'
+    assert child.poll() is None,'connection flood terminated daemon'
+    for c in sockets:c.close()
+    sockets=[]
+    deadline=time.monotonic()+5
+    while True:
+     try:
+      if b'404' in fresh(1):break
+     except (OSError,TimeoutError):pass
+     assert time.monotonic()<deadline,'proxy did not recover after the flood'
+   finally:
+    for c in sockets:c.close()
+    if child.poll() is None:child.terminate()
+    try:child.wait(timeout=5)
+    except subprocess.TimeoutExpired:child.kill();child.wait()
+run(64)
+if parent_hard==resource.RLIM_INFINITY or parent_hard>=4096:run(4096)
 "#;
     let out = Command::new("python3")
         .args([

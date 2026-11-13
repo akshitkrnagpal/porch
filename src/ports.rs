@@ -26,12 +26,28 @@ pub const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
 /// enough or the binary has `cap_net_bind_service`. When this holds, Porch
 /// can serve URLs with no port in them (`http://web.localhost`) without
 /// elevation. Root never counts: its proxy would be owned by root.
+///
+/// Asks with [`crate::sockets::probe`], which binds without listening, so the
+/// check never accepts a connection on port 80 or 443. A port held only by
+/// closing connections (TIME_WAIT, right after the proxy restarts) still
+/// counts as bindable: the proxy's own bind reuses it.
 pub fn clean_port_bindable(port: u16) -> bool {
     #[cfg(unix)]
     if unsafe { libc::geteuid() } == 0 {
         return false;
     }
-    crate::sockets::reserve(port).is_ok()
+    match crate::sockets::probe(port) {
+        Ok(()) => true,
+        // Unix checks privilege before conflicts, so this user may bind the
+        // port; it's free once nothing is listening on it. (Windows probes
+        // with a full reservation, which already reuses TIME_WAIT ports, and
+        // reports reserved ports as in use.)
+        #[cfg(unix)]
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            !has_listener(port) && crate::sockets::probe_time_wait(port).is_ok()
+        }
+        Err(_) => false,
+    }
 }
 
 /// Port-free URLs are on unless `PORCH_CLEAN_URLS=0` (or `false`, `off`).
@@ -345,6 +361,26 @@ mod tests {
             assert!(!available(refused));
             assert!(!has_listener(refused));
             assert!(!wait_released(refused, Duration::from_millis(100)));
+        }
+    }
+    #[test]
+    fn clean_port_check_never_listens() {
+        let port = crate::test_support::free_port();
+        assert!(clean_port_bindable(port));
+        // Held by a listener: not bindable.
+        #[cfg(unix)]
+        let (held, _) = crate::test_support::ChildListener::bind("127.0.0.1", port, false).unwrap();
+        #[cfg(not(unix))]
+        let held = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        assert!(!clean_port_bindable(port));
+        drop(held);
+        // Another socket bound there without listening: not bindable, like
+        // a reservation, and the check itself opens no listener.
+        #[cfg(unix)]
+        {
+            let (_bound, refused) = crate::test_support::refused_port();
+            assert!(!clean_port_bindable(refused));
+            assert!(!accepts(refused));
         }
     }
     #[test]
