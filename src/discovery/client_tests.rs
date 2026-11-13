@@ -1242,3 +1242,220 @@ fn cached_peers_follow_every_change_to_the_file() {
     assert!(shared_peers_in(dir.clone()).unwrap().is_empty());
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn peer_supplied_text_cannot_carry_escapes_bidi_or_option_like_ids() {
+    let mut c = fixture_catalog();
+    validate_catalog(&c, "machine-b").unwrap();
+    c.apps[0].remote_access = false;
+    c.apps[0].unavailable_reason = Some("App process is stopped".into());
+    validate_catalog(&c, "machine-b").unwrap();
+    // Terminal escape sequences in a reason that `porch list` prints.
+    c.apps[0].unavailable_reason = Some("\u{1b}]52;c;cHduZWQ=\u{7}".into());
+    assert!(validate_catalog(&c, "machine-b").is_err());
+    c.apps[0].unavailable_reason = Some("x".repeat(513));
+    assert!(validate_catalog(&c, "machine-b").is_err());
+    c.apps[0].unavailable_reason = None;
+    // A right-to-left override makes a name read as something else.
+    c.apps[0].name = "web\u{202E}gpj.exe".into();
+    assert!(validate_catalog(&c, "machine-b").is_err());
+    c.apps[0].name = "web".into();
+    c.machine.name = "mini\u{2066}".into();
+    assert!(validate_catalog(&c, "machine-b").is_err());
+    c.machine.name = "Remote Mac".into();
+    // IDs the tray passes as arguments can't look like options.
+    c.apps[0].id = "--help".into();
+    assert!(validate_catalog(&c, "machine-b").is_err());
+    let mut c = fixture_catalog();
+    c.machine.id = "-machine-b".into();
+    assert!(validate_catalog(&c, "-machine-b").is_err());
+    // Ordinary non-ASCII names are fine.
+    let mut c = fixture_catalog();
+    c.machine.name = "Akshit’s Mac — 東京".into();
+    validate_catalog(&c, "machine-b").unwrap();
+}
+
+fn named(id: &str, name: &str, slug: &str) -> Peer {
+    Peer {
+        machine: Machine {
+            id: id.into(),
+            name: name.into(),
+        },
+        slug: slug.into(),
+        ..fixture_peer("https://10.0.0.2:7463/".into(), "a".repeat(64))
+    }
+}
+fn refreshed(id: &str, name: &str) -> PeerCatalog {
+    PeerCatalog {
+        machine: Machine {
+            id: id.into(),
+            name: name.into(),
+        },
+        slug: String::new(),
+        endpoint: "https://10.0.0.9:7463/".into(),
+        sources: vec![Source::Lan],
+        last_seen: 42,
+        catalog: None,
+        error: None,
+    }
+}
+#[test]
+fn references_resolve_by_id_then_slug_then_name_and_renames_cannot_collide() {
+    let mut all = vec![
+        named("id-mini", "mac-mini", "mac-mini"),
+        named("id-laptop", "laptop", "laptop"),
+    ];
+    // The laptop renames itself to the mini's name, slug and ID in turn: none
+    // is taken, while its address and sources still update.
+    for name in ["Mac-Mini", "mac-mini", "id-mini"] {
+        record_refreshed(&mut all, &[&refreshed("id-laptop", name)]);
+        assert_eq!(all[1].machine.name, "laptop");
+        assert_eq!(all[1].endpoint, "https://10.0.0.9:7463/");
+        assert_eq!(all[1].last_seen, 42);
+    }
+    record_refreshed(&mut all, &[&refreshed("id-laptop", "work laptop")]);
+    assert_eq!(all[1].machine.name, "work laptop");
+    assert_eq!(
+        find_peer_in(&all, "mac-mini").unwrap().machine.id,
+        "id-mini"
+    );
+    // A stored name equal to another machine's slug (from before this check)
+    // still resolves to the slug's owner.
+    all[1].machine.name = "mac-mini".into();
+    assert_eq!(
+        find_peer_in(&all, "mac-mini").unwrap().machine.id,
+        "id-mini"
+    );
+    assert_eq!(
+        find_peer_in(&all, "MAC-MINI").unwrap().machine.id,
+        "id-mini"
+    );
+    // An ID always wins, even over another machine named like it.
+    all[0].machine.name = "id-laptop".into();
+    assert_eq!(
+        find_peer_in(&all, "id-laptop").unwrap().machine.id,
+        "id-laptop"
+    );
+    assert_eq!(
+        find_peer_in(&all, "laptop").unwrap().machine.id,
+        "id-laptop"
+    );
+    assert!(find_peer_in(&all, "nobody").is_err());
+    // Two machines with the same name and no other way to tell: ambiguous.
+    let twins = vec![named("a", "twin", "twin"), named("b", "Twin", "twin-2")];
+    assert_eq!(find_peer_in(&twins, "twin").unwrap().machine.id, "a");
+    let twins = vec![named("a", "dup", "x"), named("b", "dup", "y")];
+    assert!(find_peer_in(&twins, "dup").is_err());
+}
+
+fn hint(id: &str, ip: &str, seen: u64) -> Candidate {
+    Candidate {
+        machine_id: Some(id.into()),
+        name: format!("Porch {id}"),
+        endpoint: format!("https://{ip}:7463/"),
+        source: Source::Lan,
+        last_seen: seen,
+        node: None,
+    }
+}
+#[test]
+fn candidate_cache_bounds_each_address_and_machine_and_keeps_paired_machines() {
+    let mut cache = CandidateCache::default().preferring(["paired".to_owned()]);
+    // One address claimed by many services keeps only a few entries.
+    for i in 0..10 {
+        cache.insert(
+            format!("fake{i}"),
+            vec![hint(&format!("f{i}"), "10.0.0.66", 100)],
+        );
+    }
+    assert_eq!(cache.entries.len(), MAX_ENTRIES_PER_ADDRESS);
+    // One claimed machine ID keeps only its most recent entries.
+    let mut cache = CandidateCache::default();
+    for i in 0..5u8 {
+        cache.insert(
+            format!("svc{i}"),
+            vec![hint("mini", &format!("10.0.1.{i}"), 100 + u64::from(i))],
+        );
+    }
+    let kept: Vec<_> = cache.all().into_iter().map(|c| c.last_seen).collect();
+    assert_eq!(kept.len(), MAX_ENTRIES_PER_MACHINE);
+    assert!(kept.contains(&104) && kept.contains(&103), "{kept:?}");
+    // A full cache still takes a paired machine's hint, and a newer one.
+    let mut cache = CandidateCache::default().preferring(["paired".to_owned()]);
+    for i in 0..MAX_CANDIDATES {
+        let ip = format!("10.{}.{}.1", i / 200, i % 200);
+        cache.insert(format!("fake{i}"), vec![hint(&format!("f{i}"), &ip, 100)]);
+    }
+    assert_eq!(cache.entries.len(), MAX_CANDIDATES);
+    cache.insert("real".into(), vec![hint("paired", "192.168.1.20", 100)]);
+    assert!(cache.entries.contains_key("real"));
+    cache.insert("stale".into(), vec![hint("other", "192.168.1.21", 100)]);
+    assert!(
+        !cache.entries.contains_key("stale"),
+        "no older entry to replace"
+    );
+    cache.insert("fresh".into(), vec![hint("other", "192.168.1.21", 101)]);
+    assert!(cache.entries.contains_key("fresh"));
+    assert!(cache.entries.contains_key("real"));
+    assert_eq!(cache.entries.len(), MAX_CANDIDATES);
+}
+#[test]
+fn a_peer_is_tried_at_its_address_then_its_freshest_hints() {
+    let peer = fixture_peer("https://10.0.0.2:7463/".into(), "a".repeat(64));
+    let id = peer.machine.id.clone();
+    let mut candidates: Vec<_> = (0..10u8)
+        .map(|i| hint("someone-else", &format!("10.0.3.{i}"), 500))
+        .collect();
+    candidates.push(hint(&id, "10.0.0.7", 100));
+    candidates.push(hint(&id, "10.0.0.8", 300));
+    candidates.push(Candidate {
+        machine_id: None,
+        source: Source::Tailscale,
+        ..hint("", "100.64.0.2", 900)
+    });
+    let endpoints: Vec<_> = peer_endpoints(&peer, &candidates)
+        .into_iter()
+        .map(|(e, _)| e)
+        .collect();
+    assert_eq!(
+        endpoints,
+        [
+            "https://10.0.0.2:7463/",
+            "https://10.0.0.8:7463/",
+            "https://10.0.0.7:7463/",
+            "https://100.64.0.2:7463/"
+        ]
+    );
+}
+#[test]
+fn a_paired_machine_is_replaced_only_by_itself() {
+    let dir = std::env::temp_dir().join(format!(
+        "porch-identity-{}",
+        super::super::server::random().unwrap()
+    ));
+    let mini = named("id-mini", "mac-mini", "");
+    upsert_peer_in(&dir, mini.clone()).unwrap();
+    // Same ID, other certificate: refused, and nothing changes.
+    let impostor = Peer {
+        fingerprint: "b".repeat(64),
+        endpoint: "https://10.0.0.66:7463/".into(),
+        ..mini.clone()
+    };
+    let e = upsert_peer_in(&dir, impostor).unwrap_err();
+    assert!(e.is::<IdentityConflict>(), "{e:#}");
+    let stored = peers_in(&dir).unwrap();
+    assert_eq!(stored[0].endpoint, mini.endpoint);
+    assert_eq!(stored[0].fingerprint, mini.fingerprint);
+    // The same machine (same certificate, colons and case aside) re-pairs.
+    let again = Peer {
+        fingerprint: "A".repeat(64),
+        token: "z".repeat(64),
+        ..mini
+    };
+    upsert_peer_in(&dir, again).unwrap();
+    let stored = peers_in(&dir).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].token, "z".repeat(64));
+    assert_eq!(stored[0].slug, "mac-mini");
+    let _ = fs::remove_dir_all(dir);
+}

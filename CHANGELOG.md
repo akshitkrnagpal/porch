@@ -22,6 +22,16 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - A plain-HTTP request with an `Upgrade` header other than `websocket` (such as `h2c`) no longer skips the redirect to HTTPS.
 - Web pages on other sites can no longer make the dashboard's app list ask every paired machine for its apps.
 - A port below 1024 without sudo is bound on loopback where the OS allows it (Linux, Windows), not on every network interface.
+- `porch unpair` now revokes a machine's access when the two machines were enrolled with `porch peers add` and a pair token. Before, only code-paired machines were revoked, even though `unpair` reported success. Machines enrolled by Porch 0.5.2 or earlier aren't recorded against their credential, so `porch unpair` now says it can't tell which credential is theirs and points to `porch discovery revoke`, instead of claiming their access is revoked.
+- A machine pairing with this one can no longer take over the identity, URL and browser cookies of a machine that is already paired by claiming its ID. Pairing is refused unless it's the same machine (the same certificate), with a message to run `porch unpair` first if that machine was reinstalled. The joining machine also refuses a machine that claims to be itself.
+- The five-wrong-codes limit now holds when many guesses arrive at once. Before, a device on the network that started several pairing attempts in parallel could test up to sixteen codes instead of five.
+- Devices on your network can no longer lock paired machines out of the discovery agent by holding its connections open. Each address gets only a few connections until it authenticates, connections that never authenticate are closed when idle, and addresses of paired machines keep their headroom. The agent also accepts more connections (256).
+- Apps opened from a paired machine no longer receive `X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `X-Original-*` or similar headers that the other machine supplied. The agent sets `X-Forwarded-For`, `-Host`, `-Proto` and `-Port` itself.
+- Names and status messages from a paired machine can't carry terminal escape sequences or invisible right-to-left and zero-width characters, and machine and app IDs can't start with `-`.
+- A paired machine can no longer rename itself to another paired machine's name. `--peer` and `porch unpair` look a machine up by its ID first, then its URL name, then its name.
+- Abandoned pairing attempts can no longer fill the agent's table and block pairing: each address keeps only its newest two, and the oldest gives way when the table is full. Devices from more than 4,096 addresses no longer lock everyone out of pairing.
+- `porch pair CODE` reads at most 4 KB of an error reply, so a machine answering on the network can't stream a large body into it.
+- LAN discovery hints can't crowd out real machines: each advertised address and machine ID is limited to a few entries, a paired machine's hints displace others when the cache is full, and a paired machine's possible addresses are tried in parallel rather than one after another.
 
 ### Fixed
 - Launch options before `--name` (`-d`, `--detach`, `--private`, `--prefix=…`, `--app-port=…`, `--framework`, `--state-dir`) no longer make Porch treat the command as the app's name, and `porch --private -- --filter=web` passes `--filter=web` to the dev script. `porch web --name api …` is refused instead of quietly ignoring `--name`.
@@ -69,6 +79,9 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - `porch discovery relay` keeps running after a transient error accepting a connection.
 - A connection left over from a refused WebSocket upgrade no longer holds one of the paired machine's connection slots.
 - Start at login (`porch discovery autostart`) records the link you run Porch through (a Nix profile, `~/.local/bin`) rather than the versioned file behind it, so upgrades don't break it. `autostart status` reports when the recorded program is gone. On Linux a state directory containing `$` is passed correctly. On macOS, enabling again waits for the old agent to unload instead of failing; a failed enable no longer leaves a startup file that says it's on; the LaunchAgent is always written with mode 0644.
+- The discovery agent kept running when accepting a connection failed (for example when it ran out of file descriptors). Before, one failed accept stopped it. It also raises its open-file limit on macOS and Linux.
+- On Windows, pairing attempts in the first minute after boot could make the agent refuse every later pairing attempt until it restarted.
+- The discovery agent no longer rewrites and syncs a state file each time it reads the machine's identity, which every app list did twice.
 
 ### Improved
 - The proxy no longer reads the process table every 5 seconds when no app is running, nor connects to every app each time.

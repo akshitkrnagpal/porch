@@ -106,6 +106,10 @@ pub struct ServerConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PairRequest {
     pub token: String,
+    /// The enrolling machine, so `porch unpair` there can revoke exactly its
+    /// credential. Porch 0.5.2 and earlier don't send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<Machine>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PairResponse {
@@ -195,7 +199,8 @@ pub struct PairStatusReport {
     pub version: u32,
     pub id: String,
     pub state: PairState,
-    /// Why a code was cancelled: `user`, `too_many_failures` or `host_full`.
+    /// Why a code was cancelled: `user`, `too_many_failures`, `host_full` or
+    /// `already_paired`.
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
@@ -225,7 +230,8 @@ pub struct JoinCandidate {
 }
 /// Why `porch pair CODE` failed. `code` is stable for scripts and the tray:
 /// wrong_code, not_waiting, rate_limited, certificate_mismatch, host_full,
-/// no_host, multiple_hosts, unreachable, invalid_code, protocol, local.
+/// already_paired, no_host, multiple_hosts, unreachable, invalid_code,
+/// protocol, local.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JoinFailure {
     pub code: String,

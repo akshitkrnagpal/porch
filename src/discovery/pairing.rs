@@ -163,6 +163,11 @@ pub fn failure(code: &str) -> JoinFailure {
             "The other machine couldn't save this pairing. Remove an unused machine there.",
             false,
         ),
+        "already_paired" => (
+            code,
+            "A different machine is already paired under the same ID. Unpair the old one, then pair again.",
+            false,
+        ),
         "no_host" => (
             code,
             "No machine is showing a code. Show one there first, or enter its address.",
@@ -596,7 +601,7 @@ fn select_target(
 /// Map a refused `/v1/pair-code` response. Status first: older agents send plain text.
 async fn refused(response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    let text = String::from_utf8_lossy(&error_body(response).await).into_owned();
     let structured = serde_json::from_str::<PairCodeError>(&text).ok();
     let detail: String = match &structured {
         Some(e) => e.error.message.clone(),
@@ -612,6 +617,7 @@ async fn refused(response: reqwest::Response) -> anyhow::Error {
         429 => "rate_limited",
         409 => match structured.as_ref().map(|e| e.error.code.as_str()) {
             Some("host_full") => "host_full",
+            Some("already_paired") => "already_paired",
             None if !detail.contains("certificate") => "host_full",
             // Anything else about the host's identity stops pairing, no bypass.
             _ => "certificate_mismatch",
@@ -626,6 +632,23 @@ async fn refused(response: reqwest::Response) -> anyhow::Error {
             detail
         },
     )
+}
+
+/// An error reply is at most a short JSON message. Read no more than that, so
+/// whatever answered can't stream a large body into `porch pair CODE`.
+const MAX_ERROR_BODY: usize = 4 * 1024;
+async fn error_body(response: reqwest::Response) -> Vec<u8> {
+    use futures_util::StreamExt;
+    let mut out = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(Ok(chunk)) = chunks.next().await {
+        let room = MAX_ERROR_BODY - out.len();
+        out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if out.len() >= MAX_ERROR_BODY {
+            break;
+        }
+    }
+    out
 }
 
 /// Read a successful JSON reply from a pairing step, or map the refusal.
@@ -704,12 +727,13 @@ async fn join_one(
             client::endpoint(ip, config.port).context("invalid local agent address")?;
         let machine = server::identity()?;
         let fingerprint = server::fingerprint()?;
-        let bearer = server::mint_client("pending")?;
+        let bearer = server::mint_client(server::PENDING_LABEL)?;
         anyhow::Ok((own_endpoint, machine, fingerprint, bearer))
     }
     .await;
     let (own_endpoint, machine, fingerprint, bearer) =
         prepared.map_err(|e| fail("local", format!("{e:#}")))?;
+    let own_id = machine.id.clone();
     let result = async {
         let request = PairFinish {
             session: started.session,
@@ -740,26 +764,37 @@ async fn join_one(
         if !key.check_host_payload(&response.machine, &response.token, &response.mac) {
             return Err(fail("protocol", "pairing response failed authentication"));
         }
-        // The host accepted the code: from here on, store both sides.
-        server::label_client(&bearer, &response.machine.id)?;
         let mut sources = vec![Source::Explicit];
         if !sources.contains(&source) {
             sources.push(source);
         }
+        let peer = Peer {
+            machine: response.machine,
+            endpoint: endpoint.into(),
+            fingerprint: pin.into(),
+            token: response.token,
+            sources,
+            last_seen: server::now(),
+            slug: String::new(),
+        };
         crate::state::load()?;
-        client::upsert_peer_in(
-            &crate::state::dir(),
-            Peer {
-                machine: response.machine,
-                endpoint: endpoint.into(),
-                fingerprint: pin.into(),
-                token: response.token,
-                sources,
-                last_seen: server::now(),
-                slug: String::new(),
-            },
-        )
-        .map_err(|e| fail("protocol", format!("{e:#}")))
+        let paired = client::peers_in(&crate::state::dir()).unwrap_or_default();
+        if let Some(e) = refuse_host(&own_id, &paired, &peer) {
+            // It already stored this machine: have it forget it again.
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), client::unpair_remote(&peer)).await;
+            return Err(e);
+        }
+        // The host accepted the code: from here on, store both sides.
+        server::label_client(&bearer, &peer.machine.id)?;
+        client::upsert_peer_in(&crate::state::dir(), peer).map_err(|e| {
+            let code = if e.is::<client::IdentityConflict>() {
+                "already_paired"
+            } else {
+                "protocol"
+            };
+            fail(code, format!("{e:#}"))
+        })
     }
     .await;
     let peer = match result {
@@ -780,30 +815,50 @@ async fn join_one(
     Ok(peer)
 }
 
+pub struct Unpaired {
+    pub peer: Peer,
+    /// Why the other machine was not reached, if it wasn't.
+    pub unreached: Option<String>,
+    /// No credential here is recorded as the other machine's, but some aren't
+    /// recorded as anyone's, so it may still have access.
+    pub access_unknown: bool,
+}
+/// The host knows the code, but its identity is only its word: it can't be
+/// this machine, or take over another paired machine's.
+fn refuse_host(own_id: &str, paired: &[Peer], host: &Peer) -> Option<anyhow::Error> {
+    if host.machine.id == own_id {
+        return Some(fail(
+            "protocol",
+            format!(
+                "{} claims this machine's own ID",
+                host.endpoint.trim_end_matches('/')
+            ),
+        ));
+    }
+    client::identity_conflict(paired, &host.machine.id, &host.fingerprint)
+        .map(|c| fail("already_paired", c.to_string()))
+}
+
 /// Forget a machine: revoke its access here first, then tell it (best effort,
-/// five seconds). Returns why the other machine was not reached, if it wasn't.
-pub async fn unpair(reference: &str) -> Result<(Peer, Option<String>)> {
+/// five seconds).
+pub async fn unpair(reference: &str) -> Result<Unpaired> {
     let peer = client::find_peer(reference)?;
-    server::revoke_machine(&peer.machine.id)?;
+    let revoked = server::revoke_machine(&peer.machine.id)?;
     super::disconnect_peer(&peer.machine.id).await?;
     client::remove_peer(&peer.machine.id)?;
-    let remote = async {
-        client::http_client(&peer.fingerprint)?
-            .post(format!("{}v1/unpair", peer.endpoint))
-            .bearer_auth(&peer.token)
-            .send()
-            .await?
-            .error_for_status()?;
-        anyhow::Ok(())
-    };
-    let unreached = match tokio::time::timeout(Duration::from_secs(5), remote).await {
-        Ok(Ok(())) => None,
-        // The alternate form includes the cause (timeout, refused, reset),
-        // which reqwest's own message omits.
-        Ok(Err(e)) => Some(format!("{e:#}")),
-        Err(_) => Some("no answer within 5 seconds".into()),
-    };
-    Ok((peer, unreached))
+    let unreached =
+        match tokio::time::timeout(Duration::from_secs(5), client::unpair_remote(&peer)).await {
+            Ok(Ok(())) => None,
+            // The alternate form includes the cause (timeout, refused, reset),
+            // which reqwest's own message omits.
+            Ok(Err(e)) => Some(format!("{e:#}")),
+            Err(_) => Some("no answer within 5 seconds".into()),
+        };
+    Ok(Unpaired {
+        peer,
+        unreached,
+        access_unknown: revoked.revoked == 0 && revoked.unidentified > 0,
+    })
 }
 
 /// The browser URL template for a paired machine's apps.
@@ -947,6 +1002,63 @@ mod tests {
         let down = code_of(down.unwrap_err());
         assert_eq!(down.code, "unreachable");
         assert!(down.retry);
+    }
+    fn host(id: &str, pin: char) -> Peer {
+        Peer {
+            machine: Machine {
+                id: id.into(),
+                name: "mini".into(),
+            },
+            endpoint: "https://10.0.0.2:7463/".into(),
+            fingerprint: pin.to_string().repeat(64),
+            token: "t".repeat(64),
+            sources: vec![Source::Explicit],
+            last_seen: 0,
+            slug: "mini".into(),
+        }
+    }
+    #[test]
+    fn a_host_cannot_claim_this_machine_or_another_paired_one() {
+        let paired = vec![host("mini-id", 'a')];
+        // Claiming the joiner's own ID.
+        let e = refuse_host("me", &paired, &host("me", 'b')).unwrap();
+        assert_eq!(code_of(e).code, "protocol");
+        // Claiming a paired machine's ID with another certificate.
+        let e = refuse_host("me", &paired, &host("mini-id", 'b')).unwrap();
+        let e = code_of(e);
+        assert_eq!(e.code, "already_paired");
+        assert!(e.detail.unwrap().contains("porch unpair mini-id"));
+        // The same machine pairing again, or a new one, is fine.
+        assert!(refuse_host("me", &paired, &host("mini-id", 'a')).is_none());
+        assert!(refuse_host("me", &paired, &host("new-id", 'b')).is_none());
+    }
+    #[tokio::test]
+    async fn refusals_read_a_bounded_body() {
+        let huge = format!(
+            r#"{{"error":{{"code":"host_full","message":"{}"}}}}"#,
+            "x".repeat(1024 * 1024)
+        );
+        let response: reqwest::Response = hyper::http::Response::builder()
+            .status(409)
+            .body(huge.clone())
+            .unwrap()
+            .into();
+        assert_eq!(error_body(response).await.len(), MAX_ERROR_BODY);
+        // Too long to parse, so mapped by status, with a short detail.
+        let response: reqwest::Response = hyper::http::Response::builder()
+            .status(429)
+            .body(huge)
+            .unwrap()
+            .into();
+        let e = code_of(refused(response).await);
+        assert_eq!(e.code, "rate_limited");
+        assert!(e.detail.unwrap().len() <= 200);
+        let ok: reqwest::Response = hyper::http::Response::builder()
+            .status(409)
+            .body(r#"{"error":{"code":"already_paired","message":"m"}}"#.to_owned())
+            .unwrap()
+            .into();
+        assert_eq!(code_of(refused(ok).await).code, "already_paired");
     }
     #[test]
     fn codes_are_normalized_and_failures_have_stable_codes() {

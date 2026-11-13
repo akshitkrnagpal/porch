@@ -336,19 +336,57 @@ pub(super) async fn bounded_json<T: DeserializeOwned>(response: reqwest::Respons
     }
     serde_json::from_slice(&data).context("invalid peer protocol response")
 }
+/// Machine and app IDs. They never start with `-`, so a tool passing one as a
+/// command-line argument can't have it read as an option.
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
+        && !id.starts_with('-')
         && id
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
-pub(super) fn validate_machine(machine: &Machine) -> Result<()> {
-    if !valid_id(&machine.id)
+/// Invisible formatting characters: bidirectional overrides and isolates
+/// (which can make a name read differently from what it is), zero-width
+/// characters and other Unicode format controls.
+pub(super) fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
+}
+/// Text a peer supplies that Porch prints: no control characters (terminal
+/// escape sequences) and no invisible formatting characters.
+pub(super) fn printable(text: &str, max: usize) -> bool {
+    text.len() <= max && !text.chars().any(|c| c.is_control() || is_format_char(c))
+}
+/// The rules a stored peer was accepted under. Identities from paired machines
+/// are checked more strictly as they arrive (`validate_machine`).
+fn validate_stored_machine(machine: &Machine) -> Result<()> {
+    if machine.id.is_empty()
+        || machine.id.len() > 128
+        || !machine
+            .id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
         || machine.name.is_empty()
         || machine.name.len() > 256
         || machine.name.chars().any(char::is_control)
     {
+        bail!("invalid peer machine identity");
+    }
+    Ok(())
+}
+pub(super) fn validate_machine(machine: &Machine) -> Result<()> {
+    if !valid_id(&machine.id) || machine.name.is_empty() || !printable(&machine.name, 256) {
         bail!("invalid peer machine identity");
     }
     Ok(())
@@ -366,10 +404,16 @@ fn validate_catalog(catalog: &Catalog, expected_id: &str) -> Result<()> {
         if !valid_id(&app.id)
             || !ids.insert(&app.id)
             || app.name.is_empty()
-            || app.name.len() > 512
-            || app.name.chars().any(char::is_control)
+            || !printable(&app.name, 512)
         {
             bail!("invalid or duplicate peer app identity");
+        }
+        if app
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|r| !printable(r, 512))
+        {
+            bail!("invalid app status in peer catalog");
         }
         let u = Url::parse(&app.local_url).context("invalid app URL in peer catalog")?;
         if !matches!(u.scheme(), "http" | "https")
@@ -509,7 +553,9 @@ pub(super) fn peers_in(dir: &std::path::Path) -> Result<Vec<Peer>> {
     for p in &mut peers {
         p.endpoint = normalize_endpoint(&p.endpoint)?;
         normalize_pin(&p.fingerprint)?;
-        validate_machine(&p.machine)?;
+        // Stored by an earlier version under its rules; refusing it now would
+        // make every peer command fail.
+        validate_stored_machine(&p.machine)?;
         if p.token.len() < 32
             || p.token.len() > 512
             || !p
@@ -549,11 +595,48 @@ fn update_peers_in(
     assign_slugs(&mut all);
     super::server::write(dir, PEERS_FILE, &serde_json::to_vec_pretty(&all)?)
 }
-/// Insert or replace a peer by machine ID, keeping an existing slug.
+/// A machine claims the ID of a paired machine but presents another
+/// certificate. Machine IDs are public (mDNS advertises them), so this is
+/// either that machine reinstalled or another one impersonating it.
+#[derive(Debug)]
+pub struct IdentityConflict {
+    pub existing: Machine,
+}
+impl std::fmt::Display for IdentityConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({}) is already paired with a different certificate. If it was reinstalled, run `porch unpair {}` first, then pair again; otherwise another machine is claiming its identity",
+            self.existing.name, self.existing.id, self.existing.id
+        )
+    }
+}
+impl std::error::Error for IdentityConflict {}
+/// The stored peer `id` is pinned to a certificate other than `fingerprint`.
+pub(super) fn identity_conflict(
+    all: &[Peer],
+    id: &str,
+    fingerprint: &str,
+) -> Option<IdentityConflict> {
+    let old = all.iter().find(|p| p.machine.id == id)?;
+    let same = normalize_pin(&old.fingerprint)
+        .ok()
+        .zip(normalize_pin(fingerprint).ok())
+        .is_some_and(|(a, b)| a == b);
+    (!same).then(|| IdentityConflict {
+        existing: old.machine.clone(),
+    })
+}
+/// Insert or replace a peer by machine ID, keeping an existing slug. A stored
+/// peer is only replaced by the same machine (the same pinned certificate);
+/// anything else is an `IdentityConflict`, so it can't take over its URL.
 pub(super) fn upsert_peer_in(dir: &std::path::Path, mut peer: Peer) -> Result<Peer> {
     peer.endpoint = normalize_endpoint(&peer.endpoint)?;
     let mut stored = None;
     update_peers_in(dir, |all| {
+        if let Some(conflict) = identity_conflict(all, &peer.machine.id, &peer.fingerprint) {
+            return Err(conflict.into());
+        }
         if let Some(old) = all.iter_mut().find(|p| p.machine.id == peer.machine.id) {
             peer.slug = old.slug.clone();
             *old = peer.clone();
@@ -576,23 +659,30 @@ pub(super) fn remove_peer_in(dir: &std::path::Path, id: &str) -> Result<()> {
         Ok(())
     })
 }
-/// Resolve a user-supplied machine reference: ID, exact name or URL slug.
+/// Resolve a user-supplied machine reference: its ID, then its URL slug, then
+/// its name. IDs and slugs never change once paired, so a paired machine that
+/// renames itself can't take over another one's reference.
 pub fn find_peer(reference: &str) -> Result<Peer> {
-    let all = peers()?;
+    find_peer_in(&peers()?, reference)
+}
+pub(super) fn find_peer_in(all: &[Peer], reference: &str) -> Result<Peer> {
     let wanted = reference.to_ascii_lowercase();
-    let matches: Vec<_> = all
-        .iter()
-        .filter(|p| {
-            p.machine.id == reference
-                || p.machine.name.eq_ignore_ascii_case(reference)
-                || p.slug == wanted
-        })
-        .collect();
-    match matches.as_slice() {
-        [one] => Ok((*one).clone()),
-        [] => bail!("no paired machine named {reference}; see porch peers list"),
-        _ => bail!("{reference} matches several paired machines; use its ID from porch peers list"),
+    let rules: [&dyn Fn(&Peer) -> bool; 3] = [
+        &|p| p.machine.id == reference,
+        &|p| p.slug == wanted,
+        &|p| p.machine.name.eq_ignore_ascii_case(reference),
+    ];
+    for rule in rules {
+        let matches: Vec<_> = all.iter().filter(|p| rule(p)).collect();
+        match matches.as_slice() {
+            [] => continue,
+            [one] => return Ok((*one).clone()),
+            _ => bail!(
+                "{reference} matches several paired machines; use its ID from porch peers list"
+            ),
+        }
     }
+    bail!("no paired machine named {reference}; see porch peers list")
 }
 pub fn remove_peer(id: &str) -> Result<()> {
     update_peers(|all| {
@@ -621,6 +711,7 @@ pub async fn pair(endpoint: &str, fingerprint: &str, token: &str) -> Result<Peer
         .post(format!("{endpoint}v1/pair"))
         .json(&PairRequest {
             token: token.into(),
+            machine: Some(super::server::identity()?),
         })
         .send()
         .await
@@ -639,6 +730,9 @@ pub async fn pair(endpoint: &str, fingerprint: &str, token: &str) -> Result<Peer
     {
         bail!("invalid enrollment response token");
     }
+    if response.machine.id == super::server::identity()?.id {
+        bail!("that machine claims to be this one; check the address and fingerprint");
+    }
     let peer = Peer {
         machine: response.machine,
         endpoint,
@@ -649,7 +743,24 @@ pub async fn pair(endpoint: &str, fingerprint: &str, token: &str) -> Result<Peer
         slug: String::new(),
     };
     crate::state::load()?;
-    upsert_peer_in(&crate::state::dir(), peer)
+    match upsert_peer_in(&crate::state::dir(), peer.clone()) {
+        Ok(peer) => Ok(peer),
+        Err(e) => {
+            // Not stored here: hand back the credential it just issued.
+            let _ = tokio::time::timeout(Duration::from_secs(5), unpair_remote(&peer)).await;
+            Err(e)
+        }
+    }
+}
+/// Ask a machine to revoke the credential `peer.token` and forget this one.
+pub(super) async fn unpair_remote(peer: &Peer) -> Result<()> {
+    http_client(&peer.fingerprint)?
+        .post(format!("{}v1/unpair", peer.endpoint))
+        .bearer_auth(&peer.token)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 pub(super) async fn fetch_catalog(peer: &Peer, endpoint: &str) -> Result<Catalog> {
     if let Some(shared) = super::gateway::fetch_shared(peer, endpoint).await {
@@ -704,11 +815,48 @@ pub(super) async fn relay_catalog(peer: &Peer, client: &RelayClient) -> Result<C
         .context("peer catalog request timed out")?
 }
 
+/// Discovery hints are unauthenticated, so one device can't fill the cache:
+/// each advertised address and each claimed machine ID is limited to a few
+/// entries, and a paired machine's hints displace others when it is full.
+const MAX_ENTRIES_PER_ADDRESS: usize = 4;
+const MAX_ENTRIES_PER_MACHINE: usize = 2;
 #[derive(Default, Serialize, Deserialize)]
 struct CandidateCache {
     entries: BTreeMap<String, Vec<Candidate>>,
+    /// IDs of paired machines, whose hints are kept first.
+    #[serde(skip)]
+    preferred: std::collections::HashSet<String>,
+}
+fn candidate_ip(c: &Candidate) -> Option<IpAddr> {
+    match Url::parse(&c.endpoint).ok()?.host()? {
+        url::Host::Ipv4(ip) => Some(ip.into()),
+        url::Host::Ipv6(ip) => Some(ip.into()),
+        url::Host::Domain(_) => None,
+    }
+}
+fn entry_seen(all: &[Candidate]) -> u64 {
+    all.iter().map(|c| c.last_seen).max().unwrap_or_default()
 }
 impl CandidateCache {
+    fn preferring(mut self, ids: impl IntoIterator<Item = String>) -> Self {
+        self.preferred = ids.into_iter().collect();
+        self
+    }
+    fn is_preferred(&self, all: &[Candidate]) -> bool {
+        all.iter().any(|c| {
+            c.machine_id
+                .as_ref()
+                .is_some_and(|id| self.preferred.contains(id))
+        })
+    }
+    /// The least recently seen entry other than `key`, among those `eligible`.
+    fn oldest(&self, key: &str, eligible: impl Fn(&[Candidate]) -> bool) -> Option<String> {
+        self.entries
+            .iter()
+            .filter(|(k, all)| k.as_str() != key && eligible(all))
+            .min_by_key(|(_, all)| entry_seen(all))
+            .map(|(k, _)| k.clone())
+    }
     fn expire(&mut self, timestamp: u64) {
         self.entries.retain(|_, all| {
             all.retain(|c| {
@@ -720,9 +868,55 @@ impl CandidateCache {
     }
     fn insert(&mut self, key: String, mut candidates: Vec<Candidate>) {
         candidates.truncate(8);
-        if self.entries.len() < MAX_CANDIDATES || self.entries.contains_key(&key) {
-            self.entries.insert(key, candidates);
+        // An address already claimed by several other entries is not taken again.
+        candidates.retain(|c| {
+            let Some(ip) = candidate_ip(c) else {
+                return false;
+            };
+            self.entries
+                .iter()
+                .filter(|(k, all)| **k != key && all.iter().any(|o| candidate_ip(o) == Some(ip)))
+                .count()
+                < MAX_ENTRIES_PER_ADDRESS
+        });
+        if candidates.is_empty() {
+            return;
         }
+        // One machine ID keeps only its most recently seen entries.
+        if let Some(id) = candidates.iter().find_map(|c| c.machine_id.clone()) {
+            let same = |all: &[Candidate]| all.iter().any(|c| c.machine_id.as_ref() == Some(&id));
+            while self
+                .entries
+                .iter()
+                .filter(|(k, all)| **k != key && same(all))
+                .count()
+                >= MAX_ENTRIES_PER_MACHINE
+            {
+                let Some(victim) = self.oldest(&key, same) else {
+                    break;
+                };
+                self.entries.remove(&victim);
+            }
+        }
+        if self.entries.len() >= MAX_CANDIDATES && !self.entries.contains_key(&key) {
+            // Full: a paired machine's hint displaces the oldest other hint;
+            // any other hint displaces only one seen before it.
+            let victim = if self.is_preferred(&candidates) {
+                self.oldest(&key, |all| !self.is_preferred(all))
+            } else {
+                let seen = entry_seen(&candidates);
+                self.oldest(&key, |all| {
+                    !self.is_preferred(all) && entry_seen(all) < seen
+                })
+            };
+            match victim {
+                Some(victim) => {
+                    self.entries.remove(&victim);
+                }
+                None => return,
+            }
+        }
+        self.entries.insert(key, candidates);
     }
     fn remove(&mut self, key: &str) {
         self.entries.remove(key);
@@ -887,7 +1081,10 @@ async fn tailscale_status() -> Result<Vec<Candidate>> {
     }
 }
 pub(super) async fn collect_candidates(refresh: bool) -> Result<(Vec<Candidate>, Vec<String>)> {
-    let mut cache: CandidateCache = read_json(CACHE_FILE)?;
+    let paired = peers()
+        .map(|all| all.into_iter().map(|p| p.machine.id).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut cache = read_json::<CandidateCache>(CACHE_FILE)?.preferring(paired.clone());
     cache.expire(now());
     let mut warnings = Vec::new();
     if refresh {
@@ -899,11 +1096,11 @@ pub(super) async fn collect_candidates(refresh: bool) -> Result<(Vec<Candidate>,
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
                 warnings.push(e.to_string());
-                CandidateCache::default()
+                CandidateCache::default().preferring(paired)
             }
             Err(e) => {
                 warnings.push(format!("mDNS browsing failed: {e}"));
-                CandidateCache::default()
+                CandidateCache::default().preferring(paired)
             }
         };
         cache
@@ -926,50 +1123,92 @@ pub async fn candidates() -> Result<Vec<Candidate>> {
     Ok(collect_candidates(true).await?.0)
 }
 
-async fn query_peer_inner(mut peer: Peer, candidates: &[Candidate]) -> PeerCatalog {
-    let mut endpoints = vec![(peer.endpoint.clone(), Source::Explicit)];
-    for c in candidates {
+/// Where to look for a paired machine: its stored address, then hints that
+/// claim its ID (most recently seen first), then tailnet addresses.
+fn peer_endpoints(peer: &Peer, candidates: &[Candidate]) -> Vec<(String, Source)> {
+    let mut hints: Vec<&Candidate> = candidates
+        .iter()
         // mDNS's claimed identity does not confer trust: TLS and catalog identity
         // must still match. Tailnet candidates are tried with the same pinned key.
-        if (c.machine_id.as_ref() == Some(&peer.machine.id) || c.source == Source::Tailscale)
-            && !endpoints.iter().any(|(u, _)| u == &c.endpoint)
-        {
-            endpoints.push((c.endpoint.clone(), c.source.clone()));
-        }
+        .filter(|c| {
+            c.machine_id.as_ref() == Some(&peer.machine.id) || c.source == Source::Tailscale
+        })
+        .collect();
+    hints.sort_by_key(|c| {
+        (
+            c.machine_id.as_ref() != Some(&peer.machine.id),
+            std::cmp::Reverse(c.last_seen),
+        )
+    });
+    let mut endpoints = vec![(peer.endpoint.clone(), Source::Explicit)];
+    for c in hints {
         if endpoints.len() >= 8 {
             break;
         }
+        if !endpoints.iter().any(|(u, _)| u == &c.endpoint) {
+            endpoints.push((c.endpoint.clone(), c.source.clone()));
+        }
     }
-    let mut last_error = "peer is unreachable".to_owned();
-    for (endpoint, source) in endpoints {
-        match fetch_catalog(&peer, &endpoint).await {
-            Ok(catalog) => {
-                peer.machine = catalog.machine.clone();
-                peer.endpoint = endpoint;
-                peer.last_seen = now();
-                if !peer.sources.contains(&source) {
-                    peer.sources.push(source);
+    endpoints
+}
+async fn query_peer_inner(mut peer: Peer, candidates: &[Candidate]) -> PeerCatalog {
+    let endpoints = peer_endpoints(&peer, candidates);
+    // The stored address gets a head start; the others are then tried
+    // together, so hints for dead addresses can't use up the refresh budget.
+    let (found, error) = {
+        let peer = &peer;
+        let mut pending: stream::FuturesUnordered<_> = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(i, (endpoint, source))| async move {
+                if i > 0 {
+                    tokio::time::sleep(Duration::from_millis(750)).await;
                 }
-                // An authenticated identity at one address deduplicates LAN+tailnet
-                // records for that machine, without trusting unauthenticated hints.
-                for c in candidates.iter().filter(|c| {
-                    c.machine_id.as_ref() == Some(&peer.machine.id) || c.endpoint == peer.endpoint
-                }) {
-                    if !peer.sources.contains(&c.source) {
-                        peer.sources.push(c.source.clone());
-                    }
+                (i, fetch_catalog(peer, &endpoint).await, endpoint, source)
+            })
+            .collect();
+        let mut found = None;
+        // Report why the stored address failed; hints are only guesses.
+        let mut error: Option<(usize, String)> = None;
+        while let Some((i, result, endpoint, source)) = pending.next().await {
+            match result {
+                Ok(catalog) => {
+                    found = Some((catalog, endpoint, source));
+                    break;
                 }
-                return PeerCatalog {
-                    slug: peer.slug,
-                    machine: peer.machine,
-                    endpoint: peer.endpoint,
-                    sources: peer.sources,
-                    last_seen: peer.last_seen,
-                    catalog: Some(catalog),
-                    error: None,
-                };
+                Err(e) if error.as_ref().is_none_or(|(j, _)| i < *j) => {
+                    error = Some((i, e.to_string()))
+                }
+                Err(_) => {}
             }
-            Err(e) => last_error = e.to_string(),
+        }
+        (found, error.map(|(_, e)| e))
+    };
+    let Some((catalog, endpoint, source)) = found else {
+        return PeerCatalog {
+            slug: peer.slug,
+            machine: peer.machine,
+            endpoint: peer.endpoint,
+            sources: peer.sources,
+            last_seen: peer.last_seen,
+            catalog: None,
+            error: Some(error.unwrap_or_else(|| "peer is unreachable".into())),
+        };
+    };
+    peer.machine = catalog.machine.clone();
+    peer.endpoint = endpoint;
+    peer.last_seen = now();
+    if !peer.sources.contains(&source) {
+        peer.sources.push(source);
+    }
+    // An authenticated identity at one address deduplicates LAN+tailnet
+    // records for that machine, without trusting unauthenticated hints.
+    for c in candidates
+        .iter()
+        .filter(|c| c.machine_id.as_ref() == Some(&peer.machine.id) || c.endpoint == peer.endpoint)
+    {
+        if !peer.sources.contains(&c.source) {
+            peer.sources.push(c.source.clone());
         }
     }
     PeerCatalog {
@@ -978,8 +1217,8 @@ async fn query_peer_inner(mut peer: Peer, candidates: &[Candidate]) -> PeerCatal
         endpoint: peer.endpoint,
         sources: peer.sources,
         last_seen: peer.last_seen,
-        catalog: None,
-        error: Some(last_error),
+        catalog: Some(catalog),
+        error: None,
     }
 }
 fn unavailable_peer(peer: Peer, message: &str) -> PeerCatalog {
@@ -1121,14 +1360,30 @@ pub async fn open_peer(local_id: &str, peer_id: &str) -> Result<PeerCatalog> {
     refresh_peer(local_id, peer_id).await
 }
 /// Persist the address, sources and identity a successful refresh authenticated.
-fn record_refreshed(all: &mut [Peer], successful: &[&PeerCatalog]) {
-    for p in all {
-        if let Some(good) = successful.iter().find(|g| g.machine.id == p.machine.id) {
-            p.endpoint = good.endpoint.clone();
-            p.sources = good.sources.clone();
-            p.machine = good.machine.clone();
-            p.last_seen = good.last_seen;
+/// A new name that another paired machine already answers to (as its ID, slug
+/// or name) is not taken, so references to that machine stay unambiguous.
+pub(super) fn record_refreshed(all: &mut [Peer], successful: &[&PeerCatalog]) {
+    for i in 0..all.len() {
+        let Some(good) = successful
+            .iter()
+            .find(|g| g.machine.id == all[i].machine.id)
+        else {
+            continue;
+        };
+        let name = &good.machine.name;
+        let collides = all.iter().enumerate().any(|(j, other)| {
+            j != i
+                && (other.machine.id.eq_ignore_ascii_case(name)
+                    || other.slug.eq_ignore_ascii_case(name)
+                    || other.machine.name.eq_ignore_ascii_case(name))
+        });
+        let p = &mut all[i];
+        p.endpoint = good.endpoint.clone();
+        p.sources = good.sources.clone();
+        if !collides {
+            p.machine.name = name.clone();
         }
+        p.last_seen = good.last_seen;
     }
 }
 /// Refresh one enrolled peer, as `snapshot` would, without querying any other.
