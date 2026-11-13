@@ -499,6 +499,9 @@ http.server.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),Server).serve_forev
         .unwrap()
         .iter()
         .any(|r| r["name"] == "daemon" && r["pid"] == pid);
+    // The daemon left the launched command's group (setsid): only its own pid
+    // is recorded, so stopping the route never signals a group.
+    let single_process = s.state()["owners"]["daemon"]["child"].is_null();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let body = runtime.block_on(async {
         reqwest::Client::builder()
@@ -526,6 +529,7 @@ http.server.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),Server).serve_forev
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(retained);
+    assert!(single_process, "{}", s.state());
     assert_eq!(body, "daemon survived");
     assert!(
         takeover.status.success(),
@@ -911,6 +915,51 @@ fn upstream_alias_dials_loopback_with_its_own_host_and_verifies_tls() {
         );
     });
     drop(servers);
+}
+
+#[cfg(unix)]
+#[test]
+fn detached_logs_survive_force_replacement_and_invalid_utf8() {
+    let s = Sandbox::new();
+    let app = "import os,socket,sys,time\ns=socket.socket()\ns.bind(('127.0.0.1',int(os.environ['PORT'])))\ns.listen()\nfor i in range(5): print('line',i,flush=True)\nsys.stdout.buffer.write(b'bad \\xff byte\\n');sys.stdout.flush()\nwhile True:\n print('tick',flush=True);time.sleep(0.05)";
+    s.ok(&["run", "--detach", "--name", "bg", "python3", "-c", app]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !String::from_utf8_lossy(&s.run(&["logs", "bg"]).stdout).contains("tick") {
+        assert!(Instant::now() < deadline, "no output from the first run");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // One invalid byte no longer makes the whole log unreadable.
+    let all = s.run(&["logs", "bg"]);
+    assert!(
+        all.status.success(),
+        "{}",
+        String::from_utf8_lossy(&all.stderr)
+    );
+    let all = String::from_utf8(all.stdout).expect("logs prints valid UTF-8");
+    assert!(
+        all.contains("line 0") && all.contains("bad \u{FFFD} byte"),
+        "{all}"
+    );
+    let last = s.ok(&["logs", "bg", "--lines", "1"]);
+    assert_eq!(last.lines().count(), 1, "{last}");
+    // Replacing it: the old run's output moves to bg.log.1, and the new log
+    // never gets the old launcher's writes (or a hole of NUL bytes).
+    s.ok(&["run", "--detach", "--force", "--name", "bg", "python3", "-c", "import os,socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',int(os.environ['PORT'])))\ns.listen()\nprint('second run',flush=True)\nwhile True: time.sleep(1)"]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !s.ok(&["logs", "bg"]).contains("second run") {
+        assert!(Instant::now() < deadline, "no output from the second run");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let log = std::fs::read(s.root.join("state/logs/bg.log")).unwrap();
+    let previous = std::fs::read(s.root.join("state/logs/bg.log.1")).unwrap();
+    s.ok(&["stop", "bg"]);
+    assert!(!log.contains(&0), "NUL bytes in the new log");
+    assert!(
+        !String::from_utf8_lossy(&log).contains("tick"),
+        "old run wrote into the new log"
+    );
+    assert!(String::from_utf8_lossy(&previous).contains("line 0"));
 }
 
 #[test]

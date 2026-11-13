@@ -16,6 +16,20 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - Launch options before `--name` (`-d`, `--detach`, `--private`, `--prefix=…`, `--app-port=…`, `--framework`, `--state-dir`) no longer make Porch treat the command as the app's name, and `porch --private -- --filter=web` passes `--filter=web` to the dev script. `porch web --name api …` is refused instead of quietly ignoring `--name`.
 - On/off environment variables (`PORCH_PRIVATE`, `PORCH_HTTPS`, `PORCH_LAN`, `PORCH_CLEAN_URLS` and the rest) all accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off` in any case. Anything else is an error; `PORCH_PRIVATE=yes` used to mean off.
 - Fields that a newer Porch adds to `state.json` and `proxy.json` are kept when this version rewrites them. Versions up to 0.5.2 drop them, which turned private apps shared and `--upstream https` aliases back into plain HTTP when an older `porch` was still running.
+- `porch stop`, `--force` and `porch prune` could stop a server Porch never started. When a command exits successfully, Porch hands its route to a daemon on the app's port only if the command started it. A server that was already running and only asked to listen, such as Docker Desktop for `docker run -p` or a running PM2 daemon for `pm2 start`, is left alone. A daemon outside the command's process group is stopped on its own, never with its whole group, and a handover that can't complete no longer kills anything.
+- A route left over from before a reboot, or whose process ids were reused, no longer matches someone else's processes, so `porch prune --force`, `porch doctor --fix` and relaunching the same name can't stop them.
+- Processes an app leaves behind (for example a dev server behind `npm run`) get SIGTERM and up to 3 seconds to clean up before SIGKILL, instead of SIGKILL a moment later.
+- Background app logs: replacing an app with `--force` no longer fills the new log with NUL bytes or the old app's output. The previous run's log is kept as `NAME.log.1`, logs over 10 MB move to `NAME.log.1`, and logs of apps stopped more than 14 days ago are deleted. `porch logs --lines N` reads only the end of the log, and a log with invalid UTF-8 shows with `�` instead of failing with "no log for NAME". `proxy.log` is capped the same way.
+- With HTTPS on, an app's existing `NODE_EXTRA_CA_CERTS` (a corporate CA, say) is kept: Porch points the app at a bundle of that file and the local CA instead of replacing it.
+- Two commands starting together after an update no longer both restart the proxy. A command waiting for another one that is asking for your password (sudo or CA trust) waits for it instead of failing with "another proxy startup did not finish", and an exited proxy's error shows the last 20 lines of `proxy.log` rather than all of it.
+- `porch setup` defaults "Start Porch automatically at login?" to whether the startup service is installed. After `porch discovery autostart enable`, `porch setup --yes` no longer tries to install the system service with sudo, and keeping the default no longer removes sharing's login item.
+- Requests to an app whose port is reserved but which hasn't started yet (while a sharing tunnel starts, say) show the "waiting for the app" page at once instead of hanging, and `porch run --detach` waits until the app has actually started.
+- On Linux, a running app that saw the proxy stop after `porch self-update` couldn't restart it. It now uses the updated binary, and says so if the restart fails.
+
+### Improved
+- The proxy no longer reads the process table every 5 seconds when no app is running, nor connects to every app each time.
+- Stopping, replacing and pruning apps check processes without running `ps` for each check, and look for a free app port without blocking other porch commands on `lsof`.
+- Launching in a workspace looks up the Git worktree and the workspace's packages once instead of once per package, and `porch run --detach` doesn't repeat it in the background launcher. A command that exits without handing its port to a daemon no longer runs `lsof` for a second.
 
 ## 0.5.2 (2026-11-14)
 

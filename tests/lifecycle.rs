@@ -406,3 +406,132 @@ fn removing_one_tld_from_an_unscoped_alias_preserves_the_other_domain() {
     assert_eq!(sandbox.status("demo.test"), 404);
     assert_eq!(sandbox.status("demo.localhost"), 502);
 }
+
+/// A command that asks an already-running service manager to serve the app
+/// port (`docker run -p`, `pm2 start` with its daemon up) exits 0 while the
+/// manager, which Porch did not start, holds the socket. Porch must not adopt
+/// that manager, or `porch stop` would signal the manager's whole group.
+#[test]
+fn handoff_never_adopts_a_listener_porch_did_not_start() {
+    let sandbox = Sandbox::new();
+    let port = loop {
+        let p = free_port();
+        if p != sandbox.port {
+            break p;
+        }
+    };
+    // The manager leads its own group with a second member, like a daemon
+    // and the containers or apps it supervises.
+    fs::write(
+        sandbox.root.join("manager.py"),
+        r#"import os,sys,socket,time,pathlib
+port=int(sys.argv[1])
+os.setsid()
+member=os.fork()
+if member==0:
+ pathlib.Path('member.pid').write_text(str(os.getpid()))
+ while True:time.sleep(.05)
+pathlib.Path('manager.pid').write_text(str(os.getpid()))
+while not pathlib.Path('serve').exists():time.sleep(.02)
+s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('127.0.0.1',port));s.listen()
+pathlib.Path('listening').write_text('1')
+while True:
+ c,a=s.accept();c.recv(65536);c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok');c.close()
+"#,
+    )
+    .unwrap();
+    let mut manager = Command::new("python3")
+        .arg("manager.py")
+        .arg(port.to_string())
+        .current_dir(&sandbox.root)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let manager_pid = sandbox.pid_file("manager.pid");
+    let member = sandbox.pid_file("member.pid");
+    sandbox.track_group(manager_pid);
+    // The launched command only asks the manager to listen, then exits 0
+    // once it does.
+    let output = sandbox.run(&[
+        "managed",
+        "--app-port",
+        &port.to_string(),
+        "python3",
+        "-c",
+        "import pathlib,time\npathlib.Path('serve').write_text('1')\nwhile not pathlib.Path('listening').exists():time.sleep(.02)",
+    ]);
+    let stop = sandbox.run(&["stop", "managed"]);
+    std::thread::sleep(Duration::from_millis(300));
+    let survived = alive(manager_pid) && alive(member);
+    unsafe {
+        libc::kill(-(manager_pid as i32), libc::SIGKILL);
+    }
+    let _ = manager.wait();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        survived,
+        "porch stop killed a service manager it never started; stop said: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// Looking for a free app port happens while every other porch command waits
+/// for the state lock, so busy ports are skipped with a plain bind: no `lsof`
+/// or `ss` process and no connection probes per port.
+#[test]
+fn busy_app_ports_are_skipped_without_owner_lookups() {
+    let sandbox = Sandbox::new();
+    let bin = sandbox.root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let calls = sandbox.root.join("lookups.log");
+    for tool in ["lsof", "ss"] {
+        common::write_executable(
+            &bin.join(tool),
+            &format!(
+                "#!/bin/sh\necho {tool} >> \"{}\"\nexit 1\n",
+                calls.display()
+            ),
+        );
+    }
+    let pool = common::app_ports(sandbox.port);
+    let (first, last) = pool.split_once('-').unwrap();
+    let (first, last) = (first.parse::<u16>().unwrap(), last.parse::<u16>().unwrap());
+    // All but the last port of the private pool are busy.
+    let held: Vec<_> = (first..last)
+        .map(|port| TcpListener::bind(("127.0.0.1", port)).unwrap())
+        .collect();
+    sandbox.ok(&["proxy", "start"]);
+    let output = sandbox
+        .command(&[
+            "busy",
+            "python3",
+            "-c",
+            "import os;print(os.environ['PORT'])",
+        ])
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    drop(held);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        last.to_string()
+    );
+    let lookups = fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        lookups.is_empty(),
+        "owner lookups while allocating: {lookups}"
+    );
+}

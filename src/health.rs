@@ -191,6 +191,11 @@ pub fn target_listening(target: &str) -> bool {
 }
 
 pub fn evaluate(s: &State, r: &Route, procs: &[Proc]) -> Health {
+    evaluate_with(s, r, procs, true)
+}
+/// [`evaluate`]; without `probe`, a live route counts as `Ok` without
+/// connecting to it, for callers that only clean up dead routes.
+fn evaluate_with(s: &State, r: &Route, procs: &[Proc], probe: bool) -> Health {
     if !state::route_alive(s, r) {
         return Health::Dead {
             orphaned: orphaned(s, r),
@@ -199,7 +204,7 @@ pub fn evaluate(s: &State, r: &Route, procs: &[Proc]) -> Health {
     if r.pid.is_some() && stopped(procs, &owned_pids(s, r, procs)) {
         return Health::Stopped;
     }
-    if listening(r) {
+    if !probe || listening(r) {
         Health::Ok
     } else {
         Health::NotListening
@@ -230,13 +235,24 @@ pub fn reconcile() -> Result<(Vec<String>, Vec<RouteHealth>)> {
 /// Like [`reconcile`], but with `apply: false` nothing is written: the dead
 /// routes that would be removed are returned instead (for `porch doctor`).
 pub fn reconcile_with(apply: bool) -> Result<(Vec<String>, Vec<RouteHealth>)> {
-    let procs = processes();
+    reconcile_inner(apply, true)
+}
+
+/// With `probe: false`, the returned health doesn't say whether live routes
+/// answer, and no connection is made to find out.
+fn reconcile_inner(apply: bool, probe: bool) -> Result<(Vec<String>, Vec<RouteHealth>)> {
     let snapshot = state::load()?;
+    // Only routes Porch launched have processes to check.
+    let procs = if snapshot.routes.iter().any(|r| r.pid.is_some()) {
+        processes()
+    } else {
+        Vec::new()
+    };
     let mut removable = Vec::new();
     let mut stopped_now = Vec::new();
     let mut rows = Vec::new();
     for r in &snapshot.routes {
-        let health = evaluate(&snapshot, r, &procs);
+        let health = evaluate_with(&snapshot, r, &procs, probe);
         match health {
             Health::Dead { orphaned: false } if r.pid.is_some() => {
                 removable.push((r.name.clone(), r.pid));
@@ -290,16 +306,17 @@ pub fn reconcile_with(apply: bool) -> Result<(Vec<String>, Vec<RouteHealth>)> {
 
 /// Reconcile, reporting but never failing the caller.
 pub fn reconcile_quietly() {
-    if let Err(e) = reconcile() {
+    if let Err(e) = reconcile_inner(true, false) {
         eprintln!("porch: stale route cleanup skipped: {e:#}");
     }
 }
 
-/// Periodic cleanup for the long-running proxy.
+/// Periodic cleanup for the long-running proxy. It removes dead routes and
+/// tracks stopped ones; with no launched routes it reads no process table.
 pub async fn reconcile_forever(every: Duration) {
     loop {
         tokio::time::sleep(every).await;
-        let _ = tokio::task::spawn_blocking(reconcile).await;
+        let _ = tokio::task::spawn_blocking(|| reconcile_inner(true, false)).await;
     }
 }
 
