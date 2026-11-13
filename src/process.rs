@@ -1058,18 +1058,23 @@ mod tests {
         );
     }
 
+    /// A recorded start time that can only be from an earlier boot: one
+    /// second after 1970 on macOS (seconds since the epoch); on Linux (clock
+    /// ticks since boot), far more ticks than this machine has been up.
+    fn previous_boot_start() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "1:0"
+        } else {
+            "18446744073709551"
+        }
+    }
+
     #[test]
     fn start_times_from_an_earlier_boot_never_match() {
         let me = crate::state::identity(std::process::id()).unwrap();
         assert!(start_key(&me.started).is_some());
         assert_ne!(started_this_boot(&me.started), Some(false));
-        // Seconds since 1970 on macOS; on Linux, far more ticks than this
-        // machine has been up.
-        let ancient = if cfg!(target_os = "macos") {
-            "1:0"
-        } else {
-            "18446744073709551"
-        };
+        let ancient = previous_boot_start();
         if cfg!(any(target_os = "macos", target_os = "linux")) {
             assert_eq!(started_this_boot(ancient), Some(false));
         }
@@ -1104,7 +1109,7 @@ mod tests {
             drop(child.stdin.take());
             child.wait().await.unwrap();
             let matched = crate::state::group_matches(leader, Some(&started));
-            let other_start = crate::state::group_matches(leader, Some("1:0"));
+            let other_start = crate::state::group_matches(leader, Some(previous_boot_start()));
             unsafe { libc::kill(member as i32, libc::SIGKILL) };
             assert_eq!(matched, own_session, "own session: {own_session}");
             assert!(
