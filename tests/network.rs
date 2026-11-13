@@ -147,7 +147,9 @@ async fn actual_http_tls_h2_ws_streaming_routing_and_redirects() {
     .unwrap();
     for tls in [false, true] {
         let port = free_port();
-        let redirect_port = free_port();
+        // Only the HTTPS proxy has a redirect listener (a test may claim
+        // eight ports).
+        let redirect_port = if tls { free_port() } else { 0 };
         let settings = ProxySettings {
             port,
             tls,
@@ -671,7 +673,9 @@ with context.wrap_socket(socket.create_connection(('127.0.0.1',int(sys.argv[2]))
     let key = dir.join("custom-key.pem");
     std::fs::write(&cert, pair.cert.pem()).unwrap();
     std::fs::write(&key, pair.key_pair.serialize_pem()).unwrap();
-    // The stopped proxy's port, free again (a test may claim eight ports).
+    // A port of its own: on Linux the stopped proxy's closed connections can
+    // keep its port from being bound again for a while.
+    let port = free_port();
     let proxy = tokio::spawn(porch::proxy::serve_config(ProxySettings {
         port,
         tls: true,

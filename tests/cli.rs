@@ -595,9 +595,9 @@ fn proxy_stays_within_its_descriptor_limit() {
     // of them and still answers a new client.
     let script = r#"
 import os,resource,socket,subprocess,sys,tempfile,time
-exe,port=sys.argv[1],int(sys.argv[2])
+exe=sys.argv[1]
 _,parent_hard=resource.getrlimit(resource.RLIMIT_NOFILE)
-def run(hard):
+def run(hard,port):
  with tempfile.TemporaryDirectory(prefix='porch-fds-') as root:
   env=os.environ.copy();env.update(PORCH_STATE_DIR=root,PORCH_SYNC_HOSTS='0',PORCH_SKIP_TRUST='1',PORCH_CLEAN_URLS='0')
   def limit():resource.setrlimit(resource.RLIMIT_NOFILE,(64,hard))
@@ -611,7 +611,7 @@ def run(hard):
    try:
     deadline=time.monotonic()+10
     while not os.path.exists(root+'/proxy.ready'):
-     assert child.poll() is None,'proxy exited before ready'
+     assert child.poll() is None,'proxy exited before ready: '+open(root+'/log').read()
      assert time.monotonic()<deadline,'proxy never ready'
      time.sleep(.02)
     for i in range(110):
@@ -641,16 +641,19 @@ def run(hard):
     if child.poll() is None:child.terminate()
     try:child.wait(timeout=5)
     except subprocess.TimeoutExpired:child.kill();child.wait()
-run(64)
-if parent_hard==resource.RLIM_INFINITY or parent_hard>=4096:run(4096)
+# A port each: on Linux the first daemon's closed connections can keep its
+# port from being bound again for a while.
+run(64,int(sys.argv[2]))
+if parent_hard==resource.RLIM_INFINITY or parent_hard>=4096:run(4096,int(sys.argv[3]))
 "#;
     let out = Command::new("python3")
         .args([
             "-c",
             script,
             env!("CARGO_BIN_EXE_porch"),
-            // A private port: one freed by Python could be reassigned before
+            // Private ports: one freed by Python could be reassigned before
             // the daemon binds it.
+            &common::free_port().to_string(),
             &common::free_port().to_string(),
         ])
         .output()
