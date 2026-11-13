@@ -1300,9 +1300,13 @@ mod native {
             let Built {
                 actions, toggles, ..
             } = fill_menu(&menu, &model, 0)?;
-            let builder = TrayIconBuilder::new()
-                .with_tooltip("Porch — your dev apps")
-                .with_menu(Box::new(menu.clone()));
+            let builder = TrayIconBuilder::new().with_menu(Box::new(menu.clone()));
+            // No tooltip on macOS. AppKit can leave a status item's tooltip on
+            // screen after the menu opens or the icon changes under it, and
+            // Porch never becomes the active app, so nothing dismisses it.
+            // Menu bar extras there don't usually have one anyway.
+            #[cfg(not(target_os = "macos"))]
+            let builder = builder.with_tooltip("Porch — your dev apps");
             let icon_state = IconState::from_snapshot(None);
             #[cfg(target_os = "macos")]
             let builder = builder.with_icon_templated(icon(icon_state)?);

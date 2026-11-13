@@ -2,6 +2,12 @@
 
 All notable changes to Porch. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.5.1 (2026-11-13)
+
+### Fixed
+- On macOS, the menu bar icon's "Porch — your dev apps" tooltip could stay on screen after the menu closed. The icon no longer has a tooltip on macOS.
+- `porch tray` on Windows couldn't find `porch-tray.exe` beside it.
+
 ## 0.5.0 (2026-11-08)
 
 ### Security
