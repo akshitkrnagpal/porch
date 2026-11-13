@@ -636,7 +636,7 @@ pub fn started_this_boot(started: &str) -> Option<bool> {
             .parse()
             .ok()?;
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-        (hz > 0).then(|| value as f64 <= (uptime + 1.0) * hz as f64)
+        (hz > 0).then_some(value as f64 <= (uptime + 1.0) * hz as f64)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
