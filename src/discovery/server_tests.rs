@@ -1289,42 +1289,61 @@ async fn relay_limits_answer_with_clear_statuses() {
     )
     .await;
     assert_eq!((status, &body[..]), (StatusCode::OK, &b"1048576"[..]));
-    let (status, body) = call(
-        &f,
-        Method::POST,
-        &format!("/v1/apps/{web}/proxy/upload"),
-        Some(&bearer),
-        None,
-        "x".repeat(MAX_UPLOAD + 1),
-    )
-    .await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-    assert!(String::from_utf8_lossy(&body).contains("16 MB"));
-    // The same without a declared length (a streamed upload).
-    let stream = tls_stream(&f).await;
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .unwrap();
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    let chunks = futures_util::stream::iter((0..17).map(|_| {
-        Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from(vec![
-            b'x';
-            1024 * 1024
-        ])))
-    }));
-    let response = sender
-        .send_request(
-            Request::post(format!("/v1/apps/{web}/proxy/upload"))
-                .header("host", f.addr.to_string())
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(http_body_util::StreamBody::new(chunks))
-                .unwrap(),
+    // Oversized uploads, declared and streamed, over HTTP/2 as the relay
+    // sends them: the agent answers before reading the rest, and HTTP/2
+    // delivers that answer however the platform treats the unread data.
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(f.cert.clone()).unwrap();
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(
+            rustls::pki_types::ServerName::IpAddress(f.addr.ip().into()),
+            tokio::net::TcpStream::connect(f.addr).await.unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
+    for declared in [true, false] {
+        let chunk = chunk.clone();
+        let chunks = futures_util::stream::iter(
+            (0..17).map(move |_| Ok::<_, Infallible>(hyper::body::Frame::data(chunk.clone()))),
+        );
+        let mut request = Request::post(format!("https://{}/v1/apps/{web}/proxy/upload", f.addr))
+            .header("authorization", format!("Bearer {bearer}"));
+        if declared {
+            request = request.header("content-length", (17 * 1024 * 1024).to_string());
+        }
+        sender.ready().await.unwrap();
+        let response = sender
+            .send_request(
+                request
+                    .body(http_body_util::StreamBody::new(chunks))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{declared}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("16 MB"));
+    }
     let (status, _) = call(
         &f,
         Method::GET,
