@@ -1,7 +1,15 @@
 name: Release
-# Pushing a tag vX.Y.Z (matching Cargo.toml) builds every target, publishes a
-# GitHub Release with the tarballs and SHA256SUMS, then updates the Homebrew tap.
-# A manual run builds and uploads workflow artifacts only; it never publishes.
+# Pushing a tag vX.Y.Z (matching Cargo.toml, on a commit that is on main)
+# builds every target, publishes a GitHub Release with the tarballs,
+# SHA256SUMS and signed build-provenance attestations, then updates the
+# Homebrew tap. A manual run builds, tests and uploads workflow artifacts
+# only; it never publishes.
+#
+# Supply chain: every action is pinned to a full commit SHA (the version is in
+# the comment beside it; update both together). The jobs whose output is
+# published (`build`, `release`) restore no caches and install only pinned
+# tools; tests, which run third-party tools such as turbo, run in a separate
+# job whose output is never published.
 on:
   push:
     tags: ['v*']
@@ -17,20 +25,91 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history and every branch, to check the tag is on main.
+          fetch-depth: 0
+          persist-credentials: false
       - id: version
-        name: Tag must match Cargo.toml version
+        name: Tag must match Cargo.toml and point at a commit on main
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
           echo "Cargo.toml version: $version"
-          if [ "$REF_TYPE" = tag ] && [ "$REF_NAME" != "v$version" ]; then
-            echo "::error::tag $REF_NAME does not match Cargo.toml version v$version"
-            exit 1
+          if [ "$REF_TYPE" = tag ]; then
+            if [ "$REF_NAME" != "v$version" ]; then
+              echo "::error::tag $REF_NAME does not match Cargo.toml version v$version"
+              exit 1
+            fi
+            # A release must come from reviewed code. This check lives in the
+            # workflow at the tagged commit, so a tag ruleset (only
+            # maintainers may create v* tags) is what stops a tag on a branch
+            # that edits this file; see SECURITY.md.
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::tag $REF_NAME points at $GITHUB_SHA, which is not on main"
+              exit 1
+            fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            turbo: '1'
+          - os: macos-15
+            target: aarch64-apple-darwin
+            turbo: '1'
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      PORCH_TEST_TURBO_REQUIRED: ${{ matrix.turbo }}
+      PORCH_NO_UPDATE_CHECK: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: runner.os != 'Windows'
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      # turbo has no install scripts; its platform binaries are exact versions.
+      - if: runner.os != 'Windows'
+        run: npm install --global --ignore-scripts turbo@2.6.3
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libdbus-1-dev
+      - run: cargo test --locked --features tray --lib tray::tests
+      # setup-python provides `python` on every runner; `python3` is not on Windows.
+      - run: python scripts/test_packaging.py
+      - if: runner.os != 'Windows'
+        # Fat LTO with one codegen unit on every test binary would add many
+        # minutes, so tests use the release profile's opt-level without it.
+        # The shipped binaries are built with the full profile and smoke-run.
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+        run: cargo test --locked --no-fail-fast --release --target ${{ matrix.target }} --all-targets
+      # The same suite as ci.yml's Windows job: some integration suites are
+      # still Unix-only and run nothing here.
+      - if: runner.os == 'Windows'
+        timeout-minutes: 20
+        run: cargo test --locked --no-fail-fast --tests
 
   build:
     needs: version
@@ -40,111 +119,116 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            test: true
           - os: macos-15
             target: aarch64-apple-darwin
-            test: true
-          # Cross-compiled on the Apple Silicon runner; not executed in CI.
+          # Cross-compiled on the Apple Silicon runner and run under Rosetta.
           - os: macos-15
             target: x86_64-apple-darwin
-            test: false
-          # Built natively. The test suite does not pass on Windows yet; the
-          # smoke steps below still run the built binary.
           - os: windows-2025
             target: x86_64-pc-windows-msvc
-            test: false
           # Static, CLI-only Linux builds: no glibc version requirement, so they
           # run on older distributions, Alpine and ARM64 servers. Built with
-          # cargo-zigbuild; the x86_64 one is smoke-run below.
+          # cargo-zigbuild. The x86_64 one is smoke-run here, the ARM64 one by
+          # `smoke-arm64` on an ARM64 runner.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            test: false
             musl: true
           - os: ubuntu-24.04
             target: aarch64-unknown-linux-musl
-            test: false
             musl: true
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: bash
     env:
-      PORCH_TEST_TURBO_REQUIRED: "1"
       PORCH_NO_UPDATE_CHECK: "1"
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           targets: ${{ matrix.target }}
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
-      - if: matrix.test
-        run: npm install --global turbo@2.6.3
       - if: runner.os == 'Linux' && !matrix.musl
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libdbus-1-dev
       - if: matrix.musl
+        name: Install zig and cargo-zigbuild (pinned)
         run: |
-          python3 -m pip install ziglang==0.13.0
+          # The x86_64 and aarch64 Linux wheels of ziglang 0.13.0, from PyPI.
+          cat > "$RUNNER_TEMP/zig-requirements.txt" <<'EOF'
+          ziglang==0.13.0 \
+              --hash=sha256:3ce0c9f16547e5d61b32e0d226926e9a2552ef4b91fccf7ab5ea1a623a77824b \
+              --hash=sha256:5714a4d46f9246ba6180a0930e23df2bc8bc26e62b5fe0dc798b4afca1903308
+          EOF
+          python3 -m pip install --only-binary :all: --require-hashes -r "$RUNNER_TEMP/zig-requirements.txt"
           cargo install --locked cargo-zigbuild@0.24.1
-      - if: matrix.test
-        run: cargo test --features tray --lib tray::tests
-      - if: matrix.test
-        run: python3 scripts/test_packaging.py
-      - if: matrix.test
-        # Fat LTO with one codegen unit on every test binary would add many
-        # minutes, so tests use the release profile's opt-level without it.
-        # The shipped binaries below get the full profile and are smoke-run.
-        env:
-          CARGO_PROFILE_RELEASE_LTO: "false"
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-        run: cargo test --no-fail-fast --release --target ${{ matrix.target }} --all-targets
       - if: '!matrix.musl'
-        run: cargo build --release --target ${{ matrix.target }} --bin porch
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin porch
       - if: '!matrix.musl'
-        run: cargo build --release --target ${{ matrix.target }} --features tray --bin porch-tray
+        run: cargo build --locked --release --target ${{ matrix.target }} --features tray --bin porch-tray
       - if: matrix.musl
-        run: cargo zigbuild --release --target ${{ matrix.target }} --bin porch
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }} --bin porch
       - if: matrix.target == 'x86_64-unknown-linux-musl'
         name: Static build runs and reports the release version
         run: |
           file target/${{ matrix.target }}/release/porch | grep -Eq 'statically linked|static-pie linked'
-          target/${{ matrix.target }}/release/porch --version | grep -Fx "porch ${{ needs.version.outputs.version }}"
-      - if: matrix.test || runner.os == 'Windows'
+          target/${{ matrix.target }}/release/porch --version | grep -Fx "porch $VERSION"
+      - if: matrix.target == 'x86_64-apple-darwin'
+        name: Intel build runs under Rosetta and reports the release version
+        run: |
+          file target/${{ matrix.target }}/release/porch | grep -q x86_64
+          # Rosetta is usually present on GitHub's Apple Silicon images.
+          arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 target/${{ matrix.target }}/release/porch --version | grep -Fx "porch $VERSION"
+      - if: '!matrix.musl && matrix.target != ''x86_64-apple-darwin'''
         name: Built binary reports the release version
-        run: target/${{ matrix.target }}/release/porch --version | tr -d '\r' | grep -Fx "porch ${{ needs.version.outputs.version }}"
-      - if: runner.os == 'Windows'
-        run: python scripts/test_packaging.py
-      # setup-python provides `python` on every runner; `python3` is not on Windows.
+        run: target/${{ matrix.target }}/release/porch --version | tr -d '\r' | grep -Fx "porch $VERSION"
       - run: python scripts/package.py --target ${{ matrix.target }} --binaries target/${{ matrix.target }}/release
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: porch-${{ matrix.target }}
           path: dist/porch-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
+  smoke-arm64:
+    # The ARM64 static build is cross-compiled; run the packaged binary on ARM64.
+    needs: [version, build]
+    runs-on: ubuntu-24.04-arm
+    env:
+      PORCH_NO_UPDATE_CHECK: "1"
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: porch-aarch64-unknown-linux-musl
+          path: dist
+      - name: Static ARM64 build runs and reports the release version
+        run: |
+          name="porch-$VERSION-aarch64-unknown-linux-musl"
+          tar -xzf "dist/$name.tar.gz" -C "$RUNNER_TEMP"
+          file "$RUNNER_TEMP/$name/porch" | grep -Eq 'ARM aarch64.*(statically linked|static-pie linked)'
+          "$RUNNER_TEMP/$name/porch" --version | grep -Fx "porch $VERSION"
+
   release:
     if: github.ref_type == 'tag'
-    needs: [version, build]
+    needs: [version, test, build, smoke-arm64]
     runs-on: ubuntu-24.04
+    # GitHub creates this environment, unprotected, on first use. Adding
+    # required reviewers to it in the repository settings makes every
+    # release wait for approval before anything is published.
+    environment: release
     permissions:
       contents: write
       # Build provenance: `gh attestation verify` (and `porch self-update`)
-      # can prove each archive came from this workflow.
+      # can prove each archive came from this workflow at this tag.
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           pattern: porch-*
@@ -154,7 +238,7 @@ jobs:
         run: |
           sha256sum porch-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
-      - uses: actions/attest-build-provenance@v3
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: |
             dist/porch-*.tar.gz
@@ -166,7 +250,7 @@ jobs:
         run: |
           gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --title "Porch $TAG" --generate-notes --verify-tag
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
@@ -176,23 +260,47 @@ jobs:
     needs: [version, release]
     runs-on: ubuntu-24.04
     env:
-      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       TAP_REPO: akshitkrnagpal/homebrew-tap
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - if: env.HOMEBREW_TAP_TOKEN == ''
-        run: echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the Homebrew tap update. Render it locally with scripts/render_formula.py."
-      - if: env.HOMEBREW_TAP_TOKEN != ''
-        uses: actions/checkout@v7
-      - if: env.HOMEBREW_TAP_TOKEN != ''
-        uses: actions/download-artifact@v8
+      - id: token
+        name: Check for HOMEBREW_TAP_TOKEN
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          message="HOMEBREW_TAP_TOKEN is not set, so $TAP_REPO was NOT updated and brew users stay on the previous version. Render Formula/porch.rb with scripts/render_formula.py and push it to the tap by hand."
+          echo "::warning title=Homebrew tap not updated::$message"
+          {
+            echo "### Homebrew tap not updated"
+            echo
+            echo "$message"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: steps.token.outputs.present == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: SHA256SUMS
           path: dist
-      - if: env.HOMEBREW_TAP_TOKEN != ''
+      - if: steps.token.outputs.present == 'true'
         name: Commit Formula/porch.rb to the tap
+        # Only this step sees the token. git gets it as an HTTP header through
+        # environment config: never in a URL, on a command line, or in .git/config.
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          auth=$(printf 'x-access-token:%s' "$HOMEBREW_TAP_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          git clone --depth 1 "https://github.com/${TAP_REPO}.git" tap
           python3 scripts/render_formula.py --version "$VERSION" --sums dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --output tap/Formula/porch.rb
           cd tap

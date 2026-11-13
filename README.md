@@ -39,7 +39,7 @@ Your app receives its port as `PORT`. The image uses demo apps.
 curl -fsSL https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.sh | sh
 ```
 
-Installing needs no sudo or Python. The installer verifies the checksum and, if the GitHub CLI is installed, the signed build attestation. If `porch` is not found, run `export PATH="$HOME/.local/bin:$PATH"` and add that line to your shell profile.
+Installing needs no sudo or Python. The installer always checks the download against the release's `SHA256SUMS`, which shows the file is intact but comes from the same release. If the [GitHub CLI](https://cli.github.com) (2.49 or newer) is installed and logged in, it also verifies the signed build attestation, which shows Porch's release workflow built the archive from the release tag; otherwise it prints that this check was skipped. Set `PORCH_UPDATE_VERIFY=require` to refuse to install without it. If `porch` is not found, run `export PATH="$HOME/.local/bin:$PATH"` and add that line to your shell profile.
 
 On macOS, the script also installs `Porch.app`. Open the menu with `open ~/Applications/Porch.app`.
 
@@ -49,7 +49,7 @@ On Linux, the default install is CLI only. For the tray on x86_64 Linux (glibc 2
 curl -fsSL https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.sh | PORCH_TRAY=1 sh
 ```
 
-There is no prebuilt tray for ARM64 Linux.
+There is no prebuilt tray for ARM64 Linux. Rerunning the script keeps a tray installed this way; `PORCH_TRAY=0` switches back to the CLI-only build and removes it.
 
 **Windows (PowerShell):**
 
@@ -57,16 +57,16 @@ There is no prebuilt tray for ARM64 Linux.
 irm https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.ps1 | iex
 ```
 
-Open a new terminal after installing to pick up the updated `PATH`; run `porch-tray.exe` for the tray.
+It checks the download the same way as the macOS and Linux script and adds `%LOCALAPPDATA%\Programs\Porch\bin` to your user `PATH` (other terminals pick it up once reopened); run `porch-tray.exe` for the tray.
 
 **Homebrew** (macOS and Linux, CLI only): `brew install akshitkrnagpal/tap/porch`.
 
-Update with `porch self-update`. Running apps and the proxy keep running while you update.
+Update with `porch self-update` (Homebrew: `brew upgrade akshitkrnagpal/tap/porch`). It checks the same things as the install script; see [Updates](docs/reference.md#updates). Running apps and the proxy keep running while you update.
 
 <details>
 <summary>Release archives, platform requirements and building from source</summary>
 
-**Release archive** (CLI plus the menu bar or tray app). Download `porch-<version>-<target>.tar.gz` from the [latest release](https://github.com/akshitkrnagpal/porch/releases/latest). Every archive has a signed build-provenance attestation, so you can check that this repository's release workflow built it: `gh attestation verify porch-*.tar.gz --repo akshitkrnagpal/porch`. For example, on an Apple Silicon Mac:
+**Release archive** (CLI plus the menu bar or tray app). Download `porch-<version>-<target>.tar.gz` from the [latest release](https://github.com/akshitkrnagpal/porch/releases/latest). Every archive has a signed build-provenance attestation, so you can check that this repository's release workflow built it from the release tag: `gh attestation verify porch-VERSION-TARGET.tar.gz --repo akshitkrnagpal/porch --signer-workflow akshitkrnagpal/porch/.github/workflows/release.yml --source-ref refs/tags/vVERSION`. For example, on an Apple Silicon Mac:
 
 ```sh
 tar -xzf porch-*-aarch64-apple-darwin.tar.gz
@@ -84,7 +84,7 @@ On Windows, extract `porch-<version>-x86_64-pc-windows-msvc.tar.gz` with `tar -x
 **From source:**
 
 ```sh
-cargo install --git https://github.com/akshitkrnagpal/porch porch
+cargo install --locked --git https://github.com/akshitkrnagpal/porch porch
 ```
 
 </details>
