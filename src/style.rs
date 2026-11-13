@@ -11,6 +11,23 @@ pub enum Stream {
     Stderr,
 }
 
+/// Text from a repository file (package.json, porch.json), safe to print:
+/// control characters, which could move the cursor or rewrite the screen, and
+/// bidirectional overrides, which could reorder what is shown, become escapes.
+pub fn printable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control()
+            || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub fn enabled(stream: Stream) -> bool {
     let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty() && v != "0");
     if set("NO_COLOR") {
@@ -60,5 +77,19 @@ pub fn url(s: Stream, u: &str) -> String {
         format!("\x1b]8;;{u}\x1b\\\x1b[1;36m{u}\x1b[0m\x1b]8;;\x1b\\")
     } else {
         u.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn printable_escapes_terminal_controls() {
+        assert_eq!(super::printable("vite --port 3000"), "vite --port 3000");
+        assert_eq!(
+            super::printable("dev\u{1b}]0;owned\u{7}\r\nx"),
+            "dev\\u{1b}]0;owned\\u{7}\\u{d}\\u{a}x"
+        );
+        assert_eq!(super::printable("a\u{202e}b\u{9b}c"), "a\\u{202e}b\\u{9b}c");
+        assert_eq!(super::printable("café"), "café");
     }
 }

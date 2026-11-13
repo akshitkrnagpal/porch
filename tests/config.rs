@@ -1022,3 +1022,55 @@ fn package_manager_script_shorthands_resolve_framework_flags() {
         assert!(!out.iter().any(|s| s == "4567"), "{out:?}");
     }
 }
+#[test]
+fn child_path_takes_bins_from_the_project_only() {
+    let f = Fixture::new();
+    let bin = |dir: &str| {
+        let p = f.0.join(dir).join("node_modules/.bin");
+        fs::create_dir_all(&p).unwrap();
+        p
+    };
+    // Someone else's directory above the project, such as /tmp or C:\.
+    let planted = bin("outer");
+    fs::create_dir_all(f.0.join("outer/repo/.git")).unwrap();
+    let root_bin = bin("outer/repo");
+    let app_bin = bin("outer/repo/app");
+    let cwd = f.0.join("outer/repo/app/src");
+    fs::create_dir_all(&cwd).unwrap();
+    let path = augmented_path(&cwd);
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    assert_eq!(dirs[..2], [app_bin, root_bin], "{dirs:?}");
+    assert!(!dirs.contains(&planted), "{dirs:?}");
+    // Outside any project and outside the home directory: this directory only.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if !home.is_some_and(|h| f.0.starts_with(h)) {
+        let loose = f.0.join("loose");
+        let own = bin("loose");
+        let above = bin("");
+        let dirs: Vec<PathBuf> = std::env::split_paths(&augmented_path(&loose)).collect();
+        assert_eq!(dirs.first(), Some(&own), "{dirs:?}");
+        assert!(!dirs.contains(&above), "{dirs:?}");
+    }
+}
+#[cfg(unix)]
+#[test]
+fn child_path_skips_bins_owned_by_another_user() {
+    use std::os::unix::fs::MetadataExt;
+    // /tmp and similar shared directories are root-owned; a directory there
+    // made by this user is fine. A different owner needs root to set up.
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let f = Fixture::new();
+    fs::create_dir_all(f.0.join(".git")).unwrap();
+    let theirs = f.0.join("node_modules/.bin");
+    fs::create_dir_all(&theirs).unwrap();
+    let nobody = 65534;
+    std::os::unix::fs::chown(f.0.join("node_modules"), Some(nobody), None).unwrap();
+    assert_eq!(
+        fs::metadata(f.0.join("node_modules")).unwrap().uid(),
+        nobody
+    );
+    let dirs: Vec<PathBuf> = std::env::split_paths(&augmented_path(&f.0)).collect();
+    assert!(!dirs.contains(&theirs), "{dirs:?}");
+}

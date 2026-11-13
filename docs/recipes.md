@@ -229,7 +229,7 @@ porch web --lan pnpm dev        # also publishes web.local over mDNS
 porch lan                       # LAN mode status and addresses
 ```
 
-Open `http://web.local:7462` on the phone. The proxy then accepts connections from your network, so allow TCP 7462 through the firewall. Pin the address with `--ip 192.168.1.42` if the machine has several. Expo in LAN mode keeps its own host handling.
+Open `http://web.local:7462` on the phone. The proxy then accepts connections from your network for every app, so allow TCP 7462 through the firewall. LAN mode lasts until the proxy restarts (`porch proxy stop`); `porch proxy start --lan` keeps it on across restarts, and `porch proxy start --no-lan` turns it off. Pin the address with `--ip 192.168.1.42` if the machine has several. Expo in LAN mode keeps its own host handling.
 
 ## Sharing outside your machine
 

@@ -109,9 +109,16 @@ pub(crate) struct ProxyOptions {
     /// Never use sudo or edit the hosts file (implied for ports 1024 and up)
     #[arg(long)]
     pub(crate) unprivileged: bool,
-    /// Serve .local names to other devices on your network
-    #[arg(long)]
+    /// Serve .local names to other devices on your network, and keep doing so
+    /// on later starts (saved)
+    #[arg(long, conflicts_with = "no_lan")]
     pub(crate) lan: bool,
+    /// Turn LAN mode off: only this computer can reach the proxy (saved)
+    #[arg(long, conflicts_with = "ip")]
+    pub(crate) no_lan: bool,
+    /// LAN mode for this proxy run only, as an app's --lan asks for.
+    #[arg(long, hide = true, conflicts_with = "no_lan")]
+    pub(crate) lan_temporary: bool,
     /// LAN address to advertise (default: detected automatically)
     #[arg(long)]
     pub(crate) ip: Option<String>,
@@ -404,6 +411,7 @@ fn merge(mut a: RunOptions, b: RunOptions) -> RunOptions {
 }
 pub async fn run() -> Result<i32> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    check_flag_vars()?;
     // --name explicitly bypasses reserved command dispatch.
     if leading_name(&raw) {
         let app = App::parse_from(std::iter::once("porch".to_string()).chain(raw));
@@ -422,6 +430,16 @@ pub async fn run() -> Result<i32> {
     };
     if let Some(d) = cli.state_dir {
         std::env::set_var("PORCH_STATE_DIR", d)
+    }
+    // Commands that take their own --state-dir check when they first open state.
+    if !matches!(
+        &cli.command,
+        Some(Commands::Run(_) | Commands::Named(_))
+            | Some(Commands::Proxy {
+                command: Some(ProxyCommand::Start(_))
+            })
+    ) {
+        state::check_dir()?;
     }
     let options = cli.options;
     if options.lan {
@@ -486,6 +504,9 @@ pub async fn run() -> Result<i32> {
             let a = App::parse_from(std::iter::once("porch".into()).chain(args));
             if let Some(d) = &a.state_dir {
                 std::env::set_var("PORCH_STATE_DIR", d)
+            }
+            if let Some(other) = options.name.as_ref().or(a.options.name.as_ref()) {
+                bail!("two app names given, {name} and --name {other}; use one: `porch {name} <command>` or `porch --name {other} <command>`")
             }
             let mut o = merge(options, a.options);
             o.name = Some(name);
@@ -595,6 +616,8 @@ pub async fn run() -> Result<i32> {
         Some(Commands::Clean { force }) => {
             // Per-user trust is removed as this user, before any elevation.
             crate::integrations::untrust_user_scope()?;
+            // Pairing and discovery's login startup belong to this user too.
+            clean_discovery().await?;
             if clean_needs_elevation() {
                 return elevate(&raw).await;
             }
@@ -701,13 +724,14 @@ pub async fn run() -> Result<i32> {
             );
             for plan in plans {
                 let rel = plan.cwd.strip_prefix(&root).unwrap_or(&plan.cwd);
+                // Names, directories and commands come from the repository's files.
                 let rel = if rel.as_os_str().is_empty() {
                     ".".to_owned()
                 } else {
-                    rel.display().to_string()
+                    style::printable(&rel.display().to_string())
                 };
                 let url = if plan.proxy {
-                    p.url(&plan.name)
+                    style::printable(&p.url(&plan.name))
                 } else {
                     "(task, no URL)".to_owned()
                 };
@@ -716,7 +740,7 @@ pub async fn run() -> Result<i32> {
                     style::url(Stdout, &url),
                     " ".repeat(width.saturating_sub(url.len())),
                     rel,
-                    style::dim(Stdout, &plan.command.join(" "))
+                    style::dim(Stdout, &style::printable(&plan.command.join(" ")))
                 );
             }
         }
@@ -734,8 +758,32 @@ pub(crate) async fn integration(name: &str, args: Vec<String>) -> Result<()> {
     }
     crate::integrations::run(argv).await
 }
+/// On/off environment variables, all read with [`state::parse_flag`].
+const FLAG_VARS: [&str; 13] = [
+    "HTTPS",
+    "UNPRIVILEGED",
+    "LAN",
+    "WILDCARD",
+    "SYNC_HOSTS",
+    "SKIP_TRUST",
+    "READ_ONLY",
+    "PRIVATE",
+    "TAILSCALE",
+    "FUNNEL",
+    "NGROK",
+    "CLOUDFLARE",
+    "CLEAN_URLS",
+];
+/// Refuse a value like PORCH_PRIVATE=y up front instead of reading it as off.
+fn check_flag_vars() -> Result<()> {
+    for key in FLAG_VARS {
+        state::env_flag(key)?;
+    }
+    Ok(())
+}
+/// An on/off environment variable; `check_flag_vars` has rejected other values.
 fn enabled(key: &str) -> Option<bool> {
-    state::env(key).map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+    state::env_flag(key).ok().flatten()
 }
 pub fn normalize(n: &str) -> Result<String> {
     let n = n.trim_end_matches('.').to_ascii_lowercase();
@@ -847,21 +895,33 @@ pub(crate) fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
     if unprivileged_choice == Some(true) && !tls_explicit {
         s.tls = false
     }
-    if let Some(v) = enabled("LAN") {
-        s.lan = v;
-        if !v {
-            s.lan_ip = None;
-            if s.tlds == ["local"] {
-                s.tlds = vec!["localhost".into()]
-            }
-        }
+    // LAN mode turned on by an app launch lasts while its proxy runs; a new
+    // proxy starts from the saved choice. A running proxy keeps what it has.
+    if s.lan_temporary.is_some() && !proxy_running() {
+        lan_off(&mut s);
     }
-    if o.lan {
-        s.lan = true
+    let lan_env = enabled("LAN");
+    let lan_refused = lan_env == Some(false) || o.no_lan;
+    if lan_refused {
+        lan_off(&mut s);
     }
-    if let Some(ip) = o.ip.clone().or_else(|| state::env("LAN_IP")) {
+    let lan_ip = o.ip.clone().or_else(|| state::env("LAN_IP"));
+    if let Some(ip) = &lan_ip {
         let _: std::net::IpAddr = ip.parse().context("invalid LAN IP")?;
+    }
+    let lan_saved = (o.lan || o.ip.is_some()) && !o.lan_temporary;
+    let lan_for_now = o.lan_temporary || lan_env == Some(true) || lan_ip.is_some();
+    if lan_refused {
+        // Off wins over any address given alongside it.
+    } else if lan_saved {
+        // `porch proxy start --lan` (or a startup service): saved.
         s.lan = true;
+        s.lan_temporary = None;
+    } else if lan_for_now && !s.lan {
+        s.lan = true;
+        s.lan_temporary = Some(s.tlds.clone());
+    }
+    if let Some(ip) = lan_ip.filter(|_| s.lan) {
         s.lan_ip = Some(ip)
     }
     if let Some(v) = enabled("WILDCARD") {
@@ -877,6 +937,10 @@ pub(crate) fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
         s.tlds = tlds(&o.tld)?
     }
     if s.lan {
+        // Domains chosen alongside a temporary LAN mode are the ones to return to.
+        if let Some(restore) = s.lan_temporary.as_mut().filter(|_| s.tlds != ["local"]) {
+            *restore = s.tlds.clone()
+        }
         s.tlds = vec!["local".into()]
     }
     if let Some(c) = &o.cert {
@@ -971,6 +1035,32 @@ pub(crate) fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
         bail!("PORCH_SYNC_HOSTS=1 cannot be combined with --unprivileged; drop one, e.g. `PORCH_SYNC_HOSTS=0 porch proxy start --unprivileged`")
     }
     Ok(s)
+}
+/// Back to loopback-only, restoring the domains LAN mode replaced.
+fn lan_off(s: &mut ProxySettings) {
+    s.lan = false;
+    s.lan_ip = None;
+    if let Some(tlds) = s.lan_temporary.take() {
+        s.tlds = tlds
+    } else if s.tlds == ["local"] {
+        s.tlds = vec!["localhost".into()]
+    }
+}
+/// A warning while the proxy accepts clients from other devices, for `porch
+/// list` and `porch doctor`.
+pub(crate) fn lan_warning(s: &ProxySettings) -> Option<String> {
+    if !s.lan {
+        return None;
+    }
+    let scope = if s.lan_temporary.is_some() {
+        "An app's --lan turned it on until the proxy restarts."
+    } else {
+        "It is saved and stays on when the proxy restarts."
+    };
+    Some(format!(
+        "LAN mode is on: other devices on your network can open every app at {}. {scope} To turn it off: `porch proxy stop && porch proxy start --no-lan`.",
+        s.url("<name>")
+    ))
 }
 fn proxy_identity() -> Option<ProcessIdentity> {
     serde_json::from_slice(&fs::read(state::dir().join("proxy.identity")).ok()?).ok()
@@ -1127,7 +1217,10 @@ fn settings_args(s: &ProxySettings) -> Vec<String> {
         a.extend(["--tld".into(), t.clone()])
     }
     for (flag, on) in [
-        ("--lan", s.lan),
+        ("--lan", s.lan && s.lan_temporary.is_none()),
+        ("--lan-temporary", s.lan && s.lan_temporary.is_some()),
+        // The daemon starts from the saved settings: say "off" explicitly.
+        ("--no-lan", !s.lan),
         ("--wildcard", s.wildcard),
         ("--unprivileged", s.unprivileged),
     ] {
@@ -1588,9 +1681,24 @@ fn list(json: bool) -> Result<()> {
             }))?
         )
     } else if routes.is_empty() {
+        if let Some(w) = lan_warning(&p) {
+            use crate::style::{self, Stream::Stdout};
+            println!(
+                "{} {}",
+                style::yellow(Stdout, "!"),
+                style::yellow(Stdout, &w)
+            );
+        }
         println!("No active routes")
     } else {
         use crate::style::{self, Stream::Stdout};
+        if let Some(w) = lan_warning(&p) {
+            println!(
+                "{} {}",
+                style::yellow(Stdout, "!"),
+                style::yellow(Stdout, &w)
+            );
+        }
         if !proxy_running() {
             println!(
                 "{} {}",
@@ -2074,6 +2182,7 @@ fn reserve(
     plan: &crate::config::LaunchPlan,
     requested: Option<u16>,
     force: bool,
+    private: bool,
 ) -> Result<(u16, Lease)> {
     let owner = std::process::id();
     let identity = state::identity(owner).context("cannot identify launcher")?;
@@ -2129,7 +2238,7 @@ fn reserve(
             target: format!("http://127.0.0.1:{port}"),
             pid: Some(owner),
         });
-        if enabled("PRIVATE") == Some(true) {
+        if private {
             s.private.insert(name.clone());
         }
         s.owners.insert(name.clone(), identity);
@@ -2658,6 +2767,9 @@ async fn launch_extra(
     if let Some(ip) = &options.ip {
         std::env::set_var("PORCH_LAN_IP", ip)
     }
+    // `--private` in any position (before or after the subcommand or name, or
+    // from MCP's run tool), or PORCH_PRIVATE.
+    let private = options.private || enabled("PRIVATE") == Some(true);
     for p in &mut plans {
         if let Some(port) = options.app_port {
             p.app_port = Some(port)
@@ -2698,7 +2810,7 @@ async fn launch_extra(
     for mut plan in plans {
         let (port, lease) = if plan.proxy {
             evict_conflicts(std::slice::from_ref(&plan.name), &s, options.force).await?;
-            let (p, l) = reserve(&plan, plan.app_port, options.force)?;
+            let (p, l) = reserve(&plan, plan.app_port, options.force, private)?;
             (Some(p), Some(l))
         } else {
             (None, None)
@@ -2837,6 +2949,76 @@ async fn launch_extra(
     result
 }
 
+/// `porch clean`: unpair from every paired machine (telling each one, when it
+/// answers), stop relays and the discovery agent, and remove discovery's login
+/// startup. The pairing keys and credentials go with the state files.
+async fn clean_discovery() -> Result<()> {
+    use crate::discovery;
+    let peers = discovery::client::peers().unwrap_or_default();
+    for peer in peers {
+        match discovery::pairing::unpair(&peer.machine.id).await {
+            Ok((peer, None)) => println!("Unpaired {}", peer.machine.name),
+            Ok((peer, Some(reason))) => eprintln!(
+                "Unpaired {}, which was unreachable ({reason}); it keeps listing this machine until you run `porch unpair` there, but can no longer connect.",
+                peer.machine.name
+            ),
+            Err(e) => eprintln!(
+                "porch: could not unpair {}: {e:#}; its access ends when the pairing keys are removed",
+                peer.machine.name
+            ),
+        }
+    }
+    discovery::disconnect().await?;
+    discovery::disable().await?;
+    Ok(())
+}
+/// Whether `name` in the state directory is a file Porch creates.
+fn porch_state_file(name: &str) -> bool {
+    const FILES: [&str; 29] = [
+        "state.json",
+        "state.lock",
+        "proxy.json",
+        "proxy.log",
+        "proxy.pid",
+        "proxy.identity",
+        "proxy.ready",
+        "proxy.version",
+        "proxy.stopped",
+        "proxy.lock",
+        "proxy.lan",
+        "proxy.port",
+        "proxy.hosts-sync-token",
+        "proxy.hosts-capability",
+        "startup.lock",
+        "ca.pem",
+        "ca-key.pem",
+        "hosts-sync.token",
+        "hosts-sync.secret",
+        "hosts-localhost-hint",
+        "service.json",
+        "tls.lock",
+        "tls-profile-version",
+        "trust.json",
+        "compose-ports.json",
+        "compose.lock",
+        "tip-https",
+        "tip-https-peer",
+        "update-check.json",
+    ];
+    // Pairing keys, credentials, peers and logs; per-run files; retired CAs;
+    // and temporary files a crash left behind.
+    const PREFIXES: [&str; 8] = [
+        "discovery",
+        "dev-manifest-",
+        "turbo-env-loader-",
+        "ca.pem.retired-",
+        "ca-key.pem.retired-",
+        "compose-",
+        "cloudflare-",
+        "sharing-",
+    ];
+    FILES.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p)) || name.ends_with(".tmp")
+}
 fn clean_state() -> Result<()> {
     state::transaction(|s| {
         for n in s.owners.keys() {
@@ -2845,76 +3027,93 @@ fn clean_state() -> Result<()> {
         *s = state::State::default();
         Ok(())
     })?;
-    for entry in fs::read_dir(state::dir())? {
+    let dir = state::dir();
+    let mut kept = Vec::new();
+    for entry in fs::read_dir(&dir)? {
         let entry = entry?;
-        let n = entry.file_name();
-        let n = n.to_string_lossy();
-        let known = [
-            "state.json",
-            "proxy.json",
-            "proxy.log",
-            "proxy.pid",
-            "proxy.identity",
-            "proxy.ready",
-            "proxy.version",
-            "ca.pem",
-            "ca-key.pem",
-            "hosts-sync.token",
-            "hosts-sync.secret",
-            "proxy.lan",
-            "proxy.port",
-            "proxy.hosts-sync-token",
-            "service.json",
-            "tls.lock",
-            "tls-profile-version",
-            "proxy.hosts-capability",
-            "hosts-localhost-hint",
-        ]
-        .contains(&n.as_ref())
-            || n.starts_with("dev-manifest-")
-            || n.starts_with("turbo-env-loader-");
-        if known && entry.file_type()?.is_file() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let kind = entry.file_type()?;
+        if kind.is_dir() && name == "logs" {
+            // Output of apps started with --detach.
+            for log in fs::read_dir(entry.path())? {
+                let log = log?;
+                let n = log.file_name().to_string_lossy().into_owned();
+                if log.file_type()?.is_file() && (n.ends_with(".log") || n.ends_with(".logref")) {
+                    fs::remove_file(log.path())?;
+                } else {
+                    kept.push(format!("logs/{n}"));
+                }
+            }
+            let _ = fs::remove_dir(entry.path());
+        } else if kind.is_file() && porch_state_file(&name) {
             fs::remove_file(entry.path())?;
+        } else {
+            kept.push(name);
         }
+    }
+    if kept.is_empty() {
+        let _ = fs::remove_dir(&dir);
+    } else {
+        eprintln!(
+            "Kept {} in {}: Porch didn't create {}.",
+            kept.iter()
+                .map(|k| crate::style::printable(k))
+                .collect::<Vec<_>>()
+                .join(", "),
+            dir.display(),
+            if kept.len() == 1 { "it" } else { "them" }
+        );
     }
     Ok(())
 }
 
-fn leading_name(args: &[String]) -> bool {
-    let mut i = 0;
-    let mut found = false;
-    while let Some(arg) = args.get(i) {
-        if arg == "--name" || arg.starts_with("--name=") {
-            found = true;
-        }
-        if [
-            "--name",
-            "--prefix",
-            "--script",
-            "--app-port",
-            "--framework",
-            "--ip",
-        ]
-        .contains(&arg.as_str())
-        {
-            i += 2;
-        } else if arg.starts_with("--name=")
-            || [
-                "--force",
-                "--tailscale",
-                "--funnel",
-                "--ngrok",
-                "--cloudflare",
-                "--lan",
-            ]
-            .contains(&arg.as_str())
-        {
-            i += 1;
+/// How many arguments the option at the start of `args` takes up (the option
+/// and its value), when it is one of `command`'s own options. Read from the
+/// clap definitions, so it knows every launch option.
+fn option_width(command: &clap::Command, args: &[String]) -> Option<usize> {
+    let arg = args.first()?;
+    if let Some(long) = arg.strip_prefix("--").filter(|l| !l.is_empty()) {
+        let (long, inline) = long
+            .split_once('=')
+            .map_or((long, false), |(l, _)| (l, true));
+        let option = command
+            .get_arguments()
+            .find(|a| a.get_long() == Some(long))?;
+        return Some(if inline || !option.get_action().takes_values() {
+            1
         } else {
-            break;
+            2
+        });
+    }
+    // A short flag or a cluster of them (-d), or one taking a value (-p 80, -p80).
+    let shorts = arg.strip_prefix('-').filter(|s| !s.is_empty())?;
+    for (i, c) in shorts.char_indices() {
+        let option = command.get_arguments().find(|a| a.get_short() == Some(c))?;
+        if option.get_action().takes_values() {
+            return Some(if i + c.len_utf8() < shorts.len() {
+                1
+            } else {
+                2
+            });
         }
     }
-    found
+    Some(1)
+}
+/// `porch [launch options] --name NAME ...`: --name among the leading options
+/// makes the rest a command, even when it starts with a subcommand's name.
+fn leading_name(args: &[String]) -> bool {
+    let command = App::command();
+    let mut i = 0;
+    while let Some(rest) = args.get(i..) {
+        let Some(width) = option_width(&command, rest) else {
+            break;
+        };
+        if rest[0] == "--name" || rest[0].starts_with("--name=") {
+            return true;
+        }
+        i += width;
+    }
+    false
 }
 async fn share_failure(shares: &mut Option<crate::integrations::ShareSession>) -> Result<()> {
     if let Some(s) = shares {
@@ -3023,42 +3222,17 @@ fn clean_needs_elevation() -> bool {
     }
 }
 
+/// `porch [options] -- ARGS`: the position of the `--` after only top-level
+/// options, whose ARGS go to the workspace's dev command.
 fn bare_separator(args: &[String]) -> Option<usize> {
+    let command = Cli::command();
     let mut i = 0;
-    while let Some(a) = args.get(i) {
-        if a == "--" {
+    loop {
+        if args.get(i)? == "--" {
             return Some(i);
         }
-        if [
-            "--name",
-            "--prefix",
-            "--script",
-            "--app-port",
-            "--framework",
-            "--ip",
-            "--state-dir",
-        ]
-        .contains(&a.as_str())
-        {
-            i += 2
-        } else if [
-            "--force",
-            "--tailscale",
-            "--funnel",
-            "--ngrok",
-            "--cloudflare",
-            "--lan",
-        ]
-        .contains(&a.as_str())
-            || a.starts_with("--script=")
-            || a.starts_with("--app-port=")
-        {
-            i += 1
-        } else {
-            break;
-        }
+        i += option_width(&command, &args[i..])?;
     }
-    None
 }
 
 fn child_program(
@@ -3210,5 +3384,87 @@ mod app_port_tests {
                 .collect::<Vec<_>>(),
             vec![65535]
         );
+    }
+}
+
+#[cfg(test)]
+mod option_walk_tests {
+    use super::{bare_separator, leading_name};
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    fn every_launch_option_before_name_is_skipped() {
+        for a in [
+            &["--name", "api", "pnpm", "dev"][..],
+            &["-d", "--name", "api", "pnpm", "dev"],
+            &["--detach", "--private", "--name=api", "npx", "vite"],
+            &["--prefix=", "--app-port=4100", "--name", "api", "x"],
+            &["--prefix", "", "--app-port", "4100", "--name", "api", "x"],
+            &[
+                "--framework",
+                "vite",
+                "--state-dir",
+                "/tmp/s",
+                "--name",
+                "api",
+                "x",
+            ],
+            &[
+                "--framework=vite",
+                "--ip",
+                "10.0.0.2",
+                "--lan",
+                "--name",
+                "api",
+                "x",
+            ],
+            &[
+                "--force",
+                "--tailscale",
+                "--funnel",
+                "--ngrok",
+                "--cloudflare",
+                "--name",
+                "a",
+            ],
+        ] {
+            assert!(leading_name(&args(a)), "{a:?}");
+        }
+        for a in [
+            &["pnpm", "--name", "api"][..],
+            &["run", "--name", "api", "x"],
+            &["--script"],
+            &["--unknown", "--name", "api"],
+            &[],
+        ] {
+            assert!(!leading_name(&args(a)), "{a:?}");
+        }
+    }
+    #[test]
+    fn separator_after_top_level_options_only() {
+        assert_eq!(bare_separator(&args(&["--", "--filter=web"])), Some(0));
+        assert_eq!(
+            bare_separator(&args(&["--private", "--", "--filter=web"])),
+            Some(1)
+        );
+        assert_eq!(
+            bare_separator(&args(&["-d", "--script=dev", "--prefix", "", "--", "x"])),
+            Some(4)
+        );
+        assert_eq!(
+            bare_separator(&args(&[
+                "--state-dir",
+                "/tmp/s",
+                "--framework",
+                "vite",
+                "--",
+                "x"
+            ])),
+            Some(4)
+        );
+        assert_eq!(bare_separator(&args(&["run", "--", "x"])), None);
+        assert_eq!(bare_separator(&args(&["web", "node", "--", "x"])), None);
+        assert_eq!(bare_separator(&args(&["--script"])), None);
     }
 }

@@ -260,7 +260,7 @@ Codes last 5 minutes, work once, and are cancelled after 5 wrong guesses. Show a
 
 ### Firewall prompts or LAN devices can't connect
 
-`--lan` makes the proxy accept connections from your network, so phones can open `web.local:7462`. Allow incoming TCP on the proxy port (7462 by default) and mDNS (UDP 5353). Without `--lan`, the proxy only listens on loopback and needs no firewall rule.
+`--lan` makes the proxy accept connections from your network, so phones can open `web.local:7462`. Allow incoming TCP on the proxy port (7462 by default) and mDNS (UDP 5353). Without `--lan`, the proxy only listens on loopback and needs no firewall rule. To end LAN mode, run `porch proxy stop && porch proxy start --no-lan`.
 
 ### WSL
 
@@ -274,4 +274,4 @@ Windows support is a preview. Proxy, apps, trust (current user's Root store), pa
 
 - `porch list --json` and `porch doctor` output are the most useful things to include in an issue.
 - `porch prune --force` removes routes whose apps are gone and stops what they left behind.
-- `porch clean` removes everything Porch installed (trust, services, hosts entries, state). Use it as a last resort; you'll need `porch trust` again for HTTPS.
+- `porch clean` removes everything Porch installed (trust, services, hosts entries, pairing, logs, state). Use it as a last resort; you'll need `porch trust` again for HTTPS, and `porch pair` again to share with other machines.

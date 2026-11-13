@@ -132,7 +132,7 @@ For a guided first run, `porch setup` asks four questions (HTTPS, proxy port, st
 - **Docker Compose:** `porch compose up` gives each HTTP service a name and a stable port.
 - **Git worktrees:** a linked worktree on branch `fix/login` serves at `login.web.localhost`, so two checkouts of the same app don't collide.
 - **Remote aliases:** `porch alias staging https://staging.example.com` puts a real site behind a local name, with verified TLS, the right `Host` and redirects that stay on the Porch URL.
-- **Phones and tablets:** `--lan` publishes `web.local` over mDNS so other devices on your network can reach the app.
+- **Phones and tablets:** `--lan` publishes `web.local` over mDNS so other devices on your network can reach your apps, until the proxy restarts (`porch proxy start --lan` keeps it on, `--no-lan` turns it off).
 - **Coding agents:** `porch mcp` runs a stdio MCP server that lets an agent list routes, look up URLs and run diagnostics. Read-only tools can't change anything. Install the skill with `npx skills add akshitkrnagpal/porch`.
 
 </details>

@@ -967,3 +967,217 @@ fn detached_runs_answer_log_and_stop() {
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("exited"));
 }
+/// An app that does nothing for a minute; `porch stop` ends it sooner.
+const IDLE: [&str; 3] = ["python3", "-c", "import time\ntime.sleep(60)"];
+#[test]
+fn private_applies_wherever_the_flag_is_given() {
+    let s = Sandbox::new();
+    let launches: Vec<(&str, Vec<&str>, bool)> = vec![
+        ("p-run", vec!["run", "--private", "--name", "p-run"], true),
+        ("p-named", vec!["p-named", "--private"], true),
+        ("p-flag", vec!["--name", "p-flag", "--private"], true),
+        ("p-first", vec!["--private", "--name", "p-first"], true),
+        ("p-top", vec!["--private", "p-top"], true),
+        ("shared", vec!["shared"], false),
+    ];
+    let mut children = Vec::new();
+    for (name, args, _) in &launches {
+        let args: Vec<&str> = args.iter().chain(IDLE.iter()).copied().collect();
+        children.push(
+            s.command(&args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        s.wait_route(name);
+    }
+    // PORCH_PRIVATE takes the usual spellings of "on".
+    let args: Vec<&str> = ["run", "--name", "p-env"]
+        .iter()
+        .chain(IDLE.iter())
+        .copied()
+        .collect();
+    children.push(
+        s.command(&args)
+            .env("PORCH_PRIVATE", "Yes")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    s.wait_route("p-env");
+    let list: serde_json::Value = serde_json::from_str(&s.ok(&["list", "--json"])).unwrap();
+    let private = |name: &str| {
+        list["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing: {list}"))["private"]
+            .clone()
+    };
+    for (name, _, expected) in &launches {
+        assert_eq!(private(name), *expected, "{name}: {list}");
+    }
+    assert_eq!(private("p-env"), true, "{list}");
+    for name in [
+        "p-run", "p-named", "p-flag", "p-first", "p-top", "shared", "p-env",
+    ] {
+        s.ok(&["stop", name]);
+    }
+    for mut c in children {
+        c.wait().unwrap();
+    }
+}
+#[test]
+fn launch_options_before_name_or_separator_are_options() {
+    let s = Sandbox::new();
+    // -d before --name: `python3` is the command, not the app name.
+    let o = s.run(&[
+        "-d", "--name", "api", "python3", "-c",
+        "import os,socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',int(os.environ['PORT'])))\ns.listen()\nwhile True: time.sleep(1)",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout).trim(),
+        format!("http://api.localhost:{}", s.port)
+    );
+    let names: Vec<_> = s.state()["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].clone())
+        .collect();
+    assert_eq!(names, vec![serde_json::json!("api")]);
+    s.ok(&["stop", "api"]);
+    // --private before `--`: the rest goes to the dev script, not into a name.
+    std::fs::write(
+        s.root.join("package.json"),
+        r#"{"name":"fixture","scripts":{"dev":"node -e \"process.exit(7)\""}}"#,
+    )
+    .unwrap();
+    s.exits(&["--private", "--", "--filter=web"], 7);
+    s.exits(&["--prefix=", "--script=dev", "--", "--filter=web"], 7);
+    // An app name and --name together are refused rather than one dropped.
+    let o = s.run(&["web", "--name", "api", "node", "-e", "0"]);
+    assert!(!o.status.success());
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("two app names"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+#[test]
+fn on_off_environment_values_are_strict() {
+    let s = Sandbox::new();
+    let o = s
+        .command(&["list"])
+        .env("PORCH_HTTPS", "maybe")
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("PORCH_HTTPS") && err.contains("maybe"),
+        "{err}"
+    );
+    for (value, scheme) in [("on", "https"), ("OFF", "http"), ("no", "http")] {
+        let o = s
+            .command(&["get", "x", "--no-worktree"])
+            .env("PORCH_HTTPS", value)
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(out.starts_with(&format!("{scheme}://")), "{value}: {out}");
+    }
+}
+#[test]
+fn lan_from_an_app_launch_is_not_saved_and_lan_mode_warns() {
+    let s = Sandbox::new();
+    let state = s.root.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let local = format!("http://x.local:{}", s.port);
+    let localhost = format!("http://x.localhost:{}", s.port);
+    // The app's --lan reaches the proxy as PORCH_LAN; nothing is written.
+    let o = s
+        .command(&["get", "x", "--no-worktree"])
+        .env("PORCH_LAN", "1")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), local);
+    assert!(!state.join("proxy.json").exists());
+    // A proxy an app put in LAN mode, now stopped: the next start is local again.
+    std::fs::write(
+        state.join("proxy.json"),
+        format!(
+            r#"{{"port":{},"tls":false,"tlds":["local"],"lan":true,"lan_temporary":["localhost","test"],"unprivileged":true}}"#,
+            s.port
+        ),
+    )
+    .unwrap();
+    assert_eq!(s.ok(&["get", "x", "--no-worktree"]).trim(), localhost);
+    // LAN mode saved by an older Porch (or `proxy start --lan`) stays on, with a warning.
+    std::fs::write(
+        state.join("proxy.json"),
+        format!(
+            r#"{{"port":{},"tls":false,"tlds":["local"],"lan":true,"unprivileged":true}}"#,
+            s.port
+        ),
+    )
+    .unwrap();
+    assert_eq!(s.ok(&["get", "x", "--no-worktree"]).trim(), local);
+    let list = s.ok(&["list"]);
+    assert!(
+        list.contains("LAN mode is on") && list.contains("--no-lan"),
+        "{list}"
+    );
+    let doctor = String::from_utf8_lossy(&s.run(&["doctor"]).stdout).into_owned();
+    assert!(doctor.contains("LAN mode is on"), "{doctor}");
+    // --no-lan turns it off and saves that.
+    s.ok(&["proxy", "start", "--no-lan"]);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state.join("proxy.json")).unwrap()).unwrap();
+    assert_eq!(saved["lan"], false, "{saved}");
+    assert_eq!(saved["tlds"], serde_json::json!(["localhost"]), "{saved}");
+    assert!(!s.ok(&["list"]).contains("LAN mode"));
+    s.ok(&["proxy", "stop"]);
+}
+#[test]
+fn fields_from_a_newer_porch_survive_and_its_marker_is_respected() {
+    let s = Sandbox::new();
+    let state = s.root.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("state.json"),
+        r#"{"routes":[],"future_field":{"keep":["me"]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        state.join("proxy.json"),
+        format!(
+            r#"{{"port":{},"tls":false,"unprivileged":true,"future_setting":7}}"#,
+            s.port
+        ),
+    )
+    .unwrap();
+    s.ok(&["alias", "kept", "43123"]);
+    assert_eq!(
+        s.state()["future_field"],
+        serde_json::json!({"keep": ["me"]})
+    );
+    s.ok(&["proxy", "start"]);
+    s.ok(&["proxy", "stop"]);
+    let proxy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state.join("proxy.json")).unwrap()).unwrap();
+    assert_eq!(proxy["future_setting"], 7, "{proxy}");
+    // A newer Porch that needs its fields kept marks the file; this one won't write it.
+    let mut v = s.state();
+    v["min_writer"] = 99.into();
+    std::fs::write(state.join("state.json"), v.to_string()).unwrap();
+    let o = s.run(&["alias", "refused", "43124"]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("newer Porch"));
+    assert_eq!(s.state()["min_writer"], 99);
+    assert_eq!(s.state()["routes"].as_array().unwrap().len(), 1);
+}

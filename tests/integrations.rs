@@ -1179,3 +1179,58 @@ fn a_rotated_ca_loses_its_trust_when_the_new_one_is_trusted() {
         serde_json::from_slice(&fs::read(s.dir.join("state/trust.json")).unwrap()).unwrap();
     assert_ne!(record["fingerprint"].as_str().unwrap(), old);
 }
+
+#[test]
+fn clean_ends_pairing_and_removes_logs_and_leftovers() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = Sandbox::new();
+    s.fake("launchctl", "");
+    let state = s.dir.join("state");
+    for name in [
+        "discovery-auth.json",
+        "discovery-key.pem",
+        "discovery-cert.pem",
+        "discovery-config.json",
+        "discovery-machine.json",
+        "discovery.log",
+        "trust.json.123.tmp",
+        "state.json.456.tmp",
+        "compose-ports.json",
+        "update-check.json",
+        "tip-https",
+    ] {
+        fs::write(state.join(name), "{}").unwrap();
+    }
+    fs::write(state.join("discovery-peers.json"), "[]").unwrap();
+    fs::create_dir_all(state.join("logs")).unwrap();
+    fs::write(state.join("logs/web.log"), "output").unwrap();
+    fs::write(state.join("logs/api.logref"), "web\n").unwrap();
+    fs::write(state.join("notes.txt"), "mine").unwrap();
+    // Discovery's login startup for this state directory.
+    let plist = s.dir.join("dev.porch.discovery.plist");
+    fs::write(
+        &plist,
+        format!(
+            "<string>dev.porch.discovery</string><key>PORCH_STATE_DIR</key><string>{}</string>",
+            state.display()
+        ),
+    )
+    .unwrap();
+    let out = s
+        .cmd()
+        .env("PORCH_SERVICE_PLATFORM", "macos")
+        .env("PORCH_DISCOVERY_AUTOSTART_FILE", &plist)
+        .args(["clean"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(!plist.exists());
+    assert!(s.log().contains("bootout"), "{}", s.log());
+    let left: Vec<String> = fs::read_dir(&state)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, vec!["notes.txt".to_owned()], "{left:?}");
+    assert!(err.contains("Kept notes.txt"), "{err}");
+}

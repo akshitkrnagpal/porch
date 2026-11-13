@@ -20,7 +20,7 @@ The executable is `porch`. Configuration lives in `porch.json` or the `porch` ke
 | `porch setup [--yes] [--port N] [--https\|--no-https]` | Guided first run; safe to repeat, and current values are the defaults |
 | `porch doctor [--fix] [--yes]` | Diagnoses problems; `--fix` applies the safe fixes |
 
-Launch options are `--name`, `--script`, `--prefix`, `--app-port`, `--force`, `--private`, `--lan`, `--ip`, `--tailscale`, `--funnel`, `--ngrok` and `--cloudflare`. `--private` (or `PORCH_PRIVATE=1`) keeps an app off paired machines even when sharing is on; `porch alias --private` does the same for an alias. Anything after the child command belongs to the child. `--prefix ''` turns off worktree naming. `--help`/`-h` and `--version`/`-v`/`-V` work as usual.
+Launch options are `--name`, `--script`, `--prefix`, `--app-port`, `--force`, `--private`, `--lan`, `--ip`, `--framework`, `--detach`/`-d`, `--tailscale`, `--funnel`, `--ngrok` and `--cloudflare`. They work before or after `run` or the app name. `--private` (or `PORCH_PRIVATE=1`) keeps an app off paired machines even when sharing is on; `porch alias --private` does the same for an alias. Give the app name once: `porch web --name api …` is an error. Anything after the child command belongs to the child. `--prefix ''` turns off worktree naming. `--help`/`-h` and `--version`/`-v`/`-V` work as usual.
 
 A launch starts the proxy if needed and waits for it to accept connections before starting the app. It then waits up to `PORCH_LISTEN_TIMEOUT` seconds (default 15, `0` disables) for something to accept TCP on the assigned port. If nothing does, Porch prints a warning and leaves the app running. If a process in the app's tree is listening on another port, the warning names it (`app is listening on 4321 instead`) and suggests `porch run --app-port 4321 COMMAND`. Porch never reroutes on its own. Unless you pick one, app ports come from 4000–4999 (set `PORCH_APP_PORTS=START-END` for another range), starting at a random port and skipping 4045 and 4190, which browsers block. A fixed port must be free and not reserved by another route.
 
@@ -39,11 +39,12 @@ porch proxy start --foreground
 porch proxy start --tld localhost --tld test --wildcard
 porch proxy start --cert ./cert.pem --key ./key.pem
 porch proxy start --lan --ip 192.168.1.42
+porch proxy start --no-lan
 porch proxy stop
 porch proxy status
 ```
 
-Proxy options: `--port`/`-p`, `--https`, `--no-tls`, `--foreground`, `--skip-trust`, `--unprivileged`, `--lan`, `--ip`, `--tld` (repeatable or comma-separated), `--wildcard`, `--cert` with `--key`, `--state-dir`, `--bind` and `--redirect-port`. Passing a certificate turns on TLS.
+Proxy options: `--port`/`-p`, `--https`, `--no-tls`, `--foreground`, `--skip-trust`, `--unprivileged`, `--lan`, `--no-lan`, `--ip`, `--tld` (repeatable or comma-separated), `--wildcard`, `--cert` with `--key`, `--state-dir`, `--bind` and `--redirect-port`. Passing a certificate turns on TLS.
 
 **URLs without a port.** On a fresh install, Porch checks whether this user can bind the standard port (80, or 443 with HTTPS) without sudo. macOS 10.14+ and Windows allow it; Linux does when `net.ipv4.ip_unprivileged_port_start` is 80 or lower. If so, and the port is free, Porch uses it, so URLs read `http://web.localhost`. The proxy then binds the wildcard address (the only way macOS allows it) and refuses every non-loopback client unless LAN mode is on. Otherwise Porch uses port 7462. If something takes the standard port later, Porch moves to 7462 and says so. `PORCH_CLEAN_URLS=0` turns this off, and `porch setup` asks.
 
@@ -112,7 +113,7 @@ In a linked Git worktree on a feature branch, names get a prefix from the branch
 
 Workspaces come from `pnpm-workspace.yaml` or the `workspaces` field in `package.json` (array or object form). Patterns support `*` within a path segment, `**` for any depth, and `!` exclusions. Packages without their own name are named `<package>.<project>`, using the shared npm scope, the root name or the directory as the project. Build-only commands such as `tsc` and `tsup` run as tasks without routes. Two packages that would get the same name stop the launch before anything starts.
 
-The package manager (npm, pnpm, Yarn or Bun) comes from `packageManager` or the nearest lockfile. Scripts run through it, so shell syntax and lifecycle hooks behave normally. Local and parent `node_modules/.bin` directories are added to PATH.
+The package manager (npm, pnpm, Yarn or Bun) comes from `packageManager` or the nearest lockfile. Scripts run through it, so shell syntax and lifecycle hooks behave normally. Local and parent `node_modules/.bin` directories are added to PATH, up to the workspace or Git root (or your home directory outside a project), never above your home directory or at a filesystem root. On macOS and Linux, a directory owned by another user is skipped.
 
 **Turborepo.** With a `turbo.json` or `turbo.jsonc`, Porch reserves a route for each package and runs the root task once. A Node preload gives each package its own `PORT`, URL and framework flags, so Turbo keeps its task graph and TUI. A package whose `dev` script is `porch`, with `porch.script` set to `dev:app`, picks up the reserved environment instead of creating a second route. Pass arguments to Turbo after `--`, for example `porch -- --filter=web`. Set `turbo: false` to start packages directly and concurrently instead. At a multi-package root, a named command that runs the Turbo graph (including a root `pnpm run dev` that calls Turbo) is rejected, because every package would share one port. Use bare `porch` or Turbo's filters instead.
 
@@ -124,7 +125,7 @@ Each `PORCH_*` setting overrides its `PORTLESS_*` equivalent.
 
 | Variable (`PORCH_` + …) | Meaning |
 | --- | --- |
-| `STATE_DIR` | State directory, default `~/.porch` |
+| `STATE_DIR` | State directory, default `~/.porch`. Without `HOME`, Porch looks up your home directory in the user database |
 | `PORT` | Proxy port (default 80 when no sudo is needed, else 7462). Counts as an explicit choice, so a busy port fails instead of moving |
 | `CLEAN_URLS` | `0` keeps new installs on port 7462 instead of the standard port |
 | `PRIVATE` | `1` keeps launched apps and aliases off paired machines |
@@ -139,6 +140,8 @@ Each `PORCH_*` setting overrides its `PORTLESS_*` equivalent.
 | `LISTEN_TIMEOUT` | Seconds to wait for a launched app to listen before warning (default 15, `0` disables) |
 | `TAILSCALE`, `FUNNEL`, `NGROK`, `CLOUDFLARE` | Sharing provider |
 | `SKIP_TRUST` | Skip the interactive CA trust prompt |
+
+On/off variables take `1`, `true`, `yes` or `on`, and `0`, `false`, `no` or `off`, in any case. Porch stops with an error on any other value.
 
 `PORCH=0` or `PORTLESS=0` (also `false` or `skip`) turns Porch off for a run. The command runs as normal with its inherited environment and no assigned port or URL.
 
@@ -168,9 +171,9 @@ Porch issues certificates only for configured TLDs, registered route names and, 
 
 **Docker Compose.** `porch compose [GLOBAL FLAGS] up [ARGS...]` reads the Compose model, assigns each HTTP service a stable loopback port and registers a route named after the service and port. Ports for non-HTTP services are left as they are. Global flags such as `-f`, `-p`, `--profile`, `--env-file` and `--project-directory` work as they do in Docker Compose. Running it again reuses the same ports, and `down` or stale containers remove only that project's routes.
 
-**LAN.** `--lan` publishes a `.local` name for each route over mDNS and checks for route and IP changes every two seconds. A fixed `--ip` never changes.
+**LAN.** `--lan` publishes a `.local` name for each route over mDNS and checks for route and IP changes every two seconds. A fixed `--ip` never changes. In LAN mode the proxy accepts connections from other devices for every app, not just the one launched with `--lan`, so `porch list` and `porch doctor` warn while it's on. LAN mode from an app's `--lan` (or `PORCH_LAN=1`) lasts until the proxy next restarts. `porch proxy start --lan` saves it, and so does `porch service install --lan`; `porch proxy start --no-lan` turns it off again and saves that.
 
-**Cleanup.** `porch doctor` checks the proxy, state, routes, name resolution, trust and external tools, then lists each problem with either `fix applied` or the command to run. `porch doctor --fix` moves a stopped proxy off a busy port, prunes dead routes, restarts an outdated proxy and switches old high-port settings to no-sudo mode. It asks before stopping any process; `--yes` answers for you, and without `--yes` a non-interactive run never stops anything. `porch prune [--force]` stops processes left by stale routes, and `porch clean` removes everything Porch installed: trust, services, hosts entries and state. It keeps the CA files if it can't safely remove their trust.
+**Cleanup.** `porch doctor` checks the proxy, state, routes, name resolution, trust and external tools, then lists each problem with either `fix applied` or the command to run. `porch doctor --fix` moves a stopped proxy off a busy port, prunes dead routes, restarts an outdated proxy and switches old high-port settings to no-sudo mode. It asks before stopping any process; `--yes` answers for you, and without `--yes` a non-interactive run never stops anything. `porch prune [--force]` stops processes left by stale routes, and `porch clean` removes everything Porch installed: trust, services, hosts entries and state. It unpairs from every paired machine (a machine that doesn't answer keeps listing this one until you run `porch unpair` there, but can no longer connect), stops the discovery agent, removes its start-at-login entry and deletes the pairing keys, credentials and `--detach` logs. It keeps the CA files if it can't safely remove their trust, and lists any file in the state directory that Porch didn't create instead of deleting it.
 
 ## First run: `porch setup`
 
