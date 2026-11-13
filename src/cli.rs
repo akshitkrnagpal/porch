@@ -512,7 +512,7 @@ pub async fn run() -> Result<i32> {
         Some(Commands::List { json, all }) => {
             if all {
                 crate::discovery::commands::print_snapshot(
-                    crate::discovery::client::snapshot(false).await?,
+                    crate::discovery::client::list(false).await?,
                     json,
                 )?;
             } else {
@@ -535,11 +535,17 @@ pub async fn run() -> Result<i32> {
                 crate::discovery::open_url(&url)?;
             }
             println!("{url}");
+            if peer.is_some() {
+                peer_https_tip(&url);
+            }
         }
         Some(Commands::Copy { app, peer }) => {
             let url = crate::discovery::app_url(&app, peer.as_deref()).await?;
             crate::discovery::copy_url(&url)?;
             println!("{url}");
+            if peer.is_some() {
+                peer_https_tip(&url);
+            }
         }
         Some(Commands::Tray) => crate::discovery::commands::launch_tray()?,
         Some(Commands::Alias {
@@ -796,6 +802,28 @@ fn risky_tld(tld: &str) -> Option<&'static str> {
 /// Did the caller choose the proxy port (flag or PORCH_PORT)? Explicit ports never move.
 pub(crate) fn port_explicit(o: &ProxyOptions) -> bool {
     o.port.is_some() || state::env("PORT").is_some()
+}
+/// Once, in a terminal: over plain HTTP a browser fetches at most six files
+/// at a time per host, so a page with hundreds of modules waits for that many
+/// round trips to the other machine. HTTPS brings HTTP/2, which fetches them
+/// all at once.
+fn peer_https_tip(url: &str) {
+    use crate::style::{self, Stream::Stderr};
+    use std::io::IsTerminal;
+    if url.starts_with("http:")
+        && std::io::stderr().is_terminal()
+        && std::env::var_os("CI").is_none()
+        && !state::dir().join("tip-https-peer").exists()
+    {
+        let _ = state::atomic_write("tip-https-peer", b"shown\n");
+        eprintln!(
+            "{}",
+            style::dim(
+                Stderr,
+                "Tip: pages with many files (Vite, for example) load much faster from another machine over HTTPS, where the browser fetches them in parallel. Run `porch setup --https` (no sudo)."
+            )
+        );
+    }
 }
 pub(crate) fn resolve_settings(o: &ProxyOptions) -> Result<ProxySettings> {
     use crate::ports::{DEFAULT_PROXY_PORT, FIRST_UNPRIVILEGED_PORT};

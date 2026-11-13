@@ -9,7 +9,7 @@ use futures_util::{stream, StreamExt};
 use hyper::{body::Incoming, header, Request, Response, StatusCode};
 use hyper_util::{
     client::legacy::Client,
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
 };
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -38,8 +38,17 @@ const MAX_CANDIDATES: usize = 256;
 const CANDIDATE_TTL: u64 = 90;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
-pub(super) type RelayClient =
+type PinnedClient =
     Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>;
+/// Connections to one paired agent. Requests share a single HTTP/2 connection
+/// when the agent offers it, so a page's hundreds of module requests neither
+/// open a TLS connection each nor run into the agent's connection limit.
+/// WebSocket upgrades need HTTP/1.1 and use their own connections.
+#[derive(Clone)]
+pub(super) struct RelayClient {
+    requests: PinnedClient,
+    upgrades: PinnedClient,
+}
 
 fn now() -> u64 {
     SystemTime::now()
@@ -471,6 +480,9 @@ pub async fn pair(endpoint: &str, fingerprint: &str, token: &str) -> Result<Peer
     upsert_peer_in(&crate::state::dir(), peer)
 }
 pub(super) async fn fetch_catalog(peer: &Peer, endpoint: &str) -> Result<Catalog> {
+    if let Some(shared) = super::gateway::fetch_shared(peer, endpoint).await {
+        return shared;
+    }
     let endpoint = validate_endpoint(endpoint)?;
     let response = http_client(&peer.fingerprint)?
         .get(endpoint.join("v1/catalog")?)
@@ -481,6 +493,44 @@ pub(super) async fn fetch_catalog(peer: &Peer, endpoint: &str) -> Result<Catalog
     let catalog: Catalog = bounded_json(response).await?;
     validate_catalog(&catalog, &peer.machine.id)?;
     Ok(catalog)
+}
+
+/// The catalog over the relay's pooled connection: no TLS handshake when the
+/// relay is already connected, and the connection it opens serves the page next.
+pub(super) async fn relay_catalog(peer: &Peer, client: &RelayClient) -> Result<Catalog> {
+    use http_body_util::BodyExt;
+    let uri: hyper::Uri = validate_endpoint(&peer.endpoint)?
+        .join("v1/catalog")?
+        .as_str()
+        .parse()?;
+    let request = Request::get(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {}", peer.token))
+        .body(Body::empty())?;
+    let fetch = async {
+        let response = client
+            .requests
+            .request(request)
+            .await
+            .context("peer is unreachable or its pinned certificate does not match")?;
+        if !response.status().is_success() {
+            bail!(
+                "peer rejected request (HTTP {}); check enrollment and token",
+                response.status().as_u16()
+            );
+        }
+        let body = http_body_util::Limited::new(response.into_body(), MAX_BODY)
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("reading peer response: {e}"))?
+            .to_bytes();
+        let catalog: Catalog =
+            serde_json::from_slice(&body).context("invalid peer protocol response")?;
+        validate_catalog(&catalog, &peer.machine.id)?;
+        Ok(catalog)
+    };
+    tokio::time::timeout(REQUEST_TIMEOUT, fetch)
+        .await
+        .context("peer catalog request timed out")?
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -835,6 +885,70 @@ pub async fn snapshot(refresh: bool) -> Result<Snapshot> {
         warnings,
     })
 }
+/// Asks the running proxy, which fetches over the connections its relay keeps
+/// for browsers, so listing or opening a machine's apps warms the connection
+/// and catalog the page then uses. `None` when no proxy answers (stopped, an
+/// older version, or bound away from loopback): callers then fetch themselves.
+async fn from_proxy<T: DeserializeOwned>(query: &str, timeout: Duration) -> Option<T> {
+    use crate::proxy::{PEERS_PATH, PEERS_TOKEN_HEADER};
+    if !crate::cli::proxy_running() {
+        return None;
+    }
+    let settings = crate::state::proxy_settings().ok()?;
+    let token = fs::read_to_string(crate::state::dir().join("proxy.hosts-sync-token")).ok()?;
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .http1_only()
+        .timeout(timeout)
+        .resolve(
+            "localhost",
+            SocketAddr::from(([127, 0, 0, 1], settings.port)),
+        );
+    if settings.tls {
+        let pem = fs::read(crate::state::dir().join("ca.pem")).ok()?;
+        builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&pem).ok()?);
+    }
+    let url = format!(
+        "{}://localhost:{}{PEERS_PATH}?{query}",
+        if settings.tls { "https" } else { "http" },
+        settings.port
+    );
+    let response = builder
+        .build()
+        .ok()?
+        .get(url)
+        .header(PEERS_TOKEN_HEADER, token.trim())
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() || response.content_length().unwrap_or(0) > 16 * 1024 * 1024
+    {
+        return None;
+    }
+    serde_json::from_slice(&response.bytes().await.ok()?).ok()
+}
+/// Paired machines and their apps, as `snapshot`, preferably through the proxy.
+pub async fn list(refresh: bool) -> Result<Snapshot> {
+    let (query, timeout) = if refresh {
+        ("refresh=1", Duration::from_secs(30))
+    } else {
+        ("", Duration::from_secs(20))
+    };
+    match from_proxy(query, timeout).await {
+        Some(snapshot) => Ok(snapshot),
+        None => snapshot(refresh).await,
+    }
+}
+/// One paired machine's apps, as `refresh_peer`, preferably through the proxy.
+pub async fn open_peer(local_id: &str, peer_id: &str) -> Result<PeerCatalog> {
+    if valid_id(peer_id) {
+        let query = format!("peer={peer_id}");
+        if let Some(peer) = from_proxy(&query, Duration::from_secs(10)).await {
+            return Ok(peer);
+        }
+    }
+    refresh_peer(local_id, peer_id).await
+}
 /// Persist the address, sources and identity a successful refresh authenticated.
 fn record_refreshed(all: &mut [Peer], successful: &[&PeerCatalog]) {
     for p in all {
@@ -920,12 +1034,39 @@ pub(super) struct RelayContext {
     pub(super) local_app: Url,
 }
 pub(super) fn relay_client(pin: &str) -> Result<RelayClient> {
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config(pin)?)
-        .https_only()
-        .enable_http1()
-        .build();
-    Ok(Client::builder(TokioExecutor::new()).build(https))
+    let connector = |h2: bool| -> Result<_> {
+        // Small TLS records (response heads, short modules) must not wait on
+        // Nagle's algorithm for the previous segment's ACK.
+        let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+        http.enforce_http(false);
+        http.set_nodelay(true);
+        // As for catalog requests: a refresh tries several addresses in turn.
+        http.set_connect_timeout(Some(Duration::from_secs(2)));
+        let builder = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config(pin)?)
+            .https_only();
+        // Offering both lets agents from before HTTP/2 answer over HTTP/1.1.
+        Ok(if h2 {
+            builder.enable_all_versions().wrap_connector(http)
+        } else {
+            builder.enable_http1().wrap_connector(http)
+        })
+    };
+    let requests = Client::builder(TokioExecutor::new())
+        .timer(TokioTimer::new())
+        .pool_timer(TokioTimer::new())
+        // A link that dies silently (sleep, a network change) fails every
+        // request on the shared connection; pings notice within seconds.
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .http2_keep_alive_timeout(Duration::from_secs(5))
+        .http2_keep_alive_while_idle(true)
+        // Keep the warm connection between page loads. (hyper's fixed HTTP/2
+        // windows already exceed a typical link's bandwidth-delay product; an
+        // adaptive window would start at 64 KiB and throttle a cold page load.)
+        .pool_idle_timeout(Duration::from_secs(300))
+        .build(connector(true)?);
+    let upgrades = Client::builder(TokioExecutor::new()).build(connector(false)?);
+    Ok(RelayClient { requests, upgrades })
 }
 fn plain_error(status: StatusCode, message: &str) -> Response<Body> {
     let mut r = Response::new(Body::from(message.to_owned()));
@@ -1069,6 +1210,11 @@ pub(super) async fn relay_request(
         .cloned()
         .filter(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
     let downstream = upgrade.as_ref().map(|_| hyper::upgrade::on(&mut req));
+    let client = if upgrade.is_some() {
+        &context.client.upgrades
+    } else {
+        &context.client.requests
+    };
     let suffix = req
         .uri()
         .path_and_query()
@@ -1140,11 +1286,8 @@ pub(super) async fn relay_request(
         );
     }
     *req.uri_mut() = uri;
-    let result = tokio::time::timeout(
-        Duration::from_secs(30),
-        context.client.request(req.map(Body::new)),
-    )
-    .await;
+    let result =
+        tokio::time::timeout(Duration::from_secs(30), client.request(req.map(Body::new))).await;
     let mut response = match result {
         Ok(Ok(r)) => r,
         _ => {

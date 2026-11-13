@@ -1513,6 +1513,7 @@ fn upstream(dir: &Path) -> Result<Upstream> {
     let tls = tls_roots(dir)?;
     let mut http = HttpConnector::new();
     http.enforce_http(false);
+    http.set_nodelay(true);
     http.set_connect_timeout(Some(Duration::from_secs(5)));
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls)
@@ -1583,7 +1584,9 @@ pub async fn serve() -> Result<()> {
     .with_safe_default_protocol_versions()?
     .with_no_client_auth()
     .with_single_cert(certificates, key)?;
-    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // HTTP/2 lets a paired machine's relay multiplex a page's requests on one
+    // connection; HTTP/1.1 stays for older Porch versions and WebSockets.
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(ip, config.port))
         .await
         .context("binding discovery interface")?;
@@ -1622,6 +1625,7 @@ async fn connections(
 ) -> Result<()> {
     loop {
         let (stream, remote) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             drop(stream);
             continue;
@@ -1646,15 +1650,22 @@ async fn connections(
                     })
                 }
             });
-            let mut builder = hyper::server::conn::http1::Builder::new();
+            let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
             builder
+                .http1()
                 .timer(TokioTimer::new())
                 .header_read_timeout(Duration::from_secs(10))
                 .max_headers(64)
                 .max_buf_size(32 * 1024);
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .max_concurrent_streams(256)
+                .max_header_list_size(32 * 1024)
+                .keep_alive_interval(Some(Duration::from_secs(20)))
+                .keep_alive_timeout(Duration::from_secs(10));
             let _ = builder
-                .serve_connection(TokioIo::new(stream), service)
-                .with_upgrades()
+                .serve_connection_with_upgrades(TokioIo::new(stream), service)
                 .await;
         });
     }
