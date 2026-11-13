@@ -2,7 +2,7 @@
 
 All notable changes to Porch. Versions follow [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.5.2 (2026-11-14)
 
 ### Fixed
 - Apps on a paired machine load much faster through their `APP.MACHINE` URLs, especially pages with many requests such as Vite dev servers. The relay sends requests over one HTTP/2 connection to the other machine instead of opening a TLS connection for each, so over HTTPS (`porch setup`) a page's modules are fetched in parallel; they no longer fail with "Remote Porch app is unavailable" once more than 64 are in flight. The app catalog is refreshed in the background rather than while a request waits, and relay sockets disable Nagle's algorithm.
