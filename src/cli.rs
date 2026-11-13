@@ -614,10 +614,11 @@ pub async fn run() -> Result<i32> {
             crate::integrations::prune_shares(force)?;
         }
         Some(Commands::Clean { force }) => {
-            // Per-user trust is removed as this user, before any elevation.
+            // Per-user trust and login items are removed as this user, before any elevation.
             crate::integrations::untrust_user_scope()?;
             // Pairing and discovery's login startup belong to this user too.
             clean_discovery().await?;
+            crate::integrations::uninstall_user_service()?;
             if clean_needs_elevation() {
                 return elevate(&raw).await;
             }
@@ -3595,10 +3596,7 @@ fn requires_elevation(name: &str, args: &[String]) -> bool {
             return false;
         }
         (name == "trust" && args.iter().any(|a| a == "--system"))
-            || (name == "service"
-                && args
-                    .first()
-                    .is_some_and(|a| a == "install" || a == "uninstall"))
+            || (name == "service" && crate::integrations::service_needs_elevation(args))
             || (name == "hosts" && args.first().is_none_or(|a| a == "sync" || a == "clean"))
     }
     #[cfg(not(unix))]
@@ -3647,7 +3645,7 @@ fn clean_needs_elevation() -> bool {
             && std::env::var_os("PORCH_SERVICE_FILE").is_none()
             && std::env::var_os("PORCH_TRUST_DIR").is_none()
             && (crate::integrations::trust_scope().as_deref() == Some("system")
-                || state::dir().join("service.json").exists()
+                || crate::integrations::system_service_installed()
                 || crate::integrations::has_managed_hosts())
     }
     #[cfg(not(unix))]

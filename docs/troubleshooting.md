@@ -268,7 +268,7 @@ Run Porch inside WSL and open URLs in your Windows browser. `porch trust` inside
 
 ### Windows
 
-Windows support is a preview. Proxy, apps, trust (current user's Root store), pairing and the tray work; `porch service install` uses Task Scheduler. Report anything that behaves differently from macOS or Linux.
+Windows support is a preview. Proxy, apps, trust (current user's Root store), pairing and the tray work; `porch service install` adds a Task Scheduler task that starts the proxy when you log in, as you. Report anything that behaves differently from macOS or Linux.
 
 ## Still stuck
 

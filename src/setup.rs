@@ -180,7 +180,7 @@ pub async fn run(a: SetupArgs) -> Result<()> {
     // discovery autostart enable`, no sudo) is a separate choice.
     let service_installed = state::dir().join("service.json").exists();
     let service = confirm(
-        "Start Porch automatically at login? (installs a system service; asks for sudo)",
+        "Start Porch automatically at login? (runs as you)",
         service_installed,
         interactive,
     );
@@ -212,7 +212,8 @@ pub async fn run(a: SetupArgs) -> Result<()> {
     let settings = state::proxy_settings()?;
 
     let mut service_on = service_installed;
-    if service && !service_installed {
+    // An old service that runs as root is replaced by one that runs as you.
+    if service && (!service_installed || crate::integrations::service_warning().is_some()) {
         let mut args = vec![
             "install".to_owned(),
             "--port".into(),

@@ -9,6 +9,13 @@ use std::{
 /// A real "Porch Local CA" certificate; its SHA-1 was computed with `openssl x509 -fingerprint -sha1`.
 const PORCH_CA: &str = include_str!("fixtures/porch-ca.pem");
 const PORCH_CA_SHA1: &str = "8B7699335C1F0EDA581E025A5F45400A8BEF9354";
+/// A fake `security` whose keychains hold the fixture CA, plus `extra`.
+fn fake_security(s: &Sandbox, extra: &str) {
+    s.fake(
+        "security",
+        &format!("if a[0]=='find-certificate':print('SHA-1 hash: {PORCH_CA_SHA1}')\n{extra}"),
+    );
+}
 fn write_ca(s: &Sandbox) {
     fs::write(s.dir.join("state/ca.pem"), PORCH_CA).unwrap();
 }
@@ -57,6 +64,7 @@ impl Sandbox {
             .env("PORCH_APP_PORTS", common::app_ports(self.port))
             .env("PORCH_HTTPS", "0")
             .env("PORCH_SERVICE_FILE", self.dir.join("service"))
+            .env("PORCH_SYSTEM_SERVICE_FILE", self.dir.join("system-service"))
             .env("PORCH_TRUST_DIR", self.dir.join("trust"))
             .env("HOME", self.dir.join("home"))
             .env("PORCH_TEST_ROOT", &self.dir)
@@ -122,6 +130,17 @@ elif 'down' in a:
 else:raise Exception(a)
 "#);
     fs::write(s.dir.join("containers"), "[]").unwrap();
+    // Bookkeeping for a project whose folder is gone is dropped.
+    fs::write(
+        s.dir.join("state/compose-projects.json"),
+        r#"{"gone":"/nonexistent/porch-compose-project"}"#,
+    )
+    .unwrap();
+    fs::write(
+        s.dir.join("state/compose-ports.json"),
+        r#"{"gone":{"web:3000":5999}}"#,
+    )
+    .unwrap();
     s.ok(&["alias", "independent", "3456"]);
     s.ok(&[
         "compose",
@@ -147,11 +166,19 @@ else:raise Exception(a)
     assert!(names.contains(&"8080.web.shop"));
     assert!(!names.iter().any(|n| n.contains("db")));
     let first = fs::read(s.dir.join("state/compose-ports.json")).unwrap();
+    assert!(!String::from_utf8_lossy(&first).contains("gone"));
+    let inode = |s: &Sandbox| {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(s.dir.join("state/state.json")).unwrap().ino()
+    };
+    let before = inode(&s);
     s.ok(&["compose", "-p", "shop", "up", "-d"]);
     assert_eq!(
         fs::read(s.dir.join("state/compose-ports.json")).unwrap(),
         first
     );
+    // Nothing changed, so the route state wasn't rewritten.
+    assert_eq!(inode(&s), before);
     let mut stdin = s
         .cmd()
         .env("PORCH_COMPOSE_STDIN_TEST", "1")
@@ -184,6 +211,19 @@ else:raise Exception(a)
             .to_string_lossy()
             .starts_with("compose-stdin-")));
     s.ok(&["compose", "-p", "shop", "down"]);
+    // Down releases the project's ports and deletes its resolved model, which
+    // can hold secrets from .env files.
+    let ports = fs::read_to_string(s.dir.join("state/compose-ports.json")).unwrap();
+    assert!(!ports.contains("shop"), "{ports}");
+    let leftovers: Vec<_> = fs::read_dir(s.dir.join("state"))
+        .unwrap()
+        .filter_map(|e| {
+            let n = e.unwrap().file_name().to_string_lossy().into_owned();
+            (n.starts_with("compose-") && n != "compose-ports.json" && n != "compose-projects.json")
+                .then_some(n)
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
     let v = state(&s.dir);
     assert_eq!(v["routes"].as_array().unwrap().len(), 1);
     assert_eq!(v["routes"][0]["name"], "independent");
@@ -212,70 +252,202 @@ else:raise Exception(a)
         .iter()
         .any(|r| r["name"] == "web.shop.localhost"));
 }
+/// Fake service managers that remember what is loaded, as files in the sandbox.
+fn fake_service_managers(s: &Sandbox) {
+    s.fake(
+        "launchctl",
+        r#"
+st=os.environ['PORCH_TEST_ROOT']+'/launchd-'+a[-1].replace('/','_') if a[0] in ('bootout','print') else None
+if a[0]=='bootstrap':
+ st=os.environ['PORCH_TEST_ROOT']+'/launchd-'+(a[1]+'/dev.porch.proxy').replace('/','_')
+ if os.path.exists(st):sys.exit(5)
+ open(st,'w').write(a[2])
+elif a[0]=='bootout':
+ if not os.path.exists(st):sys.exit(3)
+ os.remove(st)
+elif a[0]=='print':sys.exit(0 if os.path.exists(st) else 113)
+"#,
+    );
+    s.fake(
+        "systemctl",
+        r#"
+b=[x for x in a if x!='--user']
+st=os.environ['PORCH_TEST_ROOT']+('/systemd-user' if '--user' in a else '/systemd-system')
+if b[0]=='restart':open(st,'w').write('1')
+elif b[:2]==['disable','--now']:
+ if not os.path.exists(st):sys.exit(1)
+ os.remove(st)
+elif b[0]=='is-active':sys.exit(0 if os.path.exists(st) else 3)
+"#,
+    );
+    s.fake(
+        "schtasks",
+        r#"
+st=os.environ['PORCH_TEST_ROOT']+'/task-'+a[a.index('/TN')+1]
+if a[0]=='/Create':open(st,'w').write('1')
+elif a[0] in ('/Delete','/End','/Query','/Run'):
+ if not os.path.exists(st):sys.exit(1)
+ if a[0]=='/Delete':os.remove(st)
+"#,
+    );
+}
 #[test]
 fn service_templates_persist_every_setting_for_each_platform() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for platform in ["macos", "linux", "windows"] {
         let s = Sandbox::new();
-        for tool in ["launchctl", "systemctl", "schtasks"] {
-            s.fake(tool, "");
-        }
-        let out = s
-            .cmd()
-            .env("PORCH_SERVICE_PLATFORM", platform)
-            .args([
-                "service",
-                "install",
-                "--port",
-                "8443",
-                "--https",
-                "--tld",
-                "localhost",
-                "--tld",
-                "test",
-                "--lan",
-                "--ip",
-                "192.168.1.50",
-                "--wildcard",
-                "--cert",
-                "certificate & file.pem",
-                "--key",
-                "private key.pem",
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        fake_service_managers(&s);
+        let run = |args: &[&str]| {
+            let out = s
+                .cmd()
+                .env("PORCH_SERVICE_PLATFORM", platform)
+                .env("USERNAME", "me")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{platform} {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let install = [
+            "service",
+            "install",
+            "--port",
+            "8443",
+            "--https",
+            "--tld",
+            "localhost",
+            "--tld",
+            "test",
+            "--lan",
+            "--ip",
+            "192.168.1.50",
+            "--wildcard",
+            "--cert",
+            "certificate & file.pem",
+            "--key",
+            "private key.pem",
+        ];
+        run(&install);
         let content = fs::read_to_string(s.dir.join("service")).unwrap();
         assert!(content.contains("8443"));
         assert!(content.contains("--wildcard"));
         assert!(content.contains("192.168.1.50"));
         assert!(content.contains("--cert"));
+        // A login item that runs as this user, never as root.
+        match platform {
+            "macos" => {
+                assert!(content.contains("certificate &amp; file.pem"));
+                assert!(content.contains("<key>SuccessfulExit</key><false/>"));
+                assert!(s.log().contains("\"gui/"), "{}", s.log());
+                assert!(!s.log().contains("\"system\""), "{}", s.log());
+            }
+            "linux" => {
+                assert!(content.contains("WantedBy=default.target"));
+                assert!(!content.contains("User="));
+                assert!(s.log().contains("[\"systemctl\", \"--user\", \"restart\""));
+            }
+            _ => {
+                assert!(!content.contains("S-1-5-18"));
+                assert!(content.contains("<LogonTrigger>"));
+                assert!(content.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+                assert!(content.contains("--state-dir"));
+                assert!(s.log().contains("PorchProxy-me"), "{}", s.log());
+            }
+        }
+        let status = run(&["service", "status"]);
+        assert!(status.contains("wildcard: true"), "{status}");
+        assert!(status.contains("runs as: you"), "{status}");
+        assert!(!status.contains("warning"), "{status}");
+        // Installing again replaces the running service instead of failing.
+        run(&install);
         if platform == "macos" {
-            assert!(content.contains("certificate &amp; file.pem"));
+            let log = s.log();
+            assert_eq!(log.matches("\"bootstrap\"").count(), 2, "{log}");
         }
-        if platform == "windows" {
-            assert!(content.contains("S-1-5-18"));
-            assert!(content.contains("--state-dir"));
+        // Uninstall succeeds when the service manager no longer has it loaded,
+        // and still removes the startup file and record.
+        for entry in fs::read_dir(&s.dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if ["launchd-", "systemd-", "task-"]
+                .iter()
+                .any(|p| name.starts_with(p))
+            {
+                fs::remove_file(s.dir.join(name)).unwrap();
+            }
         }
-        let status = s
-            .cmd()
-            .env("PORCH_SERVICE_PLATFORM", platform)
-            .args(["service", "status"])
-            .output()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&status.stdout).contains("wildcard: true"));
-        let uninstall = s
-            .cmd()
-            .env("PORCH_SERVICE_PLATFORM", platform)
-            .args(["service", "uninstall"])
-            .output()
-            .unwrap();
-        assert!(uninstall.status.success());
+        run(&["service", "uninstall"]);
         assert!(!s.dir.join("service").exists());
+        assert!(!s.dir.join("state/service.json").exists());
+        run(&["service", "uninstall"]);
+        assert!(run(&["service", "status"]).contains("not installed"));
+    }
+}
+#[test]
+fn service_install_replaces_a_root_service_from_older_versions() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for platform in ["macos", "linux", "windows"] {
+        let s = Sandbox::new();
+        fake_service_managers(&s);
+        // What Porch 0.5.2 installed: a root unit and a record without a scope.
+        let legacy = match platform {
+            "windows" => s.dir.join("state/porch-service.xml"),
+            _ => s.dir.join("system-service"),
+        };
+        fs::write(
+            &legacy,
+            match platform {
+                "macos" => "<plist><string>dev.porch.proxy</string></plist>",
+                "linux" => "[Service]\nExecStart=/home/me/.cargo/bin/porch proxy start\n",
+                _ => "<Task><UserId>S-1-5-18</UserId></Task>",
+            },
+        )
+        .unwrap();
+        match platform {
+            "macos" => fs::write(s.dir.join("launchd-system_dev.porch.proxy"), "1").unwrap(),
+            "linux" => fs::write(s.dir.join("systemd-system"), "1").unwrap(),
+            _ => fs::write(s.dir.join("task-PorchProxy"), "1").unwrap(),
+        }
+        fs::write(
+            s.dir.join("state/service.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "platform": platform,
+                "path": legacy,
+                "state_dir": s.dir.join("state"),
+                "settings": {"port": 7462},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let cmd = |args: &[&str]| {
+            s.cmd()
+                .env("PORCH_SERVICE_PLATFORM", platform)
+                .env("USERNAME", "me")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let status = String::from_utf8_lossy(&cmd(&["service", "status"]).stdout).into_owned();
+        assert!(status.contains("runs as: root"), "{platform}: {status}");
+        assert!(status.contains("warning: the startup service runs Porch as root"));
+        let out = cmd(&["service", "install"]);
+        assert!(
+            out.status.success(),
+            "{platform}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!legacy.exists(), "{platform}: the root unit is removed");
+        assert!(!s.dir.join("launchd-system_dev.porch.proxy").exists());
+        assert!(!s.dir.join("systemd-system").exists());
+        assert!(!s.dir.join("task-PorchProxy").exists());
+        assert!(s.dir.join("service").exists());
+        let status = String::from_utf8_lossy(&cmd(&["service", "status"]).stdout).into_owned();
+        assert!(status.contains("runs as: you"), "{platform}: {status}");
+        assert!(!status.contains("warning"), "{platform}: {status}");
+        assert!(cmd(&["service", "uninstall"]).status.success());
     }
 }
 #[test]
@@ -412,9 +584,8 @@ fn trust_install_and_cleanup_use_only_recorded_certificate() {
         ("linux", false),
     ] {
         let s = Sandbox::new();
-        for tool in ["security", "update-ca-certificates"] {
-            s.fake(tool, "");
-        }
+        s.fake("update-ca-certificates", "");
+        fake_security(&s, "");
         // Listing a database shows the nickname Porch installed.
         s.fake(
             "certutil",
@@ -455,12 +626,23 @@ fn trust_install_and_cleanup_use_only_recorded_certificate() {
         );
         let log = s.log();
         match (platform, system) {
-            ("linux", true) => assert!(s.dir.join("trust/porch-8B7699335C1F.crt").exists()),
-            ("macos", true) => assert!(log.contains("/Library/Keychains/System.keychain")),
+            ("linux", true) => {
+                use std::os::unix::fs::PermissionsExt;
+                let anchor = s.dir.join("trust/porch-8B7699335C1F.crt");
+                // Readable by tools that read the hashed directory as a normal user.
+                let mode = fs::metadata(&anchor).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o644);
+            }
+            ("macos", true) => {
+                assert!(log.contains("/Library/Keychains/System.keychain"));
+                assert!(log.contains("\"-p\", \"ssl\", \"-p\", \"basic\""), "{log}");
+            }
             ("macos", false) => {
                 let keychain = s.dir.join("home/Library/Keychains/login.keychain-db");
                 assert!(log.contains(&*keychain.to_string_lossy()), "{log}");
                 assert!(!log.contains("System.keychain"), "{log}");
+                // Trusted for TLS only, never S/MIME or code signing.
+                assert!(log.contains("\"-p\", \"ssl\", \"-p\", \"basic\""), "{log}");
             }
             ("linux", false) => {
                 // No system CA tooling: the shared NSS db is created, and both dbs get the CA.
@@ -485,6 +667,13 @@ fn trust_install_and_cleanup_use_only_recorded_certificate() {
         );
         assert!(!s.dir.join("state/trust.json").exists());
         let log = s.log();
+        if (platform, system) == ("macos", true) {
+            // The admin trust setting goes too, not only the certificate.
+            assert!(
+                log.contains("[\"security\", \"remove-trusted-cert\", \"-d\""),
+                "{log}"
+            );
+        }
         assert!(
             log.contains(match (platform, system) {
                 ("macos", _) => "delete-certificate",
@@ -594,7 +783,7 @@ else:
 fn failed_trust_removal_retains_ca_for_retry() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let s = Sandbox::new();
-    s.fake("security", "\nif 'delete-certificate' in a:sys.exit(2)");
+    fake_security(&s, "if 'delete-certificate' in a:sys.exit(2)");
     write_ca(&s);
     fs::write(s.dir.join("state/ca-key.pem"), "fixture key").unwrap();
     let out = s
@@ -720,14 +909,15 @@ fn compose_passthrough_preserves_stdin_output_and_exit_status() {
 fn stalled_external_helper_has_bounded_lifetime() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let s = Sandbox::new();
-    s.fake("security", "time.sleep(60)");
+    // A helper that never waits on the user gets the short timeout.
+    s.fake("update-ca-certificates", "time.sleep(60)");
     write_ca(&s);
     let start = std::time::Instant::now();
     let out = s
         .cmd()
-        .env("PORCH_TRUST_PLATFORM", "macos")
+        .env("PORCH_TRUST_PLATFORM", "linux")
         .env("PORCH_COMMAND_TIMEOUT_MS", "500")
-        .args(["trust"])
+        .args(["trust", "--system"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -736,7 +926,7 @@ fn stalled_external_helper_has_bounded_lifetime() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
     // The helper may be killed before its interpreter runs a line, so find it
     // by its command line rather than by a file it would write.
-    let helper = s.dir.join("bin/security");
+    let helper = s.dir.join("bin/update-ca-certificates");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let running = Command::new("pgrep")
@@ -1122,7 +1312,7 @@ fn linux_user_trust_cleanup_keeps_record_for_inaccessible_db() {
 fn a_rotated_ca_loses_its_trust_when_the_new_one_is_trusted() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let s = Sandbox::new();
-    s.fake("security", "");
+    fake_security(&s, "");
     write_ca(&s);
     let trust = |s: &Sandbox| {
         let out = s
@@ -1237,4 +1427,188 @@ fn clean_ends_pairing_and_removes_logs_and_leftovers() {
         .collect();
     assert_eq!(left, vec!["notes.txt".to_owned()], "{left:?}");
     assert!(err.contains("Kept notes.txt"), "{err}");
+}
+
+#[test]
+fn trust_prompt_is_not_cut_off_by_the_helper_timeout() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = Sandbox::new();
+    // The password or Touch ID dialog takes longer than ordinary helpers may.
+    fake_security(&s, "if a[0]=='add-trusted-cert':time.sleep(1.5)");
+    write_ca(&s);
+    let trust = |prompt_ms: Option<&str>| {
+        let mut c = s.cmd();
+        c.env("PORCH_TRUST_PLATFORM", "macos")
+            .env("PORCH_COMMAND_TIMEOUT_MS", "300");
+        if let Some(ms) = prompt_ms {
+            c.env("PORCH_PROMPT_TIMEOUT_MS", ms);
+        }
+        c.args(["trust"]).output().unwrap()
+    };
+    let out = trust(None);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The prompt still has its own (long) bound.
+    fs::remove_file(s.dir.join("state/trust.json")).unwrap();
+    let out = trust(Some("300"));
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
+}
+
+#[test]
+fn macos_trust_removed_by_hand_does_not_block_clean_or_rotation() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for system in [false, true] {
+        let s = Sandbox::new();
+        // The certificate was deleted in Keychain Access: listings don't show
+        // it, and deleting it fails.
+        s.fake(
+            "security",
+            "if a[0]=='delete-certificate':sys.exit(44)\nif a[0]=='remove-trusted-cert':sys.exit(1)",
+        );
+        write_ca(&s);
+        let mut args = vec!["trust"];
+        if system {
+            args.push("--system");
+        }
+        let out = s
+            .cmd()
+            .env("PORCH_TRUST_PLATFORM", "macos")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let out = s
+            .cmd()
+            .env("PORCH_TRUST_PLATFORM", "macos")
+            .args(["clean"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "system={system}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!s.dir.join("state/trust.json").exists());
+        assert!(!s.log().contains("delete-certificate"), "{}", s.log());
+    }
+    // Porch's copy of a trusted CA is gone (deleted by hand) but the keychain
+    // still has it: its trust is removed using the keychain's copy.
+    let s = Sandbox::new();
+    let pem = PORCH_CA.trim_end().replace('\n', "\\n");
+    fake_security(
+        &s,
+        &format!(
+            "if a[0]=='find-certificate' and '-p' in a:print('{pem}')\nif a[0]=='remove-trusted-cert':assert open(a[-1]).read().startswith('-----BEGIN CERTIFICATE-----')"
+        ),
+    );
+    write_ca(&s);
+    let trust = || {
+        s.cmd()
+            .env("PORCH_TRUST_PLATFORM", "macos")
+            .args(["trust"])
+            .output()
+            .unwrap()
+    };
+    assert!(trust().status.success());
+    fs::remove_file(s.dir.join("state/ca.pem")).unwrap();
+    // A new CA now replaces it: trusting it first removes the old one's trust.
+    let made = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=Porch Local CA",
+            "-keyout",
+        ])
+        .arg(s.dir.join("state/ca-key.pem"))
+        .arg("-out")
+        .arg(s.dir.join("state/ca.pem"))
+        .output();
+    if !made.is_ok_and(|o| o.status.success()) {
+        eprintln!("skipping: openssl unavailable");
+        return;
+    }
+    let out = trust();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = s.log();
+    assert!(log.contains("remove-trusted-cert"), "{log}");
+    assert!(
+        log.contains(&format!(
+            "\"delete-certificate\", \"-Z\", \"{PORCH_CA_SHA1}\""
+        )),
+        "{log}"
+    );
+    assert!(!fs::read_dir(s.dir.join("state")).unwrap().any(|e| e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".untrust-")));
+}
+
+#[test]
+fn windows_trust_already_removed_by_hand_does_not_block_clean() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (still_there, ok) in [(false, true), (true, false)] {
+        let s = Sandbox::new();
+        s.fake(
+            "certutil",
+            &format!(
+                "if '-delstore' in a:sys.exit(1)\nif '-verifystore' in a:sys.exit({})",
+                if still_there { 0 } else { 1 }
+            ),
+        );
+        write_ca(&s);
+        let run = |args: &[&str]| {
+            s.cmd()
+                .env("PORCH_TRUST_PLATFORM", "windows")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["trust"]).status.success());
+        assert_eq!(run(&["clean"]).status.success(), ok, "{}", s.log());
+        assert_eq!(s.dir.join("state/trust.json").exists(), !ok);
+    }
+}
+
+#[test]
+fn unreadable_sharing_records_never_block_prune_or_clean() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = Sandbox::new();
+    // An interrupted write (empty) and a corrupt record.
+    fs::write(s.dir.join("state/sharing-1-3000.json"), "").unwrap();
+    fs::write(s.dir.join("state/sharing-2-3001.json"), "{not json").unwrap();
+    // A record from a launcher that is gone, whose Tailscale is unavailable.
+    fs::write(
+        s.dir.join("state/sharing-3-3002.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "owner": {"pid": 999_999, "started": "gone"},
+            "local_port": 3002,
+            "tailscale": [["serve", 443]],
+            "tunnels": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    s.fake("tailscale", "sys.exit(1)");
+    s.ok(&["prune"]);
+    assert!(!s.dir.join("state/sharing-1-3000.json").exists());
+    assert!(!s.dir.join("state/sharing-2-3001.json").exists());
+    // Kept for the next prune, since its Tailscale sharing may still be on.
+    assert!(s.dir.join("state/sharing-3-3002.json").exists());
+    s.ok(&["clean"]);
+    assert!(!s.dir.join("state/sharing-3-3002.json").exists());
 }

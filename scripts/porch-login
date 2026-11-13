@@ -7,6 +7,7 @@ import plistlib
 import subprocess
 import sys
 import tempfile
+import time
 
 LABEL = 'dev.porch.tray'
 MARKER = 'X-Porch-Owned=true'
@@ -33,6 +34,32 @@ def launchctl(*args):
         raise RuntimeError(result.stderr.strip() or f'launchctl exited {result.returncode}')
 
 
+def loaded(target):
+    return subprocess.run(['launchctl', 'print', target], capture_output=True).returncode == 0
+
+
+def bootout(target):
+    """Unload the job and wait until launchd has let go of it: a bootstrap
+    straight after a bootout fails while the old job is still being torn down."""
+    subprocess.run(['launchctl', 'bootout', target], capture_output=True)
+    deadline = time.monotonic() + 10
+    while loaded(target) and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+
+def bootstrap(domain, target, path):
+    for attempt in range(4):
+        try:
+            launchctl('bootstrap', domain, str(path))
+            return
+        except RuntimeError:
+            if loaded(target):
+                return
+            if attempt == 3:
+                raise
+            time.sleep(0.5)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['enable', 'disable', 'status'])
@@ -54,7 +81,7 @@ def main():
             return
         if args.action == 'disable':
             if path.exists():
-                subprocess.run(['launchctl', 'bootout', f'{domain}/{LABEL}'], capture_output=True)
+                bootout(f'{domain}/{LABEL}')
                 path.unlink()
             print('Porch menu login startup disabled. Apps and proxy are unchanged.')
             return
@@ -65,12 +92,17 @@ def main():
                   'StandardOutPath': str(logs / 'tray.log'), 'StandardErrorPath': str(logs / 'tray.log')}
         if os.getenv('PORCH_STATE_DIR'):
             config['EnvironmentVariables'] = {'PORCH_STATE_DIR': os.environ['PORCH_STATE_DIR']}
-        if path.exists():
-            subprocess.run(['launchctl', 'bootout', f'{domain}/{LABEL}'], capture_output=True)
+        target = f'{domain}/{LABEL}'
+        existed = path.exists()
+        if existed:
+            bootout(target)
         atomic_write(path, plistlib.dumps(config))
         try:
-            launchctl('bootstrap', domain, str(path))
-        except RuntimeError:
+            bootstrap(domain, target, path)
+        except RuntimeError as error:
+            if existed:
+                # It was enabled before: keep it enabled for the next login.
+                raise RuntimeError(f'{error}; the login item stays enabled and starts at your next login')
             path.unlink(missing_ok=True)
             raise
         print('Porch menu login startup enabled and launched. Sharing remains unchanged.')

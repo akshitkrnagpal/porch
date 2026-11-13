@@ -23,25 +23,60 @@ fn env(name: &str) -> Option<String> {
 fn disabled(name: &str) -> bool {
     env(name).is_some_and(|v| matches!(v.as_str(), "0" | "false"))
 }
+/// Write a private state file atomically (temporary file, then rename), so a
+/// crash or full disk never leaves it empty or half written.
 fn write_state(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let name = path
+        .file_name()
+        .context("state file has no name")?
+        .to_string_lossy();
+    let temporary = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    let result = (|| -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes.as_ref())?;
+        file.sync_all()?;
+        crate::state::inherit_owner(&temporary)?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    let mut file = options.open(path)?;
-    file.write_all(bytes.as_ref())?;
-    file.sync_all()?;
-    crate::state::inherit_owner(path)?;
-    Ok(())
+    result
 }
 /// Helper stdout beyond this is an error, never silently truncated (stderr is diagnostic
 /// only and may be capped): callers such as NSS
 /// cleanup infer absence from a complete listing.
 const COMMAND_OUTPUT_LIMIT: u64 = 32 * 1024 * 1024;
+/// How long a helper may run: `PORCH_COMMAND_TIMEOUT_MS`, 30 seconds by default.
+fn helper_timeout() -> Duration {
+    Duration::from_millis(
+        env("COMMAND_TIMEOUT_MS")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30_000u64),
+    )
+}
+/// How long a helper that waits on the user (a password, Touch ID or
+/// confirmation dialog) may run: `PORCH_PROMPT_TIMEOUT_MS`, 10 minutes by default.
+fn prompt_timeout() -> Duration {
+    Duration::from_millis(
+        env("PROMPT_TIMEOUT_MS")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600_000u64),
+    )
+}
 fn command(program: &str, args: &[String]) -> Result<String> {
+    command_within(program, args, helper_timeout())
+}
+fn command_within(program: &str, args: &[String], timeout: Duration) -> Result<String> {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -69,10 +104,7 @@ fn command(program: &str, args: &[String]) -> Result<String> {
     };
     let stdout = read(Box::new(stdout));
     let stderr = read(Box::new(stderr));
-    let timeout = env("COMMAND_TIMEOUT_MS")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30_000u64);
-    let deadline = std::time::Instant::now() + Duration::from_millis(timeout);
+    let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -84,7 +116,7 @@ fn command(program: &str, args: &[String]) -> Result<String> {
             }
             let _ = child.kill();
             let _ = child.wait();
-            bail!("{program} timed out after {timeout}ms");
+            bail!("{program} timed out after {}ms", timeout.as_millis());
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -107,6 +139,15 @@ pub(crate) fn exec(program: &str, args: &[&str]) -> Result<String> {
     command(
         program,
         &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+    )
+}
+/// Run a helper that may wait on the user, such as a trust dialog: it gets
+/// minutes rather than the usual 30 seconds.
+fn exec_prompt(program: &str, args: &[&str]) -> Result<String> {
+    command_within(
+        program,
+        &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        prompt_timeout(),
     )
 }
 fn valid_hostname(host: &str) -> Result<String> {
@@ -229,13 +270,33 @@ fn hosts(action: &str) -> Result<()> {
     }
     let mut file=options.open(&path).context("writing hosts file requires administrator privileges; run porch hosts sync once with elevation")?;
     file.lock_exclusive()?;
-    let original = fs::read_to_string(&path)?;
-    let updated = hosts_content(&original, &names)?;
-    if original != updated {
-        file.set_len(0)?;
-        file.write_all(updated.as_bytes())?;
-        file.sync_all()?;
+    rewrite_locked(&mut file, |original| hosts_content(original, &names))
+}
+/// Rewrite a locked file in place through the locking handle. Windows locks are
+/// mandatory and per handle, so a second handle couldn't read it. The new text
+/// is written from the start, padded with blank lines over any old tail, and
+/// synced before the file is cut to length: an interruption leaves a complete
+/// file with trailing blank lines, never an empty or partial one. (A rename
+/// isn't used: /etc/hosts is often a bind mount, as in containers.)
+fn rewrite_locked(file: &mut fs::File, update: impl FnOnce(&str) -> Result<String>) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut original = String::new();
+    file.seek(SeekFrom::Start(0))?;
+    file.read_to_string(&mut original)?;
+    let updated = update(&original)?;
+    if original == updated {
+        return Ok(());
     }
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(updated.as_bytes())?;
+    let tail = original.len().saturating_sub(updated.len());
+    if tail > 0 {
+        file.write_all(&vec![b'\n'; tail])?;
+    }
+    file.flush()?;
+    file.sync_all()?;
+    file.set_len(updated.len() as u64)?;
+    file.sync_all()?;
     Ok(())
 }
 /// Capability probe only: open for writing without modifying the hosts file.
@@ -630,112 +691,834 @@ fn service_settings(args: &[String]) -> Result<crate::state::ProxySettings> {
     }
     Ok(s)
 }
+/// launchd label, systemd unit and Windows task of the proxy's startup service.
+const SERVICE_LABEL: &str = "dev.porch.proxy";
+const SERVICE_UNIT: &str = "porch.service";
+/// The SYSTEM scheduled task Porch 0.5.2 and earlier installed on Windows.
+const LEGACY_TASK: &str = "PorchProxy";
 #[derive(Serialize, Deserialize)]
 struct ServiceRecord {
     platform: String,
     path: PathBuf,
     state_dir: PathBuf,
     settings: crate::state::ProxySettings,
+    /// `user` (a login item that runs as you) or `system` (a Linux system unit
+    /// that runs as you with only the right to bind low ports). Records from
+    /// Porch 0.5.2 and earlier have none: their service ran as root.
+    #[serde(default)]
+    scope: Option<String>,
+    /// The Windows task name.
+    #[serde(default)]
+    task: Option<String>,
+    /// The root-owned copy of porch a Linux system unit runs.
+    #[serde(default)]
+    binary: Option<PathBuf>,
+}
+fn service_record() -> Option<ServiceRecord> {
+    serde_json::from_slice(&fs::read(crate::state::dir().join("service.json")).ok()?).ok()
 }
 fn service_platform() -> String {
     std::env::var("PORCH_SERVICE_PLATFORM").unwrap_or_else(|_| std::env::consts::OS.into())
 }
-fn service_path(platform: &str) -> PathBuf {
+#[cfg(unix)]
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+#[cfg(not(unix))]
+fn is_root() -> bool {
+    false
+}
+/// The account the service is for: the sudo caller when elevated, else this
+/// user. `(uid, gid, home)`.
+#[cfg(unix)]
+fn service_owner() -> Result<(u32, u32, PathBuf)> {
+    let uid = std::env::var("SUDO_UID")
+        .ok()
+        .filter(|_| is_root())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| unsafe { libc::getuid() });
+    let pw = unsafe { libc::getpwuid(uid) };
+    if pw.is_null() {
+        return Ok((uid, unsafe { libc::getgid() }, user_home()?));
+    }
+    let (gid, home) = unsafe {
+        (
+            (*pw).pw_gid,
+            std::ffi::CStr::from_ptr((*pw).pw_dir)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+    // Tests and isolated setups point HOME elsewhere; honour it for the user itself.
+    let home = if is_root() {
+        PathBuf::from(home)
+    } else {
+        user_home().unwrap_or_else(|_| PathBuf::from(home))
+    };
+    Ok((uid, gid, home))
+}
+#[cfg(not(unix))]
+fn service_owner() -> Result<(u32, u32, PathBuf)> {
+    Ok((0, 0, PathBuf::new()))
+}
+/// The per-user startup file (`PORCH_SERVICE_FILE` overrides it in tests).
+fn user_service_path(platform: &str) -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("PORCH_SERVICE_FILE") {
-        return p.into();
+        return Ok(p.into());
+    }
+    if platform == "windows" {
+        // Task Scheduler keeps its own copy; this one records what was installed.
+        return Ok(crate::state::dir().join("porch-service.xml"));
+    }
+    let home = service_owner()?.2;
+    Ok(match platform {
+        "macos" => home
+            .join("Library/LaunchAgents")
+            .join(format!("{SERVICE_LABEL}.plist")),
+        "linux" => std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty() && !is_root())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+            .join("systemd/user")
+            .join(SERVICE_UNIT),
+        _ => bail!("startup service supports macOS, Linux and Windows"),
+    })
+}
+/// The system-level unit: the root LaunchDaemon of Porch 0.5.2 and earlier on
+/// macOS, the system unit on Linux (`PORCH_SYSTEM_SERVICE_FILE` overrides it).
+fn system_service_path(platform: &str) -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("PORCH_SYSTEM_SERVICE_FILE") {
+        return Some(p.into());
     }
     match platform {
-        "macos" => "/Library/LaunchDaemons/dev.porch.proxy.plist".into(),
-        "linux" => "/etc/systemd/system/porch.service".into(),
-        _ => crate::state::dir().join("porch-service.xml"),
+        "macos" => Some(format!("/Library/LaunchDaemons/{SERVICE_LABEL}.plist").into()),
+        "linux" => Some(format!("/etc/systemd/system/{SERVICE_UNIT}").into()),
+        _ => None,
     }
 }
-fn service(action: &str, args: &[String]) -> Result<()> {
-    let record_path = crate::state::dir().join("service.json");
+/// Where a Linux system unit's root-owned copy of porch lives.
+fn system_binary_path() -> PathBuf {
+    match std::env::var_os("PORCH_SYSTEM_SERVICE_FILE") {
+        Some(p) => PathBuf::from(p).with_file_name("porch-service-bin"),
+        None => "/usr/local/lib/porch/porch".into(),
+    }
+}
+fn system_paths_overridden() -> bool {
+    std::env::var_os("PORCH_SYSTEM_SERVICE_FILE").is_some()
+}
+fn windows_task(user: Option<&str>) -> String {
+    let user: String = user
+        .map(str::to_owned)
+        .or_else(|| std::env::var("USERNAME").ok())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("{LEGACY_TASK}-{user}")
+}
+/// Is a system-level startup unit installed (a root LaunchDaemon from Porch
+/// 0.5.2 or earlier, or a Linux system unit)? Removing it needs sudo.
+pub fn system_service_installed() -> bool {
     let platform = service_platform();
-    let path = service_path(&platform);
-    let exe = std::env::current_exe()?;
-    let p = path.to_string_lossy();
-    match action {
-        "status" => {
-            if let Ok(raw) = fs::read_to_string(&record_path) {
-                let record: ServiceRecord = serde_json::from_str(&raw)?;
-                println!("installed: {}\nstate: {}\nHTTPS: {}\nport: {}\nTLDs: {}\nLAN: {}\nwildcard: {}",record.path.display(),record.state_dir.display(),record.settings.tls,record.settings.port,record.settings.tlds.join(","),record.settings.lan,record.settings.wildcard);
-            } else {
-                println!("not installed");
-            }
-            return Ok(());
+    system_service_path(&platform).is_some_and(|p| p.exists())
+}
+/// Whether `porch service ARGS` must run with sudo: only installing or
+/// removing the Linux system unit (`--system`) does.
+pub fn service_needs_elevation(args: &[String]) -> bool {
+    !system_paths_overridden()
+        && args
+            .first()
+            .is_some_and(|a| a == "install" || a == "uninstall")
+        && args.iter().any(|a| a == "--system")
+}
+/// A problem with the installed startup service worth telling the user about,
+/// for `porch service status` and `porch doctor`.
+pub fn service_warning() -> Option<String> {
+    let platform = service_platform();
+    let record = service_record();
+    let root_unit = || -> bool {
+        match (platform.as_str(), system_service_path(&platform)) {
+            ("macos", Some(p)) => p.exists(),
+            ("linux", Some(p)) => fs::read_to_string(p)
+                .is_ok_and(|body| !body.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE")),
+            _ => false,
         }
-        "install" => {}
-        "uninstall" => {
-            if !path.exists() && !record_path.exists() {
+    };
+    let legacy_windows = platform == "windows"
+        && record.as_ref().is_some_and(|r| r.scope.is_none())
+        || fs::read_to_string(crate::state::dir().join("porch-service.xml"))
+            .is_ok_and(|body| body.contains("S-1-5-18"));
+    if root_unit() || legacy_windows || record.as_ref().is_some_and(|r| r.scope.is_none()) {
+        return Some("the startup service runs Porch as root (installed by Porch 0.5.2 or earlier); run `porch service install` to replace it with one that runs as you".into());
+    }
+    if let Some(binary) = record.and_then(|r| r.binary) {
+        let current = std::env::current_exe().ok()?;
+        let digest = |p: &Path| fs::read(p).ok().map(Sha256::digest);
+        if digest(&binary) != digest(&current) {
+            return Some(format!(
+                "the startup service runs a copy of an older porch ({}); run `porch service install --system` again to update it",
+                binary.display()
+            ));
+        }
+    }
+    None
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceScope {
+    User,
+    System,
+}
+/// Where the startup service runs. Wherever this user can bind the proxy's
+/// ports (always on Windows, port 80/443 on macOS, every port from 1024), it is
+/// a login item that runs as you. Only Linux without a lowered
+/// `ip_unprivileged_port_start` needs a system unit for ports below 1024, and
+/// that unit still runs as you, with just the right to bind them.
+fn service_scope(
+    platform: &str,
+    settings: &crate::state::ProxySettings,
+    root: bool,
+    system: bool,
+    bindable: impl Fn(u16) -> bool,
+) -> Result<ServiceScope> {
+    let low: Vec<u16> = std::iter::once(settings.port)
+        .chain(settings.redirect_port.filter(|_| settings.tls))
+        .filter(|p| *p < crate::ports::FIRST_UNPRIVILEGED_PORT)
+        .collect();
+    if platform == "linux"
+        && (system || (!low.is_empty() && (root || !low.iter().all(|p| bindable(*p)))))
+    {
+        if low.is_empty() {
+            bail!("the proxy's ports need no privileges; run `porch service install` without --system")
+        }
+        return Ok(ServiceScope::System);
+    }
+    if system {
+        bail!("--system is only for Linux ports below 1024");
+    }
+    if root {
+        bail!("run `porch service install` without sudo: the startup service runs as you");
+    }
+    // macOS lets any user bind low ports only on the wildcard address.
+    let wildcard = settings
+        .bind
+        .as_deref()
+        .is_none_or(|b| b == "0.0.0.0" || b == "::");
+    if platform == "macos" && !low.is_empty() && !(wildcard && low.iter().all(|p| bindable(*p))) {
+        bail!(
+            "macOS doesn't let you serve port {} {}without sudo; install with the default port: `porch service install --port {}`",
+            low[0],
+            if wildcard { "" } else { "on that address " },
+            crate::ports::DEFAULT_PROXY_PORT
+        );
+    }
+    Ok(ServiceScope::User)
+}
+/// May this user bind `port` at all? A port that is merely in use (by the
+/// proxy `porch setup` just started, say) still counts.
+fn user_may_bind(port: u16) -> bool {
+    match crate::sockets::reserve(port) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::PermissionDenied,
+    }
+}
+fn render_service(
+    platform: &str,
+    scope: ServiceScope,
+    exe: &Path,
+    state: &Path,
+    argv: &[String],
+    owner: (u32, u32),
+    windows_user: &str,
+) -> Result<String> {
+    let exe = exe.to_string_lossy();
+    let log = state.join("proxy.log");
+    Ok(match (platform, scope) {
+        // KeepAlive only after a failure: `porch proxy stop` (a clean exit)
+        // stays stopped, as does a proxy an upgrade replaced.
+        ("macos", ServiceScope::User) => format!(
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
+                "<plist version=\"1.0\"><dict>",
+                "<key>Label</key><string>{label}</string>",
+                "<key>ProgramArguments</key><array><string>{exe}</string>{args}</array>",
+                "<key>EnvironmentVariables</key><dict><key>PORCH_STATE_DIR</key><string>{state}</string></dict>",
+                "<key>StandardOutPath</key><string>{log}</string>",
+                "<key>StandardErrorPath</key><string>{log}</string>",
+                "<key>RunAtLoad</key><true/>",
+                "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>",
+                "<key>ThrottleInterval</key><integer>10</integer>",
+                "</dict></plist>\n"
+            ),
+            label = SERVICE_LABEL,
+            exe = xml(&exe),
+            args = argv
+                .iter()
+                .map(|a| format!("<string>{}</string>", xml(a)))
+                .collect::<String>(),
+            state = xml(&state.to_string_lossy()),
+            log = xml(&log.to_string_lossy()),
+        ),
+        ("linux", _) => {
+            let exec = std::iter::once(systemd_quote(&exe))
+                .chain(argv.iter().map(|a| systemd_quote(a)))
+                .collect::<Result<Vec<_>>>()?
+                .join(" ");
+            let env = systemd_quote(&format!("PORCH_STATE_DIR={}", state.display()))?;
+            match scope {
+                ServiceScope::User => format!(
+                    "# {SERVICE_LABEL}: managed by `porch service install`\n[Unit]\nDescription=Porch proxy\nAfter=network.target\n[Service]\nExecStart={exec}\nEnvironment={env}\nRestart=on-failure\nRestartSec=5\n[Install]\nWantedBy=default.target\n"
+                ),
+                // Never root: the process runs as you and holds only the right
+                // to bind ports below 1024, which it can't pass on.
+                ServiceScope::System => format!(
+                    "# {SERVICE_LABEL}: managed by `porch service install --system`\n[Unit]\nDescription=Porch proxy\nAfter=network.target\n[Service]\nUser={uid}\nGroup={gid}\nExecStart={exec}\nEnvironment={env}\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nNoNewPrivileges=yes\nRestart=on-failure\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\n",
+                    uid = owner.0,
+                    gid = owner.1,
+                ),
+            }
+        }
+        ("windows", _) => {
+            // A logon task runs in the user's session, so start the detached
+            // proxy and let this console close, as the discovery agent does.
+            let line = argv
+                .iter()
+                .filter(|a| *a != "--foreground")
+                .map(|a| windows_quote(a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                concat!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                    "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">",
+                    "<RegistrationInfo><Description>{label}: Porch proxy, managed by `porch service install`</Description></RegistrationInfo>",
+                    "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>",
+                    "<Principals><Principal id=\"Author\"><UserId>{user}</UserId>",
+                    "<LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>",
+                    "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+                    "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+                    "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+                    "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>",
+                    "<Actions Context=\"Author\"><Exec><Command>{exe}</Command>",
+                    "<Arguments>{args}</Arguments></Exec></Actions></Task>\n"
+                ),
+                label = SERVICE_LABEL,
+                user = xml(windows_user),
+                exe = xml(&exe),
+                args = xml(&format!(
+                    "{line} --state-dir {}",
+                    windows_quote(&state.to_string_lossy())
+                )),
+            )
+        }
+        _ => bail!("unsupported startup service platform"),
+    })
+}
+/// `DOMAIN\user` of the current account, which a logon task is bound to.
+fn windows_account() -> String {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    match std::env::var("USERDOMAIN") {
+        Ok(domain) if !domain.is_empty() => format!("{domain}\\{user}"),
+        _ => user,
+    }
+}
+/// Homebrew upgrades delete the versioned Cellar path, so point a startup file
+/// at the stable `<prefix>/bin/porch` link when one exists.
+fn stable_exe(exe: &Path) -> PathBuf {
+    let parts: Vec<_> = exe.components().collect();
+    if let Some(i) = parts
+        .windows(2)
+        .position(|w| w[0].as_os_str() == "Cellar" && w[1].as_os_str() == "porch")
+    {
+        let link = parts[..i].iter().collect::<PathBuf>().join("bin/porch");
+        if link.exists() {
+            return link;
+        }
+    }
+    exe.to_path_buf()
+}
+/// Write a file atomically with `mode` (temporary file, then rename).
+fn write_unit(path: &Path, body: impl AsRef<[u8]>, mode: u32) -> Result<()> {
+    let parent = path.parent().context("startup file has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".{SERVICE_LABEL}.{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    let result = (|| -> std::io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode).custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut f = options.open(&temporary)?;
+        #[cfg(unix)]
+        {
+            // The umask may have narrowed the mode.
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+        f.write_all(body.as_ref())?;
+        f.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.with_context(|| format!("writing {}", path.display()))
+}
+fn remove_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("removing {}", path.display()))),
+    }
+}
+fn launchd_loaded(target: &str) -> bool {
+    exec("launchctl", &["print", target]).is_ok()
+}
+/// Unload a launchd job and wait until launchd has let go of it: a bootstrap
+/// straight after a bootout fails while the old job is still being torn down.
+fn launchd_unload(target: &str) {
+    let _ = exec("launchctl", &["bootout", target]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while launchd_loaded(target) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+fn launchd_load(domain: &str, path: &Path) -> Result<()> {
+    let target = format!("{domain}/{SERVICE_LABEL}");
+    launchd_unload(&target);
+    let path = path.to_string_lossy();
+    let mut attempt = 0;
+    loop {
+        match exec("launchctl", &["bootstrap", domain, &path]) {
+            Ok(_) => return Ok(()),
+            Err(_) if launchd_loaded(&target) => return Ok(()),
+            Err(e) if attempt >= 3 => return Err(e),
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+fn systemctl(user: bool, args: &[&str]) -> Result<String> {
+    let mut all = Vec::new();
+    if user {
+        all.push("--user");
+    }
+    all.extend_from_slice(args);
+    exec("systemctl", &all)
+}
+fn systemd_active(user: bool) -> bool {
+    systemctl(user, &["is-active", "--quiet", SERVICE_UNIT]).is_ok()
+}
+fn task_exists(task: &str) -> bool {
+    exec("schtasks", &["/Query", "/TN", task]).is_ok()
+}
+/// Remove the per-user startup service. Not being loaded counts as removed;
+/// its file is always deleted, and only a service that is still running
+/// afterwards is an error.
+fn uninstall_user_scope(platform: &str) -> Result<()> {
+    let path = user_service_path(platform)?;
+    let record = service_record();
+    let mut still = None;
+    match platform {
+        "macos" => {
+            let target = format!("gui/{}/{SERVICE_LABEL}", service_owner()?.0);
+            // Only ever touch the job Porch's own startup file describes.
+            if path.exists() {
+                launchd_unload(&target);
+                if launchd_loaded(&target) {
+                    still = Some(target);
+                }
+            }
+        }
+        "linux" => {
+            if path.exists() {
+                if is_root() {
+                    // Elevated cleanup: reach the user's manager if it can.
+                    let machine = format!("--machine={}@", service_owner()?.0);
+                    let _ = exec(
+                        "systemctl",
+                        &["--user", &machine, "disable", "--now", SERVICE_UNIT],
+                    );
+                } else {
+                    let _ = systemctl(true, &["disable", "--now", SERVICE_UNIT]);
+                    if systemd_active(true) {
+                        still = Some(format!("user unit {SERVICE_UNIT}"));
+                    }
+                }
+            }
+        }
+        "windows" => {
+            let task = record
+                .as_ref()
+                .and_then(|r| r.task.clone())
+                .unwrap_or_else(|| windows_task(None));
+            if path.exists() || record.as_ref().is_some_and(|r| r.task.is_some()) {
+                let _ = exec("schtasks", &["/End", "/TN", &task]);
+                let _ = exec("schtasks", &["/Delete", "/TN", &task, "/F"]);
+                if task_exists(&task) {
+                    still = Some(format!("task {task}"));
+                }
+            }
+        }
+        _ => bail!("unsupported startup service platform"),
+    }
+    // A record-only Windows file of the legacy task is the system scope's.
+    let legacy_file = platform == "windows"
+        && fs::read_to_string(&path).is_ok_and(|body| body.contains("S-1-5-18"));
+    if !legacy_file {
+        remove_if_present(&path)?;
+    }
+    if platform == "linux" && !is_root() {
+        let _ = systemctl(true, &["daemon-reload"]);
+    }
+    if let Some(what) = still {
+        bail!("the startup service ({what}) is still loaded after removing it");
+    }
+    Ok(())
+}
+/// Remove the system-level startup service: the root LaunchDaemon or SYSTEM
+/// task of Porch 0.5.2 and earlier, or a Linux system unit. Needs root (or
+/// an administrator on Windows).
+fn uninstall_system_scope(platform: &str) -> Result<()> {
+    match platform {
+        "macos" => {
+            let Some(path) = system_service_path(platform) else {
+                return Ok(());
+            };
+            if !path.exists() {
                 return Ok(());
             }
-            match platform.as_str() {
-                "macos" => {
-                    exec("launchctl", &["bootout", "system", &p])?;
-                }
-                "linux" => {
-                    exec("systemctl", &["disable", "--now", "porch.service"])?;
-                }
-                "windows" => {
-                    exec("schtasks", &["/Delete", "/TN", "PorchProxy", "/F"])?;
-                }
-                _ => bail!("unsupported startup service platform"),
-            };
-            if path.exists() {
-                fs::remove_file(&path)?;
+            let target = format!("system/{SERVICE_LABEL}");
+            launchd_unload(&target);
+            remove_if_present(&path).context(
+                "removing the old root startup service needs sudo: run `porch service uninstall`",
+            )?;
+            if launchd_loaded(&target) {
+                bail!("the old root startup service is still loaded after removing it");
             }
-            if platform == "linux" {
-                exec("systemctl", &["daemon-reload"])?;
-            }
-            if record_path.exists() {
-                fs::remove_file(record_path)?;
-            }
-            return Ok(());
         }
-        _ => bail!("usage: service install|status|uninstall"),
+        "linux" => {
+            let Some(path) = system_service_path(platform) else {
+                return Ok(());
+            };
+            if !path.exists() {
+                return Ok(());
+            }
+            let _ = systemctl(false, &["disable", "--now", SERVICE_UNIT]);
+            remove_if_present(&path).context(
+                "removing the system startup service needs sudo: run `porch service uninstall`",
+            )?;
+            let _ = systemctl(false, &["daemon-reload"]);
+            if let Some(binary) = service_record().and_then(|r| r.binary) {
+                if binary == system_binary_path() {
+                    remove_if_present(&binary)?;
+                }
+            }
+            if systemd_active(false) {
+                bail!("the system startup service is still running after removing it");
+            }
+        }
+        "windows" => {
+            if task_exists(LEGACY_TASK) {
+                let _ = exec("schtasks", &["/End", "/TN", LEGACY_TASK]);
+                let _ = exec("schtasks", &["/Delete", "/TN", LEGACY_TASK, "/F"]);
+                if task_exists(LEGACY_TASK) {
+                    bail!("removing the old SYSTEM startup task needs an administrator: run `porch service uninstall` from an elevated prompt");
+                }
+            }
+            let legacy = crate::state::dir().join("porch-service.xml");
+            if fs::read_to_string(&legacy).is_ok_and(|body| body.contains("S-1-5-18")) {
+                remove_if_present(&legacy)?;
+            }
+        }
+        _ => {}
     }
-    let settings = service_settings(args)?;
+    Ok(())
+}
+fn system_scope_present(platform: &str) -> bool {
+    match platform {
+        "windows" => {
+            service_record().is_some_and(|r| r.scope.is_none())
+                || fs::read_to_string(crate::state::dir().join("porch-service.xml"))
+                    .is_ok_and(|body| body.contains("S-1-5-18"))
+        }
+        _ => system_service_path(platform).is_some_and(|p| p.exists()),
+    }
+}
+fn user_scope_present(platform: &str) -> bool {
+    user_service_path(platform)
+        .is_ok_and(|p| fs::read_to_string(p).is_ok_and(|body| !body.contains("S-1-5-18")))
+}
+/// Delete service.json once nothing it describes is installed any more.
+fn forget_service_record(platform: &str) -> Result<()> {
+    if !user_scope_present(platform) && !system_scope_present(platform) {
+        remove_if_present(&crate::state::dir().join("service.json"))?;
+    }
+    Ok(())
+}
+/// Remove the per-user startup service, as the user. `porch clean` runs this
+/// before it elevates, like per-user trust.
+pub fn uninstall_user_service() -> Result<()> {
+    let platform = service_platform();
+    if !matches!(platform.as_str(), "macos" | "linux" | "windows") {
+        return Ok(());
+    }
+    uninstall_user_scope(&platform)?;
+    forget_service_record(&platform)
+}
+/// `porch service uninstall` without elevation: both scopes, as far as this
+/// process's privileges go. Every step runs even when an earlier one fails.
+fn service_uninstall(platform: &str) -> Result<()> {
+    let mut errors = Vec::new();
+    if let Err(e) = uninstall_user_scope(platform) {
+        errors.push(e);
+    }
+    if system_scope_present(platform) {
+        if let Err(e) = uninstall_system_scope(platform) {
+            errors.push(e);
+        }
+    }
+    forget_service_record(platform)?;
+    match errors.into_iter().next() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+/// Copy this porch to a root-owned path for a system unit, so the user can't
+/// replace what it runs.
+#[cfg(unix)]
+fn install_system_binary(target: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::env::current_exe()?;
+    let exe = stable_exe(&exe.canonicalize().unwrap_or(exe));
+    let parent = target.parent().context("service binary has no parent")?;
+    fs::create_dir_all(parent)?;
+    if !system_paths_overridden() {
+        let meta = fs::symlink_metadata(parent)?;
+        if meta.file_type().is_symlink() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            bail!(
+                "{} must be a directory only root can write to",
+                parent.display()
+            );
+        }
+    }
+    write_unit(target, fs::read(&exe)?, 0o755)
+        .with_context(|| format!("copying porch to {}", target.display()))?;
+    Ok(target.to_path_buf())
+}
+#[cfg(not(unix))]
+fn install_system_binary(_: &Path) -> Result<PathBuf> {
+    bail!("system startup units are only for Linux")
+}
+async fn service_install(args: &[String]) -> Result<()> {
+    let system = args.iter().any(|a| a == "--system");
+    let args: Vec<String> = args.iter().filter(|a| *a != "--system").cloned().collect();
+    let platform = service_platform();
+    let mut settings = service_settings(&args)?;
+    let scope = service_scope(
+        &platform,
+        &settings,
+        is_root() && !system_paths_overridden(),
+        system,
+        user_may_bind,
+    )?;
+    if scope == ServiceScope::System && !system {
+        // The user part (removing a login item) runs as the user; only the
+        // system unit is installed with sudo.
+        uninstall_user_scope(&platform)?;
+        let mut elevated = vec!["install".to_owned(), "--system".to_owned()];
+        elevated.extend(args);
+        return Box::pin(crate::cli::integration("service", elevated)).await;
+    }
+    if scope == ServiceScope::User {
+        // The proxy runs as you, so it can't edit the hosts file: no sudo mode.
+        settings.unprivileged = true;
+        if system_scope_present(&platform) {
+            // Replace an old root service (it also holds the proxy's port).
+            if platform == "windows" || system_paths_overridden() || is_root() {
+                uninstall_system_scope(&platform)?;
+            } else {
+                Box::pin(crate::cli::integration(
+                    "service",
+                    vec!["uninstall".into(), "--system".into()],
+                ))
+                .await
+                .context("removing the old startup service that ran as root")?;
+            }
+        }
+    }
     crate::state::save_proxy_settings(&settings)?;
     let state = crate::state::dir();
     let argv = settings_args(&settings);
-    let body=match platform.as_str(){
-        "macos"=>format!("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>dev.porch.proxy</string><key>ProgramArguments</key><array><string>{}</string>{}</array><key>EnvironmentVariables</key><dict><key>PORCH_STATE_DIR</key><string>{}</string></dict><key>StandardOutPath</key><string>{}</string><key>StandardErrorPath</key><string>{}</string><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>",xml(&exe.to_string_lossy()),argv.iter().map(|a|format!("<string>{}</string>",xml(a))).collect::<String>(),xml(&state.to_string_lossy()),xml(&state.join("proxy.log").to_string_lossy()),xml(&state.join("proxy.log").to_string_lossy())),
-        "linux"=>format!("[Unit]\nDescription=Porch proxy\nAfter=network.target\n[Service]\nExecStart={} {}\nEnvironment={}\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n",systemd_quote(&exe.to_string_lossy())?,argv.iter().map(|a|systemd_quote(a)).collect::<Result<Vec<_>>>()?.join(" "),systemd_quote(&format!("PORCH_STATE_DIR={}",state.display()))?),
-        "windows"=>{let line=argv.iter().map(|a|windows_quote(a)).collect::<Vec<_>>().join(" ");format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers><Principals><Principal id=\"System\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure></Settings><Actions Context=\"System\"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions></Task>",xml(&exe.to_string_lossy()),xml(&format!("{line} --state-dir {}",windows_quote(&state.to_string_lossy()))))},_=>bail!("unsupported startup service platform")};
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    let owner = service_owner()?;
+    let task = windows_task(None);
+    let (path, exe, binary) = match scope {
+        ServiceScope::User => {
+            let exe = std::env::current_exe()?;
+            (
+                user_service_path(&platform)?,
+                stable_exe(&exe.canonicalize().unwrap_or(exe)),
+                None,
+            )
+        }
+        ServiceScope::System => {
+            let path = system_service_path(&platform).context("no system unit on this platform")?;
+            let binary = install_system_binary(&system_binary_path())?;
+            (path, binary.clone(), Some(binary))
+        }
+    };
+    let body = render_service(
+        &platform,
+        scope,
+        &exe,
+        &state,
+        &argv,
+        (owner.0, owner.1),
+        &windows_account(),
+    )?;
+    // The service starts its own proxy: stop one started by hand (or an older
+    // service's) so the two don't fight over the port.
+    if crate::cli::proxy_running() {
+        crate::cli::stop_proxy().await?;
     }
-    fs::write(&path, body)
-        .context("startup service installation requires administrator privileges")?;
-    match platform.as_str() {
-        "macos" => {
-            exec("launchctl", &["bootstrap", "system", &p])?;
+    write_unit(
+        &path,
+        &body,
+        if scope == ServiceScope::System {
+            0o644
+        } else {
+            0o600
+        },
+    )?;
+    let p = path.to_string_lossy().into_owned();
+    // Reinstalling restarts the service, so new options apply now.
+    let loaded = match (platform.as_str(), scope) {
+        ("macos", _) => launchd_load(&format!("gui/{}", owner.0), &path),
+        ("linux", scope) => {
+            let user = scope == ServiceScope::User;
+            systemctl(user, &["daemon-reload"])
+                .and_then(|_| systemctl(user, &["enable", SERVICE_UNIT]))
+                .and_then(|_| systemctl(user, &["restart", SERVICE_UNIT]))
+                .map(|_| ())
         }
-        "linux" => {
-            exec("systemctl", &["daemon-reload"])?;
-            exec("systemctl", &["enable", "--now", "porch.service"])?;
+        ("windows", _) => {
+            let _ = exec("schtasks", &["/End", "/TN", &task]);
+            exec("schtasks", &["/Create", "/TN", &task, "/XML", &p, "/F"])
+                .and_then(|_| exec("schtasks", &["/Run", "/TN", &task]))
+                .map(|_| ())
         }
-        "windows" => {
-            exec(
-                "schtasks",
-                &["/Create", "/TN", "PorchProxy", "/XML", &p, "/F"],
-            )?;
-            exec("schtasks", &["/Run", "/TN", "PorchProxy"])?;
-        }
-        _ => unreachable!(),
+        _ => unreachable!("render_service rejects other platforms"),
+    };
+    if let Err(e) = loaded {
+        // Nothing half installed: no startup file and no record.
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(state.join("service.json"));
+        // The next app starts the proxy again.
+        let _ = fs::remove_file(state.join("proxy.stopped"));
+        return Err(e.context("loading the startup service"));
     }
+    let _ = fs::remove_file(state.join("proxy.stopped"));
     write_state(
-        &crate::state::dir().join("service.json"),
+        &state.join("service.json"),
         serde_json::to_vec_pretty(&ServiceRecord {
-            platform,
+            platform: platform.clone(),
             path,
-            state_dir: state,
+            state_dir: state.clone(),
             settings,
+            scope: Some(match scope {
+                ServiceScope::User => "user".into(),
+                ServiceScope::System => "system".into(),
+            }),
+            task: (platform == "windows").then_some(task),
+            binary: binary.clone(),
         })?,
     )?;
+    if binary.is_some() {
+        println!("The startup service runs as you, from a root-owned copy of porch; after upgrading Porch, run `porch service install` again.");
+    }
     Ok(())
+}
+fn service_status() -> Result<()> {
+    match fs::read_to_string(crate::state::dir().join("service.json")) {
+        Ok(raw) => {
+            let record: ServiceRecord = serde_json::from_str(&raw)?;
+            println!(
+                "installed: {}\nruns as: {}\nstate: {}\nHTTPS: {}\nport: {}\nTLDs: {}\nLAN: {}\nwildcard: {}",
+                record.path.display(),
+                match record.scope.as_deref() {
+                    Some("user") => "you (login item)",
+                    Some(_) => "you (system unit, may bind ports below 1024)",
+                    None => "root",
+                },
+                record.state_dir.display(),
+                record.settings.tls,
+                record.settings.port,
+                record.settings.tlds.join(","),
+                record.settings.lan,
+                record.settings.wildcard
+            );
+        }
+        Err(_) if system_service_installed() => println!("installed (system-level, no record)"),
+        Err(_) => println!("not installed"),
+    }
+    if let Some(warning) = service_warning() {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+/// `porch service install|status|uninstall`. Synchronous for `porch clean`:
+/// installing goes through [`service_command`].
+fn service(action: &str, args: &[String]) -> Result<()> {
+    let platform = service_platform();
+    match action {
+        "status" => service_status(),
+        "uninstall" if args.iter().any(|a| a == "--system") => {
+            uninstall_system_scope(&platform)?;
+            forget_service_record(&platform)
+        }
+        "uninstall" => service_uninstall(&platform),
+        _ => bail!("usage: service install|status|uninstall"),
+    }
+}
+async fn service_command(action: &str, args: &[String]) -> Result<()> {
+    let platform = service_platform();
+    match action {
+        "install" => service_install(args).await,
+        // The user part as this user; the system part (if any) with sudo.
+        "uninstall"
+            if !args.iter().any(|a| a == "--system")
+                && cfg!(unix)
+                && !is_root()
+                && !system_paths_overridden()
+                && system_service_installed() =>
+        {
+            let mut errors = Vec::new();
+            if let Err(e) = uninstall_user_scope(&platform) {
+                errors.push(e);
+            }
+            if let Err(e) = Box::pin(crate::cli::integration(
+                "service",
+                vec!["uninstall".into(), "--system".into()],
+            ))
+            .await
+            {
+                errors.push(e);
+            }
+            forget_service_record(&platform)?;
+            match errors.into_iter().next() {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        }
+        _ => service(action, args),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -755,6 +1538,10 @@ struct TrustRecord {
     /// Linux NSS databases (Chrome/Chromium, Firefox profiles) holding a per-user CA.
     #[serde(default)]
     nss_dbs: Vec<PathBuf>,
+    /// macOS trust limited to TLS (`-p ssl -p basic`). Trust installed before
+    /// Porch 0.5.3 applies to every purpose until `porch trust` runs again.
+    #[serde(default)]
+    tls_only: bool,
 }
 fn system_scope() -> String {
     "system".into()
@@ -994,18 +1781,25 @@ fn trust(system: bool) -> Result<()> {
         .into(),
         keychain: None,
         nss_dbs: Vec::new(),
+        tls_only: true,
     };
     let ca_arg = ca.to_string_lossy();
     match platform.as_str() {
         "macos" if !system => {
             // The login keychain needs no sudo; macOS confirms with a password or Touch ID dialog.
             let keychain = macos_login_keychain(&user_home()?);
-            exec(
+            exec_prompt(
                 "security",
                 &[
                     "add-trusted-cert",
                     "-r",
                     "trustRoot",
+                    // Trusted for TLS (and basic path checks) only, never for
+                    // S/MIME or code signing.
+                    "-p",
+                    "ssl",
+                    "-p",
+                    "basic",
                     "-k",
                     &keychain.to_string_lossy(),
                     &ca_arg,
@@ -1040,13 +1834,17 @@ fn trust(system: bool) -> Result<()> {
             trust_wsl_windows(&ca_arg, &mut record)?;
         }
         "macos" => {
-            exec(
+            exec_prompt(
                 "security",
                 &[
                     "add-trusted-cert",
                     "-d",
                     "-r",
                     "trustRoot",
+                    "-p",
+                    "ssl",
+                    "-p",
+                    "basic",
                     "-k",
                     "/Library/Keychains/System.keychain",
                     &ca_arg,
@@ -1054,7 +1852,8 @@ fn trust(system: bool) -> Result<()> {
             )?;
         }
         "windows" => {
-            exec("certutil", &["-user", "-addstore", "Root", &ca_arg])?;
+            // Windows asks for confirmation before adding a root.
+            exec_prompt("certutil", &["-user", "-addstore", "Root", &ca_arg])?;
             record.windows = true;
         }
         "linux" => {
@@ -1071,7 +1870,9 @@ fn trust(system: bool) -> Result<()> {
                 .unwrap_or_else(|| root.into());
             fs::create_dir_all(&root)?;
             let target = root.join(format!("porch-{}.crt", &record.fingerprint[..12]));
-            fs::copy(&ca, &target)?;
+            // World-readable like every other anchor: tools reading the hashed
+            // certificate directory as a normal user must be able to open it.
+            write_anchor(&target, &fs::read(&ca)?)?;
             record.installed = Some(target);
             record.update = Some(update.into());
             // Record before updating so a failed update can be retried/cleaned safely.
@@ -1098,6 +1899,116 @@ fn trust(system: bool) -> Result<()> {
     );
     Ok(())
 }
+/// A public trust anchor: mode 0644, replacing whatever was there.
+fn write_anchor(target: &Path, der_or_pem: &[u8]) -> Result<()> {
+    let _ = fs::remove_file(target);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o644).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(target)?;
+    #[cfg(unix)]
+    {
+        // The umask may have narrowed the mode.
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
+    file.write_all(der_or_pem)?;
+    file.sync_all()?;
+    Ok(())
+}
+/// Whether `keychain` holds a certificate with this SHA-1 fingerprint, from a
+/// complete listing. `None` when the keychain couldn't be listed.
+fn keychain_has(keychain: &str, fingerprint: &str) -> Option<bool> {
+    let listing = exec("security", &["find-certificate", "-a", "-Z", keychain]).ok()?;
+    Some(listing_has_sha1(&listing, fingerprint))
+}
+fn listing_has_sha1(listing: &str, fingerprint: &str) -> bool {
+    listing.lines().any(|line| {
+        line.trim()
+            .strip_prefix("SHA-1 hash:")
+            .is_some_and(|h| h.trim().eq_ignore_ascii_case(fingerprint))
+    })
+}
+/// The PEM of the certificate with this fingerprint in `keychain`, for removing
+/// its trust setting when Porch's own copy of the CA is gone.
+fn keychain_pem(keychain: &str, fingerprint: &str) -> Option<String> {
+    let listing = exec(
+        "security",
+        &["find-certificate", "-a", "-Z", "-p", keychain],
+    )
+    .ok()?;
+    pem_with_sha1(&listing, fingerprint)
+}
+/// The PEM block following `SHA-1 hash: <fingerprint>` in a `find-certificate -Z -p` listing.
+fn pem_with_sha1(listing: &str, fingerprint: &str) -> Option<String> {
+    let mut current = false;
+    let mut pem = String::new();
+    for line in listing.lines() {
+        if let Some(h) = line.trim().strip_prefix("SHA-1 hash:") {
+            current = h.trim().eq_ignore_ascii_case(fingerprint);
+            pem.clear();
+            continue;
+        }
+        if current {
+            pem.push_str(line);
+            pem.push('\n');
+            if line.starts_with("-----END CERTIFICATE-----") {
+                return Some(pem);
+            }
+        }
+    }
+    None
+}
+/// Remove a macOS trust setting (`-d`: the admin one) for the certificate with
+/// this fingerprint, from Porch's copy of it or the keychain's. A setting that
+/// is already gone is fine.
+fn macos_remove_trust(ca: Option<&Path>, keychain: &str, fingerprint: &str, admin: bool) {
+    let exported;
+    let path = match ca {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let Some(pem) = keychain_pem(keychain, fingerprint) else {
+                return;
+            };
+            exported = crate::state::dir().join(format!(".untrust-{}.pem", std::process::id()));
+            if write_state(&exported, pem).is_err() {
+                return;
+            }
+            exported.clone()
+        }
+    };
+    let path_arg = path.to_string_lossy().into_owned();
+    let mut args = vec!["remove-trusted-cert"];
+    if admin {
+        args.push("-d");
+    }
+    args.push(&path_arg);
+    // macOS confirms a trust change with a password or Touch ID dialog.
+    let _ = exec_prompt("security", &args);
+    if ca.is_none() {
+        let _ = fs::remove_file(&path);
+    }
+}
+/// Delete the certificate with this fingerprint from `keychain`, unless a
+/// complete listing shows it is already gone (deleted in Keychain Access).
+fn macos_delete_certificate(keychain: &str, fingerprint: &str) -> Result<()> {
+    if keychain_has(keychain, fingerprint) == Some(false) {
+        return Ok(());
+    }
+    match exec(
+        "security",
+        &["delete-certificate", "-Z", fingerprint, keychain],
+    ) {
+        Ok(_) => Ok(()),
+        // Gone between the listing and the delete counts as removed.
+        Err(_) if keychain_has(keychain, fingerprint) == Some(false) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
 /// WSL: browsers run on Windows, so also trust the CA in the Windows user store.
 fn trust_wsl_windows(ca_arg: &str, record: &mut TrustRecord) -> Result<()> {
     let wsl = std::env::var_os("WSL_DISTRO_NAME").is_some()
@@ -1105,7 +2016,7 @@ fn trust_wsl_windows(ca_arg: &str, record: &mut TrustRecord) -> Result<()> {
             .is_ok_and(|s| s.to_lowercase().contains("microsoft"));
     if wsl && find_program("certutil.exe") {
         let windows_path = exec("wslpath", &["-w", ca_arg])?;
-        exec(
+        exec_prompt(
             "certutil.exe",
             &["-user", "-addstore", "Root", windows_path.trim()],
         )?;
@@ -1145,13 +2056,15 @@ fn untrust() -> Result<()> {
                 .map(|e| e.path()),
         );
     }
-    let Some(ca) = candidates
+    // Porch's own copy may be gone (deleted by hand). Every removal below is
+    // keyed by the recorded fingerprint (or a nickname or path derived from it),
+    // so it can still only remove the certificate Porch installed.
+    let ca = candidates
         .into_iter()
-        .find(|c| ca_fingerprint(c).is_ok_and(|f| f == r.fingerprint))
-    else {
-        bail!("recorded trust fingerprint does not match any Porch CA; certificate retained");
-    };
-    verify_porch_ca(&ca)?;
+        .find(|c| ca_fingerprint(c).is_ok_and(|f| f == r.fingerprint));
+    if let Some(ca) = &ca {
+        verify_porch_ca(ca)?;
+    }
     if r.update
         .as_ref()
         .is_some_and(|s| !matches!(s.as_str(), "update-ca-certificates" | "update-ca-trust"))
@@ -1189,17 +2102,10 @@ fn untrust() -> Result<()> {
             if keychain.parent() != Some(home.join("Library/Keychains").as_path()) {
                 bail!("invalid recorded keychain path; refusing removal");
             }
+            let keychain = keychain.to_string_lossy();
             // Drop the user trust setting first; a missing setting is not an error.
-            let _ = exec("security", &["remove-trusted-cert", &ca.to_string_lossy()]);
-            exec(
-                "security",
-                &[
-                    "delete-certificate",
-                    "-Z",
-                    &r.fingerprint,
-                    &keychain.to_string_lossy(),
-                ],
-            )?;
+            macos_remove_trust(ca.as_deref(), &keychain, &r.fingerprint, false);
+            macos_delete_certificate(&keychain, &r.fingerprint)?;
         }
         "linux" if r.scope == "user" => {
             let home = user_home()?;
@@ -1236,15 +2142,10 @@ fn untrust() -> Result<()> {
             }
         }
         "macos" => {
-            exec(
-                "security",
-                &[
-                    "delete-certificate",
-                    "-Z",
-                    &r.fingerprint,
-                    "/Library/Keychains/System.keychain",
-                ],
-            )?;
+            let keychain = "/Library/Keychains/System.keychain";
+            // The admin trust setting outlives the certificate: remove it too.
+            macos_remove_trust(ca.as_deref(), keychain, &r.fingerprint, true);
+            macos_delete_certificate(keychain, &r.fingerprint)?;
         }
         "linux" => {
             if let Some(p) = r.installed {
@@ -1264,14 +2165,27 @@ fn untrust() -> Result<()> {
         _ => bail!("invalid recorded trust platform"),
     }
     if r.windows {
-        exec(
-            if r.platform == "linux" {
-                "certutil.exe"
-            } else {
-                "certutil"
-            },
-            &["-user", "-delstore", "Root", &r.fingerprint],
-        )?;
+        let certutil = if r.platform == "linux" {
+            "certutil.exe"
+        } else {
+            "certutil"
+        };
+        // Windows asks for confirmation before deleting a root.
+        if let Err(e) = exec_prompt(certutil, &["-user", "-delstore", "Root", &r.fingerprint]) {
+            // Already gone (removed in the certificate manager) counts as
+            // removed, but only when certutil itself runs and can't find it.
+            let runs = Command::new(certutil)
+                .arg("-?")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok();
+            let found = exec(certutil, &["-user", "-verifystore", "Root", &r.fingerprint]).is_ok();
+            if !runs || found {
+                return Err(e);
+            }
+        }
     }
     fs::remove_file(path)?;
     Ok(())
@@ -1315,17 +2229,39 @@ impl ShareSession {
         bail!("sharing tunnel exited unexpectedly: {}", status?);
     }
 }
-impl Drop for ShareSession {
-    fn drop(&mut self) {
+impl ShareSession {
+    /// End the tunnels (SIGTERM, then SIGKILL after a short grace period),
+    /// turn Tailscale sharing off and remove the session's files. Blocking.
+    fn cleanup(&mut self) {
+        #[cfg(unix)]
         for child in &mut self.children {
-            #[cfg(unix)]
             if let Some(pid) = child.id() {
                 unsafe {
                     libc::kill(-(pid as i32), libc::SIGTERM);
-                    libc::kill(-(pid as i32), libc::SIGKILL);
                 }
             }
-            let _ = child.start_kill();
+        }
+        // Let tunnels close their connections cleanly (cloudflared is started
+        // with a 1 s grace period).
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        while self
+            .children
+            .iter_mut()
+            .any(|c| matches!(c.try_wait(), Ok(None)))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        for child in &mut self.children {
+            if matches!(child.try_wait(), Ok(None)) {
+                #[cfg(unix)]
+                if let Some(pid) = child.id() {
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                }
+                let _ = child.start_kill();
+            }
         }
         for (mode, port) in &self.tailscale {
             let _ = exec(
@@ -1338,6 +2274,23 @@ impl Drop for ShareSession {
         }
         for p in &self.files {
             let _ = fs::remove_file(p);
+        }
+        self.children.clear();
+        self.tailscale.clear();
+        self.registry = None;
+        self.files.clear();
+    }
+}
+impl Drop for ShareSession {
+    fn drop(&mut self) {
+        // The cleanup waits on processes and runs `tailscale`: on a
+        // multi-threaded runtime, move this worker's other tasks elsewhere
+        // while it does.
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                tokio::task::block_in_place(|| self.cleanup())
+            }
+            _ => self.cleanup(),
         }
     }
 }
@@ -1505,28 +2458,45 @@ async fn start_tunnel(provider: &str, port: u16, session: &mut ShareSession) -> 
         }
     }
 }
+/// Serializes Tailscale port allocation between this user's Porch launchers,
+/// whatever their state directory (`tailscale serve` is machine-wide). It
+/// lives in a directory only this user can write: `$XDG_RUNTIME_DIR` when set,
+/// else the temporary directory (per user on macOS and Windows). If another
+/// user got there first (a shared /tmp), the 0700 state directory is used, so
+/// they can't stop `--tailscale` from working.
 fn tailscale_lock() -> Result<fs::File> {
     #[cfg(unix)]
     let user = unsafe { libc::geteuid() }.to_string();
     #[cfg(not(unix))]
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
     let key = format!("{:x}", Sha256::digest(user.as_bytes()));
-    let path = std::env::temp_dir().join(format!("porch-tailscale-{}.lock", &key[..16]));
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(false).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if file.metadata()?.uid() != unsafe { libc::geteuid() } {
-            bail!("Tailscale lock belongs to another user");
+    let name = format!("porch-tailscale-{}.lock", &key[..16]);
+    let open = |path: PathBuf| -> Result<fs::File> {
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-    }
+        let file = options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if file.metadata()?.uid() != unsafe { libc::geteuid() } {
+                bail!("Tailscale lock belongs to another user");
+            }
+        }
+        Ok(file)
+    };
+    let shared = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|d| !d.is_empty() && Path::new(d).is_dir())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let file = match open(shared.join(&name)) {
+        Ok(file) => file,
+        Err(_) => open(crate::state::dir().join("tailscale.lock"))?,
+    };
     file.lock_exclusive()?;
     Ok(file)
 }
@@ -1692,18 +2662,31 @@ fn owned_by_state_user(pid: u32) -> bool {
         true
     }
 }
+/// End sharing left behind by launchers that are gone. One bad record never
+/// stops the others: an unreadable one is removed, and a Tailscale failure is
+/// reported and (outside `--force`) kept for the next prune.
 pub fn prune_shares(force: bool) -> Result<()> {
     for entry in fs::read_dir(crate::state::dir())? {
-        let entry = entry?;
+        let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !name.starts_with("sharing-")
             || !name.ends_with(".json")
-            || !entry.file_type()?.is_file()
+            || !entry.file_type().is_ok_and(|t| t.is_file())
         {
             continue;
         }
-        let record: SharingRecord = serde_json::from_slice(&fs::read(entry.path())?)?;
+        let record: SharingRecord = match fs::read(entry.path())
+            .map_err(anyhow::Error::from)
+            .and_then(|b| Ok(serde_json::from_slice(&b)?))
+        {
+            Ok(record) => record,
+            Err(e) => {
+                eprintln!("Removing unreadable sharing record {name}: {e}");
+                let _ = fs::remove_file(entry.path());
+                continue;
+            }
+        };
         if crate::state::matches(&record.owner) {
             continue;
         }
@@ -1725,23 +2708,33 @@ pub fn prune_shares(force: bool) -> Result<()> {
                 }
             }
         }
-        for (mode, port) in record.tailscale {
-            let raw = exec("tailscale", &["serve", "status", "--json"])?;
-            let value: Value = serde_json::from_str(&raw)?;
-            let host_target = format!("http://127.0.0.1:{}", record.local_port);
-            let ours = value["Web"].as_object().is_some_and(|o| {
-                o.iter().any(|(host, v)| {
-                    host.ends_with(&format!(":{port}")) && contains_target(v, &host_target)
-                })
-            });
-            if ours {
-                exec(
-                    "tailscale",
-                    &[&mode, "--yes", &format!("--https={port}"), "off"],
-                )?;
+        let mut tailscale_failed = false;
+        for (mode, port) in &record.tailscale {
+            let result = (|| -> Result<()> {
+                let raw = exec("tailscale", &["serve", "status", "--json"])?;
+                let value: Value = serde_json::from_str(&raw)?;
+                let host_target = format!("http://127.0.0.1:{}", record.local_port);
+                let ours = value["Web"].as_object().is_some_and(|o| {
+                    o.iter().any(|(host, v)| {
+                        host.ends_with(&format!(":{port}")) && contains_target(v, &host_target)
+                    })
+                });
+                if ours {
+                    exec(
+                        "tailscale",
+                        &[mode, "--yes", &format!("--https={port}"), "off"],
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!("Couldn't turn off Tailscale sharing on port {port}: {e:#}");
+                tailscale_failed = true;
             }
         }
-        fs::remove_file(entry.path())?;
+        if !tailscale_failed || force {
+            let _ = fs::remove_file(entry.path());
+        }
     }
     Ok(())
 }
@@ -1766,60 +2759,116 @@ impl Drop for Announcements {
         let _ = self.daemon.shutdown();
     }
 }
+/// Announce every live route over mDNS, following route and address changes.
+/// It never gives up: a route that can't be announced is logged and skipped,
+/// and state or mDNS daemon errors are retried.
 pub async fn lan_watch(settings: crate::state::ProxySettings) -> Result<()> {
-    let daemon = mdns_sd::ServiceDaemon::new()?;
-    let mut guard = Announcements {
-        daemon,
-        names: Vec::new(),
-    };
+    let mut guard: Option<Announcements> = None;
     let mut previous = Vec::new();
     let mut previous_ip = None;
+    // Report each distinct problem once, not every two seconds.
+    let mut reported = BTreeSet::new();
+    let mut report = |message: String| {
+        if reported.len() > 256 {
+            reported.clear();
+        }
+        if reported.insert(message.clone()) {
+            eprintln!("LAN announcements: {message}");
+        }
+    };
     loop {
+        tokio::time::sleep(Duration::from_secs(if guard.is_some() { 2 } else { 0 })).await;
         let ip = match lan_ip(&settings) {
             Ok(ip) => ip,
             Err(e) => {
-                eprintln!("LAN address detection: {e}");
+                report(format!("address detection: {e}"));
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
         };
-        let state = crate::state::load()?;
-        let mut names = state
+        let state = match crate::state::load() {
+            Ok(state) => state,
+            Err(e) => {
+                report(format!("reading routes: {e:#}"));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        let mut names = Vec::new();
+        for r in state
             .routes
             .iter()
             .filter(|r| crate::state::route_alive(&state, r))
-            .map(|r| route_hosts(&r.name, &settings))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        {
+            match route_hosts(&r.name, &settings) {
+                Ok(hosts) => names.extend(hosts),
+                Err(e) => report(format!("skipping {}: {e}", r.name)),
+            }
+        }
         names.sort();
         names.dedup();
-        if previous_ip != Some(ip) || names != previous {
-            for name in guard.names.drain(..) {
-                let _ = guard.daemon.unregister(&name);
-            }
-            for host in &names {
-                let instance = host.trim_end_matches(".local");
-                let info = mdns_sd::ServiceInfo::new(
-                    if settings.tls {
-                        "_https._tcp.local."
-                    } else {
-                        "_http._tcp.local."
-                    },
-                    instance,
-                    &format!("{host}."),
-                    ip,
-                    settings.port,
-                    None,
-                )?;
-                guard.names.push(info.get_fullname().to_owned());
-                guard.daemon.register(info)?;
-            }
-            previous = names;
-            previous_ip = Some(ip);
+        if guard.is_some() && previous_ip == Some(ip) && names == previous {
+            continue;
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        if guard.is_none() {
+            match mdns_sd::ServiceDaemon::new() {
+                Ok(daemon) => {
+                    guard = Some(Announcements {
+                        daemon,
+                        names: Vec::new(),
+                    })
+                }
+                Err(e) => {
+                    report(format!("starting mDNS: {e}"));
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            }
+        }
+        let announcements = guard.as_mut().expect("daemon started above");
+        for name in announcements.names.drain(..) {
+            let _ = announcements.daemon.unregister(&name);
+        }
+        let mut daemon_failed = false;
+        for host in &names {
+            let instance = host.trim_end_matches(".local");
+            let info = match mdns_sd::ServiceInfo::new(
+                if settings.tls {
+                    "_https._tcp.local."
+                } else {
+                    "_http._tcp.local."
+                },
+                instance,
+                &format!("{host}."),
+                ip,
+                settings.port,
+                None,
+            ) {
+                Ok(info) => info,
+                Err(e) => {
+                    report(format!("skipping {host}: {e}"));
+                    continue;
+                }
+            };
+            let fullname = info.get_fullname().to_owned();
+            match announcements.daemon.register(info) {
+                Ok(()) => announcements.names.push(fullname),
+                Err(e) => {
+                    report(format!("announcing {host}: {e}"));
+                    daemon_failed = true;
+                }
+            }
+        }
+        if daemon_failed {
+            // Start a fresh daemon and announce everything again.
+            guard = None;
+            previous.clear();
+            previous_ip = None;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        previous = names;
+        previous_ip = Some(ip);
     }
 }
 
@@ -2129,6 +3178,29 @@ fn reconcile_compose(project: &str, globals: &[String], plan: &[ComposeRoute]) -
             });
         }
     }
+    // Polling mostly finds nothing new: don't rewrite (and fsync) the state.
+    let current = crate::state::load()?;
+    let old = current
+        .compose_projects
+        .get(project)
+        .cloned()
+        .unwrap_or_default();
+    let names: Vec<String> = routes.iter().map(|r| r.name.clone()).collect();
+    let mut existing: Vec<(&str, &str)> = current
+        .routes
+        .iter()
+        .filter(|r| old.contains(&r.name))
+        .map(|r| (r.name.as_str(), r.target.as_str()))
+        .collect();
+    let mut wanted: Vec<(&str, &str)> = routes
+        .iter()
+        .map(|r| (r.name.as_str(), r.target.as_str()))
+        .collect();
+    existing.sort();
+    wanted.sort();
+    if old == names && existing == wanted {
+        return Ok(());
+    }
     let settings = crate::state::proxy_settings()?;
     crate::state::transaction(|s| {
         if let Some(name) = compose_conflict(
@@ -2233,6 +3305,9 @@ async fn compose(args: &[String]) -> Result<()> {
             .and_then(|b| serde_json::from_slice::<Vec<ComposeRoute>>(&b).ok())
             .unwrap_or(plan);
         reconcile_compose(&project, &globals, &plan)?;
+        // The project is down: release its ports and delete the resolved
+        // model, which can hold secrets from .env files.
+        forget_compose_project(&project)?;
         let _ = request_hosts_sync().await;
         return Ok(());
     }
@@ -2251,6 +3326,7 @@ async fn compose(args: &[String]) -> Result<()> {
         .write(true)
         .open(crate::state::dir().join("compose.lock"))?;
     lock.lock_exclusive()?;
+    prune_compose_projects();
     let ports_path = crate::state::dir().join("compose-ports.json");
     let mut stored: BTreeMap<String, BTreeMap<String, u16>> = fs::read(&ports_path)
         .ok()
@@ -2357,6 +3433,7 @@ async fn compose(args: &[String]) -> Result<()> {
     }
     argv.push("up".into());
     argv.extend_from_slice(&parsed.rest);
+    remember_compose_dir(&project, &dir);
     drop(reservations);
     drop(lock);
     let mut cmd = tokio::process::Command::new("docker");
@@ -2379,12 +3456,96 @@ async fn compose(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    // Follow containers as they start and stop. `docker compose ps` runs on
+    // a blocking thread, so a slow Docker never delays Ctrl-C.
+    let reconcile = {
+        let (project, globals, plan) = (project.clone(), globals.clone(), plan.clone());
+        move || {
+            let (project, globals, plan) = (project.clone(), globals.clone(), plan.clone());
+            tokio::task::spawn_blocking(move || reconcile_compose(&project, &globals, &plan))
+        }
+    };
+    let finish = |reconcile: tokio::task::JoinHandle<Result<()>>| async move {
+        reconcile.await.map_err(anyhow::Error::from).and_then(|r| r)
+    };
+    let mut poll = tokio::time::interval(Duration::from_secs(2));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pending: Option<tokio::task::JoinHandle<Result<()>>> = None;
     loop {
         tokio::select! {
-            status=child.wait()=>{let status=status?;reconcile_compose(&project,&globals,&plan)?;let _=request_hosts_sync().await;require_status(status)?;return Ok(());},
-            _=tokio::time::sleep(Duration::from_millis(500))=>{if let Err(e)=reconcile_compose(&project,&globals,&plan){eprintln!("Compose route update: {e}");}},
-            _=tokio::signal::ctrl_c()=>{stop_compose(&mut child,2).await;let _=reconcile_compose(&project,&globals,&plan);return Err(ExternalExit(130).into());},
-            _=terminate_signal()=>{stop_compose(&mut child,15).await;let _=reconcile_compose(&project,&globals,&plan);return Err(ExternalExit(143).into());},
+            status=child.wait()=>{
+                let status=status?;
+                if let Some(p)=pending.take(){let _=p.await;}
+                finish(reconcile()).await?;
+                let _=request_hosts_sync().await;
+                require_status(status)?;
+                return Ok(());
+            },
+            _=poll.tick(), if pending.is_none()=>{pending=Some(reconcile());},
+            result=async{pending.as_mut().expect("guarded by is_some").await}, if pending.is_some()=>{
+                pending=None;
+                match result.map_err(anyhow::Error::from).and_then(|r| r){
+                    Ok(())=>{},
+                    Err(e)=>eprintln!("Compose route update: {e}"),
+                }
+            },
+            _=tokio::signal::ctrl_c()=>{stop_compose(&mut child,2).await;if let Some(p)=pending.take(){p.abort();}let _=finish(reconcile()).await;return Err(ExternalExit(130).into());},
+            _=terminate_signal()=>{stop_compose(&mut child,15).await;if let Some(p)=pending.take(){p.abort();}let _=finish(reconcile()).await;return Err(ExternalExit(143).into());},
+        }
+    }
+}
+/// Project directories by Compose project, so bookkeeping for a project whose
+/// folder is gone can be dropped.
+fn compose_dirs_path() -> PathBuf {
+    crate::state::dir().join("compose-projects.json")
+}
+fn read_json_map<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+    fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+fn remember_compose_dir(project: &str, dir: &Path) {
+    let path = compose_dirs_path();
+    let mut dirs: BTreeMap<String, PathBuf> = read_json_map(&path);
+    dirs.insert(project.into(), dir.to_path_buf());
+    if let Ok(bytes) = serde_json::to_vec_pretty(&dirs) {
+        let _ = write_state(&path, bytes);
+    }
+}
+/// Drop a project's reserved ports, resolved model, plan and directory record.
+fn forget_compose_project(project: &str) -> Result<()> {
+    let ports_path = crate::state::dir().join("compose-ports.json");
+    let mut stored: BTreeMap<String, BTreeMap<String, u16>> = read_json_map(&ports_path);
+    if stored.remove(project).is_some() {
+        write_state(&ports_path, serde_json::to_vec_pretty(&stored)?)?;
+    }
+    let dirs_path = compose_dirs_path();
+    let mut dirs: BTreeMap<String, PathBuf> = read_json_map(&dirs_path);
+    if dirs.remove(project).is_some() {
+        write_state(&dirs_path, serde_json::to_vec_pretty(&dirs)?)?;
+    }
+    let (model, plan) = compose_paths(project);
+    for path in [model, plan] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+/// Forget projects whose directory no longer exists and that have no routes.
+fn prune_compose_projects() {
+    let dirs: BTreeMap<String, PathBuf> = read_json_map(&compose_dirs_path());
+    let state = crate::state::load().unwrap_or_default();
+    for (project, dir) in dirs {
+        let routed = state
+            .compose_projects
+            .get(&project)
+            .is_some_and(|names| !names.is_empty());
+        if !dir.exists() && !routed {
+            let _ = forget_compose_project(&project);
         }
     }
 }
@@ -2426,10 +3587,30 @@ async fn stop_compose(child: &mut tokio::process::Child, signal: i32) {
             crate::shutdown::interrupt_group(pid);
         }
     }
-    if tokio::time::timeout(Duration::from_secs(5), child.wait())
-        .await
-        .is_err()
-    {
+    // Compose stops each container gracefully, waiting up to its stop timeout
+    // (10 s by default) before killing it: give it longer than that, and pass
+    // a second Ctrl-C on, which Compose takes as "force".
+    let waited = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            tokio::select! {
+                _ = child.wait() => break,
+                _ = tokio::signal::ctrl_c() => {
+                    #[cfg(unix)]
+                    if let Some(pid) = child.id() {
+                        unsafe {
+                            libc::kill(-(pid as i32), libc::SIGINT);
+                        }
+                    }
+                    #[cfg(windows)]
+                    if let Some(pid) = child.id() {
+                        crate::shutdown::interrupt_group(pid);
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    if waited.is_err() {
         #[cfg(unix)]
         if let Some(pid) = child.id() {
             unsafe {
@@ -2474,10 +3655,13 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     }
     match sub {
         "hosts" => hosts(rest.first().map(String::as_str).unwrap_or("sync")),
-        "service" => service(
-            rest.first().map(String::as_str).unwrap_or("status"),
-            &rest[rest.len().min(1)..],
-        ),
+        "service" => {
+            service_command(
+                rest.first().map(String::as_str).unwrap_or("status"),
+                &rest[rest.len().min(1)..],
+            )
+            .await
+        }
         "trust" => trust(rest.iter().any(|a| a == "--system")),
         "compose" => compose(rest).await,
         "share" => {
@@ -2742,6 +3926,25 @@ async fn doctor() -> Result<()> {
                 "its trust was removed from the trust store; run `porch trust` again",
             ),
         }
+        if let Ok(pem) = fs::read_to_string(crate::state::dir().join("ca.pem")) {
+            if !crate::tls::ca_server_auth_only(&pem) {
+                info("CA purpose", crate::tls::LEGACY_CA_NOTICE);
+            }
+        }
+        if trust_record()
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.platform == "macos" && !r.tls_only)
+        {
+            info(
+                "trust policy",
+                "macOS trusts the CA for every purpose (set by Porch 0.5.2 or earlier); run `porch trust` again (`porch trust --system` for system-wide trust) to limit it to TLS",
+            );
+        }
+    }
+    if let Some(warning) = service_warning() {
+        section("Start at login");
+        bad("startup service", &warning);
     }
     section("Tools");
     for (tool, flag, why) in [
@@ -2918,6 +4121,135 @@ mod tests {
             linux_ca_layout("ID=opensuse"),
             ("/etc/pki/trust/anchors", "update-ca-certificates")
         );
+    }
+    #[test]
+    fn keychain_listings_match_exact_fingerprints() {
+        let listing = "SHA-256 hash: 00\nSHA-1 hash: AAAA\n-----BEGIN CERTIFICATE-----\nb25l\n-----END CERTIFICATE-----\nSHA-1 hash: BBBB\n-----BEGIN CERTIFICATE-----\ndHdv\n-----END CERTIFICATE-----\n";
+        assert!(listing_has_sha1(listing, "aaaa"));
+        assert!(!listing_has_sha1(listing, "AAA"));
+        assert_eq!(
+            pem_with_sha1(listing, "BBBB").unwrap(),
+            "-----BEGIN CERTIFICATE-----\ndHdv\n-----END CERTIFICATE-----\n"
+        );
+        assert!(pem_with_sha1(listing, "CCCC").is_none());
+    }
+    #[test]
+    fn hosts_rewrite_goes_through_the_locked_handle_and_never_truncates_first() {
+        let path = std::env::temp_dir().join(format!("porch-hosts-rewrite-{}", std::process::id()));
+        let long =
+            "127.0.0.1 localhost\n# porch-start\n127.0.0.1 a.test\n::1 a.test\n# porch-end\n";
+        fs::write(&path, long).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        rewrite_locked(&mut file, |old| hosts_content(old, &[])).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "127.0.0.1 localhost\n");
+        // Unchanged content is never written: a read-only handle is enough.
+        let mut read_only = fs::File::open(&path).unwrap();
+        rewrite_locked(&mut read_only, |old| hosts_content(old, &[])).unwrap();
+        // A grown file is written whole.
+        rewrite_locked(&mut file, |old| hosts_content(old, &["b.test".into()])).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "127.0.0.1 localhost\n# porch-start\n127.0.0.1 b.test\n::1 b.test\n# porch-end\n"
+        );
+        let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn startup_service_runs_as_the_user_wherever_it_can() {
+        let settings = |port: u16| crate::state::ProxySettings {
+            port,
+            ..Default::default()
+        };
+        let yes = |_: u16| true;
+        let no = |_: u16| false;
+        use ServiceScope::*;
+        // High ports never need privileges, anywhere.
+        for platform in ["macos", "linux", "windows"] {
+            assert_eq!(
+                service_scope(platform, &settings(7462), false, false, no).unwrap(),
+                User
+            );
+        }
+        // Low ports this user may bind: a login item too.
+        assert_eq!(
+            service_scope("macos", &settings(80), false, false, yes).unwrap(),
+            User
+        );
+        assert_eq!(
+            service_scope("linux", &settings(80), false, false, yes).unwrap(),
+            User
+        );
+        assert_eq!(
+            service_scope("windows", &settings(443), false, false, no).unwrap(),
+            User
+        );
+        // Only Linux without unprivileged low ports needs a system unit.
+        assert_eq!(
+            service_scope("linux", &settings(80), false, false, no).unwrap(),
+            System
+        );
+        assert_eq!(
+            service_scope("linux", &settings(80), true, true, no).unwrap(),
+            System
+        );
+        let mut https = settings(8443);
+        https.tls = true;
+        https.redirect_port = Some(80);
+        assert_eq!(
+            service_scope("linux", &https, false, false, no).unwrap(),
+            System
+        );
+        assert!(service_scope("macos", &settings(80), false, false, no).is_err());
+        let mut bound = settings(80);
+        bound.bind = Some("127.0.0.1".into());
+        assert!(service_scope("macos", &bound, false, false, yes).is_err());
+        assert!(service_scope("macos", &settings(80), false, true, yes).is_err());
+        assert!(service_scope("linux", &settings(7462), false, true, no).is_err());
+        // Under sudo, nothing but the Linux system unit is installed.
+        assert!(service_scope("macos", &settings(7462), true, false, yes).is_err());
+        assert!(service_scope("linux", &settings(7462), true, false, yes).is_err());
+    }
+    #[test]
+    fn linux_system_unit_never_runs_as_root() {
+        let body = render_service(
+            "linux",
+            ServiceScope::System,
+            Path::new("/usr/local/lib/porch/porch"),
+            Path::new("/home/me/.porch"),
+            &settings_args(&crate::state::ProxySettings {
+                port: 80,
+                unprivileged: false,
+                ..Default::default()
+            }),
+            (1000, 1000),
+            "",
+        )
+        .unwrap();
+        for line in [
+            "User=1000",
+            "Group=1000",
+            "AmbientCapabilities=CAP_NET_BIND_SERVICE",
+            "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
+            "NoNewPrivileges=yes",
+            "ExecStart=\"/usr/local/lib/porch/porch\" \"proxy\"",
+            "WantedBy=multi-user.target",
+        ] {
+            assert!(body.contains(line), "{line}: {body}");
+        }
+        let user = render_service(
+            "linux",
+            ServiceScope::User,
+            Path::new("/home/me/bin/porch"),
+            Path::new("/home/me/.porch"),
+            &[],
+            (1000, 1000),
+            "",
+        )
+        .unwrap();
+        assert!(!user.contains("User=") && user.contains("WantedBy=default.target"));
     }
     #[test]
     fn service_rendering_options_and_escaping() {

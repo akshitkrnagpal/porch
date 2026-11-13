@@ -11,6 +11,11 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - Apps get `node_modules/.bin` directories on their PATH only from inside the project (up to the workspace or Git root, or your home directory), no longer from every directory up to `/` or `C:\`, where another user could plant a `node`. On macOS and Linux, directories owned by another user are skipped.
 - With `HOME` unset, Porch finds your home directory in the user database instead of using `.porch` in the current directory, and stops with an error if it can't.
 - `porch workspace` and the "no dev script" error escape control characters in script names and commands from `package.json` and `porch.json`, so a repository can't send terminal escape sequences.
+- The startup service (`porch service install`, or "Start at login" in `porch setup`) runs the proxy as you, not as root: a LaunchAgent on macOS, a systemd user unit on Linux, a logon task on Windows. It needs no sudo. Before, it ran as root a `porch` binary your account could overwrite, so anything running as you could gain root at the next boot. On Linux, a port below 1024 that needs privileges uses a system unit that still runs as you, with only the right to bind that port, from a root-owned copy of porch. `porch service status` and `porch doctor` point out a service from an older version, and `porch service install` or `porch setup` replaces it.
+- New local CAs can sign TLS server certificates only, and `porch trust` trusts the CA for TLS only on macOS. Before, someone who stole the CA key could also sign email or code-signing certificates your account trusted. Your existing CA is kept so its trust stays in place; `porch doctor` explains how to replace it, and on macOS running `porch trust` again limits its trust to TLS.
+- Porch no longer keeps the private key of a CA it has replaced, and deletes ones older versions kept.
+- A web page that requests made-up `*.localhost` HTTPS names can no longer use up the certificate budget your apps need: names that serve something (routes, the dashboard, apps on paired machines) have their own budget and stay cached.
+- The Tailscale sharing lock no longer sits under a guessable name in a shared `/tmp`, where another user on a Linux machine could create it first and make `--tailscale` fail.
 
 ### Fixed
 - Launch options before `--name` (`-d`, `--detach`, `--private`, `--prefix=…`, `--app-port=…`, `--framework`, `--state-dir`) no longer make Porch treat the command as the app's name, and `porch --private -- --filter=web` passes `--filter=web` to the dev script. `porch web --name api …` is refused instead of quietly ignoring `--name`.
@@ -25,6 +30,19 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - `porch setup` defaults "Start Porch automatically at login?" to whether the startup service is installed. After `porch discovery autostart enable`, `porch setup --yes` no longer tries to install the system service with sudo, and keeping the default no longer removes sharing's login item.
 - Requests to an app whose port is reserved but which hasn't started yet (while a sharing tunnel starts, say) show the "waiting for the app" page at once instead of hanging, and `porch run --detach` waits until the app has actually started.
 - On Linux, a running app that saw the proxy stop after `porch self-update` couldn't restart it. It now uses the updated binary, and says so if the restart fails.
+- `porch service install` can be run again: it replaces and restarts the service with the new options instead of failing because the old one is loaded. `porch service uninstall` and `porch clean` no longer stop when the service isn't loaded, and always remove its files.
+- macOS and Windows trust prompts are no longer cancelled after 30 seconds; Porch waits up to 10 minutes for your password, Touch ID or confirmation.
+- `porch clean` and `porch trust` no longer fail when the CA was already removed by hand (in Keychain Access or the Windows certificate manager), or when Porch's copy of it is gone. Removing system-wide trust on macOS now also removes its trust setting, not only the certificate.
+- Updating the hosts file can no longer leave it empty or cut short if Porch is interrupted or the disk is full, and an unchanged file is never rewritten. On Windows, `porch hosts sync` and `porch hosts clean` failed with a sharing violation and now work.
+- Changing `--tld` back and forth no longer makes a new CA, and a new trust prompt, every time: a new CA keeps the domains of the one it replaces. An interrupted CA creation no longer stops the proxy from ever starting with a bare "No such file"; Porch makes a new CA, or says how to recover a damaged one.
+- A proxy that runs for a year or more renews its certificates before they expire instead of serving expired ones until restarted. Issuing a certificate no longer re-reads the CA each time.
+- Linux system-wide trust installs the CA readable by every user, so tools that read the system certificate directory as a normal user can use it.
+- In the foreground, `porch compose up` checks Docker every two seconds instead of twice a second, no longer rewrites Porch's state when nothing changed, and responds to Ctrl-C at once even when Docker is slow. Ctrl-C now gives Compose time to stop containers gracefully (Porch used to kill it after 5 seconds, leaving slow containers running), and a second Ctrl-C forces it.
+- `porch compose down` releases the project's ports and deletes the resolved Compose model Porch kept, which could contain values from `.env` files. Projects whose directory is gone are forgotten.
+- One unreadable sharing record no longer stops `porch prune` and `porch clean`, and a missing `tailscale` command no longer blocks them. Sharing records are written atomically.
+- Ending a shared app gives ngrok and cloudflared a moment to close their tunnels before they are killed, without blocking the app's other work.
+- LAN mode keeps announcing your apps when one route can't be announced or the mDNS service hiccups, instead of stopping until the proxy restarts.
+- `porch-login enable` no longer turns off an already enabled menu bar login item when launchd is slow to unload the old one.
 
 ### Improved
 - The proxy no longer reads the process table every 5 seconds when no app is running, nor connects to every app each time.
