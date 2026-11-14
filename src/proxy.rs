@@ -1420,16 +1420,27 @@ fn upstream_failure(
             },
         );
     }
+    let waiting = (
+        StatusCode::BAD_GATEWAY,
+        "upstream_unavailable",
+        "The target app is not accepting connections. Check its output and PORT setting.",
+    );
+    // A port Porch reserved for an app that hasn't started yet resets every
+    // connection (`sockets::Reservation::close_connections`).
+    if loopback_target
+        && matches!(
+            crate::upstream::io_error_kind(e),
+            Some(ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe)
+        )
+    {
+        return waiting;
+    }
     let gateway = |message| (StatusCode::BAD_GATEWAY, "upstream_error", message);
     if !e.is_connect() {
         return gateway("The app closed the connection before sending a complete response. Check its output: it may have crashed.");
     }
     match crate::upstream::io_error_kind(e) {
-        Some(ErrorKind::ConnectionRefused) if loopback_target => (
-            StatusCode::BAD_GATEWAY,
-            "upstream_unavailable",
-            "The target app is not accepting connections. Check its output and PORT setting.",
-        ),
+        Some(ErrorKind::ConnectionRefused) if loopback_target => waiting,
         Some(ErrorKind::ConnectionRefused) => gateway("The backend refused the connection."),
         Some(ErrorKind::TimedOut) => (
             StatusCode::GATEWAY_TIMEOUT,
@@ -2300,6 +2311,20 @@ mod tests {
             .unwrap_err()
     }
     #[tokio::test]
+    async fn a_reserved_port_that_resets_connections_gets_the_waiting_page() {
+        let port = crate::test_support::free_port();
+        let mut reservation = crate::sockets::reserve(port).unwrap();
+        reservation.close_connections().unwrap();
+        let e = failure_for(port).await;
+        assert_eq!(
+            upstream_failure(&e, true, false).1,
+            "upstream_unavailable",
+            "{e:?}"
+        );
+        assert_eq!(upstream_failure(&e, false, false).1, "upstream_error");
+        drop(reservation);
+    }
+    #[tokio::test]
     async fn only_a_local_app_that_is_not_listening_gets_the_waiting_page() {
         // A private port nothing is bound to: connections are refused.
         let refused = crate::test_support::free_port();
@@ -2318,6 +2343,7 @@ mod tests {
         });
         let e = failure_for(port).await;
         crash.await.unwrap();
+        // (Waiting page cases above; a closed connection is a crash.)
         let (code, kind, message) = upstream_failure(&e, true, false);
         assert_eq!((code, kind), (StatusCode::BAD_GATEWAY, "upstream_error"));
         assert!(message.contains("closed the connection"), "{message}");
