@@ -1154,8 +1154,12 @@ pub async fn perform(
 }
 
 fn proxy_running() -> Option<u32> {
+    let dir = crate::state::dir();
+    if dir.as_os_str().is_empty() {
+        return None; // No home directory: never read a path relative to the cwd.
+    }
     let identity: crate::state::ProcessIdentity =
-        serde_json::from_slice(&fs::read(crate::state::dir().join("proxy.identity")).ok()?).ok()?;
+        serde_json::from_slice(&fs::read(dir.join("proxy.identity")).ok()?).ok()?;
     crate::state::matches(&identity).then_some(identity.pid)
 }
 
@@ -1394,7 +1398,11 @@ fn cache_path(state_dir: &Path) -> PathBuf {
 /// through `state`, which prepares the directory (and under sudo, gives it
 /// and the file to the invoking user).
 fn remember(latest: &Version) {
-    let path = cache_path(&crate::state::dir());
+    let dir = crate::state::dir();
+    if dir.as_os_str().is_empty() {
+        return; // No home directory: nowhere to record it.
+    }
+    let path = cache_path(&dir);
     let mut cache = read_cache(&path);
     cache.latest = Some(latest.text.clone());
     cache.checked_at = now();
