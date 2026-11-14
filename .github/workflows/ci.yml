@@ -9,6 +9,10 @@ name: CI
 # it as their README and scripts/test_packaging.py checks it is present.
 # Keep both lists the same. No status check is required on main, so a
 # skipped run never blocks a merge.
+#
+# Actions are pinned to full commit SHAs, with the version in a comment;
+# update both together. ci.yml produces nothing that is published, so it may
+# use caches; release.yml does not.
 on:
   push:
     branches: [main]
@@ -40,8 +44,10 @@ jobs:
     # Known vulnerabilities, unmaintained crates, licenses and sources.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
   test:
@@ -55,23 +61,26 @@ jobs:
       # tests/e2e.rs installs real Vite from npm and drives its HMR socket.
       PORCH_E2E: "1"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           components: rustfmt, clippy
       # Dependencies only, keyed per job, OS, toolchain and Cargo.lock, and
       # restored from an older lockfile when it changes. Saving only on main
       # keeps branch and pull request copies from evicting main's cache.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
-      - run: npm install --global turbo@2.6.3
+      # turbo has no install scripts; its platform binaries are exact versions.
+      - run: npm install --global --ignore-scripts turbo@2.6.3
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --no-fail-fast --all-targets
@@ -98,24 +107,29 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           components: clippy
       # rust-cache never re-saves a key it restored exactly, and the key only
       # follows Cargo.lock and the toolchain. Change `key` when this job starts
       # building different artifacts, so main saves a cache that has them.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: debug-builds
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       # The tray feature only adds code (src/tray.rs and porch-tray), so this
       # lints every Windows path the featureless build has and more. The
       # featureless lint runs in `test` on Linux and macOS.
       - run: cargo clippy --features tray --all-targets -- -D warnings
+      - name: Tray menu tests
+        timeout-minutes: 10
+        run: cargo test --features tray --lib tray::tests
       - name: Unit and integration tests
         # `--tests` includes the library's unit tests. A hung test must not
         # hold the job until GitHub's 6-hour limit.
@@ -134,11 +148,13 @@ jobs:
         os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - if: runner.os == 'Linux'
@@ -166,3 +182,75 @@ jobs:
           assert result.returncode != 0, result
           assert 'porch list --all' in result.stderr, result.stderr
           PY
+  installers:
+    # scripts/install.sh: lint it, then install the latest release into a
+    # temporary home, once with gh logged out (the attestation check must be
+    # skipped with a note) and once with a token (it must verify).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: runner.os == 'Linux'
+        run: shellcheck scripts/install.sh
+      - name: Install without a gh login
+        run: |
+          home="$RUNNER_TEMP/home-anonymous"
+          mkdir -p "$home"
+          env -u GH_TOKEN -u GITHUB_TOKEN HOME="$home" GH_CONFIG_DIR="$home/gh" \
+            PORCH_APP_DIR="$home/Applications" sh scripts/install.sh | tee "$RUNNER_TEMP/anonymous.log"
+          grep -q 'Skipped the build attestation check' "$RUNNER_TEMP/anonymous.log"
+          "$home/.local/bin/porch" --version
+      - name: Install with the attestation required
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          home="$RUNNER_TEMP/home-verified"
+          mkdir -p "$home"
+          HOME="$home" GH_CONFIG_DIR="$home/gh" PORCH_APP_DIR="$home/Applications" \
+            PORCH_UPDATE_VERIFY=require sh scripts/install.sh | tee "$RUNNER_TEMP/verified.log"
+          grep -q 'Verified build attestation: built by .* from refs/tags/v' "$RUNNER_TEMP/verified.log"
+          "$home/.local/bin/porch" --version
+          # Running it again replaces the installed copy in place.
+          HOME="$home" PORCH_APP_DIR="$home/Applications" sh scripts/install.sh >/dev/null
+  installers-windows:
+    # scripts/install.ps1: lint it, then run it as `irm ... | iex` does, in
+    # Windows PowerShell 5.1, into a temporary LOCALAPPDATA.
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.23.0 -Repository PSGallery -Scope CurrentUser -Force
+          # An installer talks to the person running it: Write-Host is intended.
+          $issues = Invoke-ScriptAnalyzer -Path scripts/install.ps1 -Severity Warning,Error -ExcludeRule PSAvoidUsingWriteHost
+          $issues | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+          if ($issues) { exit 1 }
+      - name: Install with irm | iex
+        shell: powershell
+        run: |
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'localappdata'
+          New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference = 'Continue'
+          Get-Content scripts/install.ps1 -Raw | Invoke-Expression
+          if ($ErrorActionPreference -ne 'Continue' -or $ProgressPreference -ne 'Continue') {
+            throw 'install.ps1 changed preferences in the calling session'
+          }
+          $porch = Join-Path $env:LOCALAPPDATA 'Programs\Porch\bin\porch.exe'
+          & $porch --version
+          if ($LASTEXITCODE -ne 0) { throw "porch.exe --version failed" }
+          # Again over the installed copy, which moves it aside.
+          Get-Content scripts/install.ps1 -Raw | Invoke-Expression
+          & $porch --version
+          if ($LASTEXITCODE -ne 0) { throw "porch.exe --version failed after reinstall" }

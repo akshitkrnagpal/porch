@@ -15,7 +15,7 @@ Your app gets the port as `PORT`, and `web.localhost` keeps pointing at it howev
 curl -fsSL https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.sh | sh
 ```
 
-The script needs no sudo and no Python. It checks the release checksum and, if the GitHub CLI is installed, the signed build attestation. Other options: `brew install akshitkrnagpal/tap/porch`, the Windows script (`irm https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.ps1 | iex`), or a [release archive](https://github.com/akshitkrnagpal/porch/releases/latest).
+The script needs no sudo and no Python. It checks the download against the release's checksum file and, when the GitHub CLI (2.49 or newer) is installed and logged in, the signed build attestation that shows Porch's release workflow built it; otherwise it says that check was skipped. Other options: `brew install akshitkrnagpal/tap/porch`, the Windows script (`irm https://raw.githubusercontent.com/akshitkrnagpal/porch/main/scripts/install.ps1 | iex`), or a [release archive](https://github.com/akshitkrnagpal/porch/releases/latest).
 
 ## 2. Run an app
 

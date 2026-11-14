@@ -7,7 +7,7 @@ Each release archive contains:
 - Linux, static (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`): `porch` and `install.py` only. These run on any distribution, including Alpine and ARM64 servers.
 - Windows (`x86_64-pc-windows-msvc`, preview): `porch.exe`, `porch-tray.exe` (a notification-area app) and `install.py`. There is no `porch-login` on Windows.
 
-Archives are attached to tagged GitHub Releases along with a `SHA256SUMS` file. They aren't signed or notarized. `homebrew/porch.rb` is the Homebrew formula template that `scripts/render_formula.py` fills in for each release.
+Archives are attached to tagged GitHub Releases along with a `SHA256SUMS` file and a signed build-provenance attestation for each. The binaries aren't code-signed or notarized. `homebrew/porch.rb` is the Homebrew formula template that `scripts/render_formula.py` fills in for each release.
 
 **What's in `Porch.app`.** The app runs the same `porch-tray` as the archive root and carries its own `porch` in `Porch.app/Contents/MacOS`, so it keeps working wherever you move it, even without the command-line install. In the download, those two files are tar hard links to the files at the archive root, so each program is downloaded once. The usual extractors (`tar`, Finder's Archive Utility, Homebrew, `install.py`, `porch self-update`) write them back as ordinary, complete files; nothing extracted is a symlink or depends on a relative path. A tool that can't recreate tar hard links would leave the app without its executables, so use `tar -xzf`. Homebrew installs only `porch`.
 
@@ -27,7 +27,7 @@ On macOS and Linux this installs `porch`, `porch-tray` and `porch-login` in `~/.
 
 The installed `Porch.app` is a complete copy with its own `porch` inside: the terminal runs `~/.local/bin/porch` and the menu runs the copy in the app. Both come from the same release. `porch self-update` replaces both, but it finds the app only in `~/Applications` or in the folder named by `PORCH_APP_DIR`. Rerunning a newer `install.py` (or an older one with `--archive`) or `brew upgrade akshitkrnagpal/tap/porch` also upgrades.
 
-Installing doesn't touch running apps, the proxy, sharing, trust stores, the hosts file or login startup. `--cli-only` installs only the CLI, and `--prefix PATH` and `--app-dir PATH` change where files go. To update later, run `porch self-update`.
+Installing doesn't touch running apps, the proxy, sharing, trust stores, the hosts file or login startup. `--cli-only` installs only the CLI, and `--prefix PATH` and `--app-dir PATH` change where files go. To update later, run `porch self-update`; see "Updates" in `docs/reference.md` for what it verifies.
 
 ## Launch the menu
 
@@ -45,7 +45,7 @@ macOS may ask you to approve an unsigned app downloaded from the internet in Sys
 
 ## Linux desktop requirements
 
-The `porch` CLI doesn't link GTK, AppIndicator or OpenSSL and works without a display. Only `porch-tray` needs the desktop libraries. The `linux-gnu` binaries need glibc 2.39 or newer; on older distributions use a static `linux-musl` archive. Every archive has a signed build-provenance attestation (`gh attestation verify porch-*.tar.gz --repo akshitkrnagpal/porch`), and `scripts/install.sh` installs the right one without Python.
+The `porch` CLI doesn't link GTK, AppIndicator or OpenSSL and works without a display. Only `porch-tray` needs the desktop libraries. The `linux-gnu` binaries need glibc 2.39 or newer; on older distributions use a static `linux-musl` archive. Every archive has a signed build-provenance attestation (`gh attestation verify porch-VERSION-TARGET.tar.gz --repo akshitkrnagpal/porch --source-ref refs/tags/vVERSION`), and `scripts/install.sh` installs the right one without Python. `install.py` itself checks neither: verify the archive before you run it. Homebrew installs the static `linux-musl` build on Linux.
 
 Build dependencies on Debian and Ubuntu:
 

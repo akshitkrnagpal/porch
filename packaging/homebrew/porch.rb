@@ -21,8 +21,8 @@ class Porch < Formula
 
   on_linux do
     if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
-      url "https://github.com/@REPO@/releases/download/v@VERSION@/porch-@VERSION@-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "@SHA256_X86_64_UNKNOWN_LINUX_GNU@"
+      url "https://github.com/@REPO@/releases/download/v@VERSION@/porch-@VERSION@-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "@SHA256_X86_64_UNKNOWN_LINUX_MUSL@"
     elsif Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
       url "https://github.com/@REPO@/releases/download/v@VERSION@/porch-@VERSION@-aarch64-unknown-linux-musl.tar.gz"
       sha256 "@SHA256_AARCH64_UNKNOWN_LINUX_MUSL@"

@@ -35,6 +35,11 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - The default MCP profile can no longer stop your apps. `alias_add` with `force` used to end the app holding the name, although only the `apps` profile is meant to stop processes. Without `apps`, `alias_add` now refuses a name that belongs to an app Porch started, and `force` only replaces another alias.
 - Aliases an agent creates over MCP stay off paired machines unless it passes `private: false`.
 - The MCP `logs` and `machines` tools describe their output as untrusted, since it comes from apps and paired machines.
+- `porch self-update` and the install scripts say exactly what they checked. When the GitHub CLI can't verify the build attestation (not installed, too old, not logged in, offline), they print why, show `gh`'s error and continue, rather than skipping silently (the install scripts) or failing with "did not verify" (an installed but unusable `gh`). A real attestation mismatch still stops the install. SECURITY.md no longer says the attestation is always verified.
+- The attestation check now also requires that the archive was built from the release's own tag (`--source-ref`, with gh versions that support it), and releases are published only from commits on `main`.
+- `PORCH_UPDATE_VERIFY=require` is enforced in every case, including with `PORCH_UPDATE_API` set, where it used to install unverified. Values other than `require` or `auto` are rejected instead of meaning "not required".
+- `GITHUB_TOKEN`/`GH_TOKEN` (and `gh auth token`) are sent only to `api.github.com`, never to a `PORCH_UPDATE_API` host or an asset URL it names, and `PORCH_UPDATE_API` must use https. The daily update check sends no token. A token GitHub rejects (expired, or for GitHub Enterprise) no longer breaks updates of a public repository: the request is retried without it.
+- Release builds no longer restore caches, pin every GitHub Action to a commit, and build with `--locked`.
 
 ### Fixed
 - Launch options before `--name` (`-d`, `--detach`, `--private`, `--prefix=…`, `--app-port=…`, `--framework`, `--state-dir`) no longer make Porch treat the command as the app's name, and `porch --private -- --filter=web` passes `--filter=web` to the dev script. `porch web --name api …` is refused instead of quietly ignoring `--name`.
@@ -97,6 +102,14 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - Menu messages go away after a few seconds, and a pairing code leaves the menu when it expires.
 - **Pair a device…** in the menu now opens a submenu that says pairing turns on sharing, and the code needs a second click.
 - Running `porch tray` again while the menu is open no longer adds a second icon.
+- `porch self-update` replaces `porch` last, so an update that fails partway (the tray, `porch-login` or `Porch.app`) is redone by running it again instead of reporting "up to date". It refuses a foreign `Porch.app` before replacing anything, and notes companions the new archive doesn't include.
+- A static Linux `porch` with a tray beside it (from an earlier `PORCH_TRAY=1` install) updates to the build that includes the tray, through `porch self-update` and `install.sh` alike. `PORCH_TRAY=0` switches back and removes the tray. `PORCH_TRAY=1` on ARM64 Linux says it is ignored.
+- `--force` no longer installs a release older than the running `porch` (except over a source build), and says it has no effect on a Homebrew install.
+- Versions such as `1.0.0-rc.10` sort after `1.0.0-rc.2`, and versions with build metadata (`1.0.0+build.1`) are understood.
+- Homebrew on x86_64 Linux installs the static build, which runs on Ubuntu 22.04, Debian 12 and RHEL 9 (the previous build needed glibc 2.39). The update notice for Homebrew installs suggests `brew upgrade` and waits until the tap has the new version.
+- The daily update check no longer delays commands while it loads the system's certificates. A slow answer is saved if the command is still running when it arrives, rather than discarded. The check no longer creates `~/.porch` itself, and `sudo porch self-update` no longer leaves a root-owned `~/.porch`.
+- `install.sh` finds the latest release without the GitHub API's hourly limit, installs the Apple Silicon build from a Rosetta shell, refuses to run under `sudo`, checks `Porch.app` is Porch's before replacing it (and swaps it in one step), uses HTTPS only, and does nothing if the download is cut short.
+- `install.ps1` fails clearly when extraction fails or `porch.exe` is missing instead of reporting success, uses Windows' own `tar`, keeps `%VAR%` entries in your PATH, works when the user PATH is empty, replaces a running `porch.exe` safely, no longer changes your PowerShell session's settings, and downloads faster on Windows PowerShell 5.1.
 
 ### Improved
 - The proxy no longer reads the process table every 5 seconds when no app is running, nor connects to every app each time.
@@ -104,7 +117,6 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - Launching in a workspace looks up the Git worktree and the workspace's packages once instead of once per package, and `porch run --detach` doesn't repeat it in the background launcher. A command that exits without handing its port to a daemon no longer runs `lsof` for a second.
 - Requests no longer wait on each other while the proxy re-reads routes or checks whether apps are alive, and route matching does less work per request.
 - An app Porch launched that listens only on IPv6 loopback is reached without a blocking check on every request. An `--upstream` alias moves to IPv6 loopback only when nothing listens on IPv4, never because the app was slow.
-
 
 ## 0.5.2 (2026-11-14)
 

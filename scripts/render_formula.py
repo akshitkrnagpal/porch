@@ -18,7 +18,9 @@ ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / 'packaging/homebrew/porch.rb'
 DEFAULT_REPO = 'akshitkrnagpal/porch'
 # Every target the formula references. Each must be present in SHA256SUMS.
-TARGETS = ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-musl']
+# Linux uses the static musl builds: Homebrew installs only the CLI, and the
+# glibc build needs glibc 2.39+, which Ubuntu 22.04, Debian 12 and RHEL 9 lack.
+TARGETS = ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl']
 VERSION = re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')
 
 

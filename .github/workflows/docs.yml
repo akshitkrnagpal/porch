@@ -1,6 +1,7 @@
 name: Docs
 # Builds the mdBook docs site (book.toml, docs/) and publishes it to GitHub
-# Pages on every push to main that touches the docs.
+# Pages on every push to main that touches the docs. Actions are pinned to
+# commit SHAs; the version is in the comment beside each.
 on:
   push:
     branches: [main]
@@ -8,29 +9,40 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-  pages: write
-  id-token: write
 concurrency:
   group: pages
   cancel-in-progress: false
 jobs:
   build:
+    # Only reads the repository; the Pages permissions belong to `deploy`.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install mdBook
+        env:
+          MDBOOK: mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz
+          # The digest GitHub lists for that release asset.
+          MDBOOK_SHA256: 3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7
         run: |
-          curl -fsSL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/$MDBOOK" \
+            "https://github.com/rust-lang/mdBook/releases/download/v0.5.4/$MDBOOK"
+          echo "$MDBOOK_SHA256  $RUNNER_TEMP/$MDBOOK" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$MDBOOK"
           ./mdbook build
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
         with:
           path: target/book
   deploy:
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

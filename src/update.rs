@@ -30,6 +30,9 @@ const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(2);
 const FINISH_WAIT: Duration = Duration::from_millis(500);
 const APP_BUNDLE_ID: &str = "dev.porch.tray";
 const COMPANIONS: [&str; 2] = ["porch-tray", "porch-login"];
+/// The formula `brew upgrade` installs from (the tap is `BREW_FORMULA`).
+const TAP_FORMULA_URL: &str =
+    "https://raw.githubusercontent.com/akshitkrnagpal/homebrew-tap/HEAD/Formula/porch.rb";
 
 /// Executable file name on this platform (`porch` or `porch.exe`).
 fn exe_name(base: &str) -> String {
@@ -52,22 +55,48 @@ pub struct SelfUpdateArgs {
 // ---------------------------------------------------------------------------
 // Versions and assets
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A semantic version. Build metadata (`+...`) is kept in the text, which
+/// names release assets, but ignored when comparing, as semver requires.
+#[derive(Debug, Clone)]
 pub struct Version {
     core: [u64; 3],
-    pre: Option<String>,
+    pre: Vec<String>,
     text: String,
+}
+
+fn is_identifier(part: &str) -> bool {
+    !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 impl Version {
     pub fn parse(raw: &str) -> Option<Self> {
         let text = raw.trim().trim_start_matches('v');
-        let (core, pre) = match text.split_once('-') {
-            Some((core, pre)) if !pre.is_empty() => (core, Some(pre.to_owned())),
-            Some(_) => return None,
-            None => (text.split('+').next()?, None),
+        let (rest, build) = match text.split_once('+') {
+            Some((rest, build)) => (rest, Some(build)),
+            None => (text, None),
         };
-        let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
+        if build.is_some_and(|b| !b.split('.').all(is_identifier)) {
+            return None;
+        }
+        let (core, pre) = match rest.split_once('-') {
+            Some((core, pre)) => (core, Some(pre)),
+            None => (rest, None),
+        };
+        let pre: Vec<String> = match pre {
+            Some(pre) => {
+                let parts: Vec<&str> = pre.split('.').collect();
+                if !parts.iter().all(|p| is_identifier(p)) {
+                    return None;
+                }
+                parts.into_iter().map(str::to_owned).collect()
+            }
+            None => Vec::new(),
+        };
+        let mut parts = core.split('.').map(|p| {
+            (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| p.parse::<u64>().ok())
+                .flatten()
+        });
         let parsed = [parts.next()??, parts.next()??, parts.next()??];
         if parts.next().is_some() {
             return None;
@@ -79,6 +108,31 @@ impl Version {
         })
     }
 }
+
+/// Semver precedence of two dot-separated pre-release identifiers: numeric
+/// ones compare as numbers and sort before alphanumeric ones.
+fn compare_identifier(a: &str, b: &str) -> Ordering {
+    let number = |s: &str| {
+        s.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| s.parse::<u128>().ok())
+            .flatten()
+    };
+    match (number(a), number(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => a.cmp(b),
+    }
+}
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Version {}
 
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -96,11 +150,19 @@ impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
         self.core
             .cmp(&other.core)
-            .then_with(|| match (&self.pre, &other.pre) {
-                (None, None) => Ordering::Equal,
-                (None, Some(_)) => Ordering::Greater,
-                (Some(_), None) => Ordering::Less,
-                (Some(a), Some(b)) => a.cmp(b),
+            .then_with(|| match (self.pre.is_empty(), other.pre.is_empty()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => {
+                    for (a, b) in self.pre.iter().zip(&other.pre) {
+                        let order = compare_identifier(a, b);
+                        if order != Ordering::Equal {
+                            return order;
+                        }
+                    }
+                    self.pre.len().cmp(&other.pre.len())
+                }
             })
     }
 }
@@ -234,50 +296,215 @@ pub fn verify_checksum(bytes: &[u8], name: &str, sums: &BTreeMap<String, String>
 // ---------------------------------------------------------------------------
 // Build provenance
 
-/// Check the archive's GitHub build attestation with `gh attestation verify`.
-///
-/// `SHA256SUMS` only proves the download is intact; the attestation proves the
-/// release workflow in the Porch repository built it. Verification runs when
-/// the GitHub CLI is installed, and `PORCH_UPDATE_VERIFY=require` makes it
-/// mandatory. A failed verification always stops the update.
-fn verify_provenance(github: &GitHub, tarball: &Path, out: &mut dyn Write) -> Result<()> {
-    if github.api != DEFAULT_API {
-        // A mirror or test server: attestations live on github.com only.
-        return Ok(());
-    }
-    let required = env_nonempty("PORCH_UPDATE_VERIFY").is_some_and(|v| v == "require");
-    let gh = Command::new("gh")
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !gh {
-        if required {
-            bail!("PORCH_UPDATE_VERIFY=require needs the GitHub CLI (gh) to check the build attestation");
+/// How strictly `porch self-update` checks the build attestation
+/// (`PORCH_UPDATE_VERIFY`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerifyMode {
+    /// Check it when the GitHub CLI can; otherwise say so and continue.
+    #[default]
+    Auto,
+    /// Refuse to install unless it verifies.
+    Require,
+}
+
+impl VerifyMode {
+    pub fn parse(value: Option<&str>) -> Result<VerifyMode> {
+        match value.map(str::trim).unwrap_or("") {
+            "" => Ok(VerifyMode::Auto),
+            v if v.eq_ignore_ascii_case("auto") => Ok(VerifyMode::Auto),
+            v if v.eq_ignore_ascii_case("require") => Ok(VerifyMode::Require),
+            other => bail!(
+                "PORCH_UPDATE_VERIFY must be `require` or `auto` (the default), got {other:?}"
+            ),
         }
-        writeln!(
-            out,
-            "Skipped build attestation check (install the GitHub CLI to enable it)"
-        )?;
-        return Ok(());
     }
-    let workflow = format!("{}/.github/workflows/release.yml", github.repo);
-    let result = Command::new("gh")
-        .args(["attestation", "verify"])
-        .arg(tarball)
-        .args(["--repo", &github.repo, "--signer-workflow", &workflow])
+
+    pub fn from_env() -> Result<VerifyMode> {
+        VerifyMode::parse(std::env::var("PORCH_UPDATE_VERIFY").ok().as_deref())
+    }
+}
+
+/// Settings for the attestation check; `gh` is the GitHub CLI to run.
+#[derive(Debug, Clone)]
+pub struct Provenance {
+    pub mode: VerifyMode,
+    pub gh: PathBuf,
+}
+
+impl Provenance {
+    pub fn from_env() -> Result<Provenance> {
+        Ok(Provenance {
+            mode: VerifyMode::from_env()?,
+            gh: PathBuf::from("gh"),
+        })
+    }
+}
+
+/// What `gh attestation verify` could establish about an archive.
+#[derive(Debug, PartialEq, Eq)]
+enum Attestation {
+    /// Verified; `pinned_ref` says whether the release tag was checked too.
+    Verified { pinned_ref: bool },
+    /// The check could not run here: no usable gh, no login, offline, a mirror.
+    Unavailable { reason: String, detail: String },
+    /// GitHub answered, and the archive has no attestation from this
+    /// repository's release workflow for this tag.
+    Failed { detail: String },
+}
+
+fn gh_output(gh: &Path, args: &[&std::ffi::OsStr]) -> std::io::Result<std::process::Output> {
+    Command::new(gh)
+        .args(args)
         .stdin(std::process::Stdio::null())
         .output()
-        .context("cannot run gh attestation verify")?;
-    if !result.status.success() {
-        bail!(
-            "the release archive's build attestation did not verify; not installing it.\n{}",
-            String::from_utf8_lossy(&result.stderr).trim()
+}
+
+/// Run `gh attestation verify` for `tarball` and classify the result.
+///
+/// gh exits 4 when it has no login. Any other failure is a verification
+/// failure only if GitHub's API is reachable with gh's credentials (checked
+/// with `gh api rate_limit`, which costs no quota); otherwise the check could
+/// not run (offline, a revoked token, an Enterprise-only login).
+fn check_attestation(gh: &Path, repo: &str, tag: &str, tarball: &Path) -> Attestation {
+    let unavailable = |reason: &str, detail: &[u8]| Attestation::Unavailable {
+        reason: reason.to_owned(),
+        detail: String::from_utf8_lossy(detail).trim().to_owned(),
+    };
+    let os = std::ffi::OsStr::new;
+    if gh_output(gh, &[os("--version")]).is_err() {
+        return unavailable("the GitHub CLI (gh) is not installed", b"");
+    }
+    let help = match gh_output(gh, &[os("attestation"), os("verify"), os("--help")]) {
+        Ok(help) if help.status.success() => help,
+        _ => {
+            return unavailable(
+                "this gh has no `attestation` command (it needs gh 2.49 or newer)",
+                b"",
+            )
+        }
+    };
+    let pinned_ref = String::from_utf8_lossy(&help.stdout).contains("--source-ref");
+    let workflow = format!("{repo}/.github/workflows/release.yml");
+    let source_ref = format!("refs/tags/{tag}");
+    let mut args = vec![
+        os("attestation"),
+        os("verify"),
+        tarball.as_os_str(),
+        os("--repo"),
+        os(repo),
+        os("--signer-workflow"),
+        os(&workflow),
+    ];
+    if pinned_ref {
+        args.extend([os("--source-ref"), os(&source_ref)]);
+    }
+    let result = match gh_output(gh, &args) {
+        Ok(result) => result,
+        Err(error) => {
+            return unavailable(
+                "gh attestation verify could not run",
+                error.to_string().as_bytes(),
+            )
+        }
+    };
+    if result.status.success() {
+        return Attestation::Verified { pinned_ref };
+    }
+    if result.status.code() == Some(4) {
+        return unavailable(
+            "gh is not logged in (run `gh auth login`, or set GH_TOKEN)",
+            &result.stderr,
         );
     }
-    writeln!(out, "Verified build attestation from {workflow}")?;
+    let api_ok = gh_output(gh, &[os("api"), os("--silent"), os("rate_limit")])
+        .is_ok_and(|probe| probe.status.success());
+    if !api_ok {
+        return unavailable(
+            "gh could not reach the GitHub API, or its token was rejected",
+            &result.stderr,
+        );
+    }
+    Attestation::Failed {
+        detail: String::from_utf8_lossy(&result.stderr).trim().to_owned(),
+    }
+}
+
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Check the archive's GitHub build attestation and report what was checked.
+///
+/// `SHA256SUMS` comes from the same release as the archive, so it shows only
+/// that the download is intact. The attestation, checked by the GitHub CLI,
+/// shows that this repository's release workflow built the archive from the
+/// release's tag. When gh can't check it, the update continues with a clear
+/// note, unless `PORCH_UPDATE_VERIFY=require`. A failed check always stops.
+fn verify_provenance(
+    github: &GitHub,
+    provenance: &Provenance,
+    tag: &str,
+    tarball: &Path,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let result = if github.api != DEFAULT_API {
+        Attestation::Unavailable {
+            reason: format!(
+                "PORCH_UPDATE_API points at {}, and attestations are checked against github.com only",
+                github.api
+            ),
+            detail: String::new(),
+        }
+    } else {
+        check_attestation(&provenance.gh, &github.repo, tag, tarball)
+    };
+    let workflow = format!("{}/.github/workflows/release.yml", github.repo);
+    match result {
+        Attestation::Verified { pinned_ref: true } => {
+            writeln!(
+                out,
+                "Verified build attestation: built by {workflow} from refs/tags/{tag}"
+            )?;
+        }
+        Attestation::Verified { pinned_ref: false } => {
+            if provenance.mode == VerifyMode::Require {
+                bail!(
+                    "PORCH_UPDATE_VERIFY=require: this gh can't check which tag the release was built from (no --source-ref); update the GitHub CLI"
+                );
+            }
+            writeln!(
+                out,
+                "Verified build attestation: built by {workflow} (update the GitHub CLI to also check it was built from {tag})"
+            )?;
+        }
+        Attestation::Unavailable { reason, detail } => {
+            let detail = if detail.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", indent(&detail))
+            };
+            if provenance.mode == VerifyMode::Require {
+                bail!("PORCH_UPDATE_VERIFY=require: cannot check the build attestation: {reason}{detail}");
+            }
+            writeln!(
+                out,
+                "Skipped the build attestation check: {reason}.{detail}\n\
+                 Only the SHA-256 checksum was checked. It comes from the same release, so it shows\n\
+                 the download is intact, not that Porch's release workflow built it. To check that,\n\
+                 install the GitHub CLI (2.49 or newer) and run `gh auth login`, or set GH_TOKEN.\n\
+                 Set PORCH_UPDATE_VERIFY=require to refuse updates that can't be checked."
+            )?;
+        }
+        Attestation::Failed { detail } => {
+            bail!(
+                "the release archive's build attestation did not verify; not installing it.\n{}",
+                indent(&detail)
+            );
+        }
+    }
     Ok(())
 }
 
@@ -287,6 +514,10 @@ fn verify_provenance(github: &GitHub, tarball: &Path, out: &mut dyn Write) -> Re
 pub struct GitHub {
     client: reqwest::Client,
     api: String,
+    /// Scheme, host and port of `api`: the only origin a token is sent to.
+    origin: url::Origin,
+    /// `api` is plain HTTP on a loopback address (a test server).
+    loopback_http: bool,
     repo: String,
     token: Option<String>,
 }
@@ -295,10 +526,36 @@ fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// Which credentials a GitHub client may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Auth {
+    /// No token: the passive daily check, which needs none for a public repository.
+    Anonymous,
+    /// `GITHUB_TOKEN`/`GH_TOKEN`, then `gh auth token`.
+    EnvOrGhCli,
+}
+
+fn is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 impl GitHub {
+    /// `api` must be `https://`, or `http://` on a loopback address.
     pub fn new(api: &str, repo: &str, token: Option<String>, timeout: Duration) -> Result<GitHub> {
         if repo.split('/').count() != 2 || repo.split('/').any(str::is_empty) {
             bail!("update repository must look like owner/name, got {repo:?}");
+        }
+        let api = api.trim_end_matches('/').to_owned();
+        let parsed =
+            url::Url::parse(&api).with_context(|| format!("update API {api:?} is not a URL"))?;
+        let loopback_http = parsed.scheme() == "http" && is_loopback(&parsed);
+        if parsed.scheme() != "https" && !loopback_http {
+            bail!("update API {api:?} must use https://");
         }
         let client = reqwest::Client::builder()
             .user_agent(format!("porch/{CURRENT_VERSION}"))
@@ -307,50 +564,75 @@ impl GitHub {
             .build()?;
         Ok(GitHub {
             client,
-            api: api.trim_end_matches('/').to_owned(),
+            origin: parsed.origin(),
+            loopback_http,
+            api,
             repo: repo.to_owned(),
             token,
         })
     }
 
-    /// Repository from `PORCH_UPDATE_REPO`, API base from `PORCH_UPDATE_API`,
-    /// token from `GITHUB_TOKEN`/`GH_TOKEN` (and, when allowed, `gh auth token`).
-    pub fn from_env(timeout: Duration, allow_gh_cli: bool) -> Result<GitHub> {
+    /// Repository from `PORCH_UPDATE_REPO`, API base from `PORCH_UPDATE_API`.
+    /// With [`Auth::EnvOrGhCli`], a token from `GITHUB_TOKEN`/`GH_TOKEN` or
+    /// `gh auth token`, but only for the default GitHub API: a token is never
+    /// sent to a host named in `PORCH_UPDATE_API`.
+    pub fn from_env(timeout: Duration, auth: Auth) -> Result<GitHub> {
         let repo = env_nonempty("PORCH_UPDATE_REPO").unwrap_or_else(|| DEFAULT_REPO.to_owned());
         let api = env_nonempty("PORCH_UPDATE_API").unwrap_or_else(|| DEFAULT_API.to_owned());
-        let mut token = env_nonempty("GITHUB_TOKEN").or_else(|| env_nonempty("GH_TOKEN"));
-        if token.is_none() && allow_gh_cli {
-            token = Command::new("gh")
-                .args(["auth", "token"])
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|t| t.trim().to_owned())
-                .filter(|t| !t.is_empty());
+        let api = api.trim_end_matches('/').to_owned();
+        let mut token = None;
+        if auth == Auth::EnvOrGhCli && api == DEFAULT_API {
+            token = env_nonempty("GITHUB_TOKEN").or_else(|| env_nonempty("GH_TOKEN"));
+            if token.is_none() {
+                token = Command::new("gh")
+                    .args(["auth", "token"])
+                    .stdin(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|t| t.trim().to_owned())
+                    .filter(|t| !t.is_empty());
+            }
         }
         GitHub::new(&api, &repo, token, timeout)
     }
 
-    fn request(&self, url: &str, accept: &str) -> reqwest::RequestBuilder {
-        let request = self
-            .client
-            .get(url)
-            .header(reqwest::header::ACCEPT, accept)
-            .header("X-GitHub-Api-Version", "2022-11-28");
-        match &self.token {
-            Some(token) => request.bearer_auth(token),
-            None => request,
+    /// The token, if one is set and `url` is on the API's own origin.
+    fn token_for(&self, url: &str) -> Option<&str> {
+        let token = self.token.as_deref()?;
+        let url = url::Url::parse(url).ok()?;
+        (url.origin() == self.origin).then_some(token)
+    }
+
+    /// GET `url`, with the token when it may go there. A public repository
+    /// needs none, so if GitHub rejects the token (401/403: expired, or one
+    /// for another GitHub host) the request is retried without it.
+    async fn get(&self, url: &str, accept: &str) -> reqwest::Result<reqwest::Response> {
+        let request = || {
+            self.client
+                .get(url)
+                .header(reqwest::header::ACCEPT, accept)
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        };
+        let Some(token) = self.token_for(url) else {
+            return request().send().await;
+        };
+        let response = request().bearer_auth(token).send().await?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            return request().send().await;
         }
+        Ok(response)
     }
 
     pub async fn latest(&self) -> Result<Release> {
         let url = format!("{}/repos/{}/releases/latest", self.api, self.repo);
         let response = self
-            .request(&url, "application/vnd.github+json")
-            .send()
+            .get(&url, "application/vnd.github+json")
             .await
             .with_context(|| format!("cannot reach {url}"))?;
         let status = response.status();
@@ -373,10 +655,15 @@ impl GitHub {
     }
 
     pub async fn download(&self, asset: &Asset) -> Result<Vec<u8>> {
-        // reqwest drops Authorization when the asset redirect leaves the API host.
+        let url = url::Url::parse(&asset.url)
+            .with_context(|| format!("{} has an invalid URL {:?}", asset.name, asset.url))?;
+        if url.scheme() != "https" && !(self.loopback_http && is_loopback(&url)) {
+            bail!("refusing to download {} over {}", asset.name, url.scheme());
+        }
+        // The token goes only to the API origin, and reqwest drops it when the
+        // asset redirect leaves that host.
         let response = self
-            .request(&asset.url, "application/octet-stream")
-            .send()
+            .get(&asset.url, "application/octet-stream")
             .await
             .with_context(|| format!("cannot download {}", asset.name))?;
         if !response.status().is_success() {
@@ -511,6 +798,37 @@ fn backup_path(dest: &Path) -> PathBuf {
     dest.with_file_name(name)
 }
 
+/// Copies of `dest` moved aside by earlier updates on Windows: `NAME.old`
+/// and `NAME.<pid>.old`. Each is deleted once the process running it exits.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn stale_asides(dest: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(name)) = (dest.parent(), dest.file_name().and_then(|n| n.to_str())) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let prefix = format!("{name}.");
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let file = entry.file_name();
+            let Some(file) = file.to_str() else {
+                return false;
+            };
+            file.strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix("old"))
+                .is_some_and(|middle| {
+                    middle.is_empty()
+                        || middle.strip_suffix('.').is_some_and(|pid| {
+                            !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
+                        })
+                })
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
 /// Replace `dest` with `source`: copy to a temp file beside `dest`, fsync,
 /// keep `dest.old` as a backup, rename into place, then run `verify`. On
 /// failure the backup is restored; on success it is removed. A process that
@@ -565,7 +883,9 @@ pub fn replace_executable(
         // still running keeps its name and this one gets a unique one.
         #[cfg(windows)]
         let backup = if had_original {
-            let _ = fs::remove_file(&backup);
+            for stale in stale_asides(dest) {
+                let _ = fs::remove_file(stale); // fails while that copy still runs
+            }
             let aside = if backup.exists() {
                 dest.with_file_name(format!("{name}.{}.old", std::process::id()))
             } else {
@@ -679,10 +999,42 @@ pub enum Outcome {
     Updated(String),
 }
 
+/// The executable names of the companions on this platform. porch-login is
+/// a script everywhere; the tray is an executable.
+fn companion_names() -> Vec<String> {
+    COMPANIONS
+        .iter()
+        .map(|c| {
+            if *c == "porch-tray" {
+                exe_name(c)
+            } else {
+                (*c).to_owned()
+            }
+        })
+        .collect()
+}
+
+/// The release target to update to. On x86_64 Linux the default install is
+/// the static CLI-only build; if a tray sits beside it (an earlier
+/// `PORCH_TRAY=1` install, since overwritten by a default one), use the
+/// glibc build that ships the tray, so the tray is updated too.
+pub fn update_target<'a>(target: &'a str, exe_dir: &Path) -> &'a str {
+    if target == "x86_64-unknown-linux-musl" && exe_dir.join("porch-tray").is_file() {
+        "x86_64-unknown-linux-gnu"
+    } else {
+        target
+    }
+}
+
 /// Download, verify, and install the latest release over `exe` (and its
 /// companions beside it) and `app` when given. Testable with temp paths.
+///
+/// `porch` itself is replaced last: its version is what the next
+/// `self-update` compares, so if anything fails earlier, rerunning the
+/// update installs everything again rather than reporting "up to date".
 pub async fn perform(
     github: &GitHub,
+    provenance: &Provenance,
     target: &str,
     exe: &Path,
     app: Option<&Path>,
@@ -696,13 +1048,41 @@ pub async fn perform(
         writeln!(out, "porch {current} is up to date.")?;
         return Ok(Outcome::UpToDate(latest.text));
     }
+    if latest < current {
+        if !is_source_build(exe) {
+            bail!(
+                "porch {current} is newer than the latest release ({latest}); --force does not downgrade.\n\
+                 To install {latest} anyway, rerun the install script with PORCH_VERSION={latest}."
+            );
+        }
+        writeln!(
+            out,
+            "Replacing source build {current} with the latest release, {latest} (older)."
+        )?;
+    } else if latest == current {
+        writeln!(out, "Reinstalling porch {latest} (--force).")?;
+    }
     let asset = select_asset(&release, target)?;
     let sums_asset = release
         .asset(SUMS_ASSET)
         .with_context(|| format!("release {} has no {SUMS_ASSET}", release.tag_name))?;
+    if let Some(app) = app {
+        // Refuse before anything is replaced, not halfway through.
+        if app.exists() && !is_porch_app(app) {
+            bail!("refusing to replace unrelated app at {}", app.display());
+        }
+    }
     if args.dry_run {
         writeln!(out, "Would download {} from {}", asset.name, github.repo)?;
         writeln!(out, "Would verify it against {SUMS_ASSET}")?;
+        writeln!(
+            out,
+            "Would check its build attestation with the GitHub CLI ({})",
+            match provenance.mode {
+                VerifyMode::Auto => "skipped with a note if gh can't check it",
+                VerifyMode::Require => "required",
+            }
+        )?;
         writeln!(out, "Would replace {}", exe.display())?;
         if let Some(app) = app {
             writeln!(out, "Would replace {}", app.display())?;
@@ -723,7 +1103,7 @@ pub async fn perform(
     let work = TempDir::new(&std::env::temp_dir(), "update")?;
     let tarball = work.0.join(&asset.name);
     fs::write(&tarball, &archive)?;
-    verify_provenance(github, &tarball, out)?;
+    verify_provenance(github, provenance, &release.tag_name, &tarball, out)?;
     let status = Command::new("tar")
         .arg("-xzf")
         .arg(&tarball)
@@ -740,19 +1120,21 @@ pub async fn perform(
     if !new_porch.is_file() {
         bail!("{} does not contain porch", asset.name);
     }
-    replace_executable(&new_porch, exe, version_check(latest.clone()))?;
-    writeln!(out, "Updated {} to {latest}", exe.display())?;
-    for companion in COMPANIONS {
-        // porch-login is a script on every platform; the tray is an executable.
-        let companion = if companion == "porch-tray" {
-            exe_name(companion)
-        } else {
-            companion.to_owned()
-        };
+    for companion in companion_names() {
         let (source, dest) = (package.join(&companion), exe_dir.join(&companion));
-        if source.is_file() && dest.is_file() {
+        if !dest.is_file() {
+            continue;
+        }
+        if source.is_file() {
             replace_executable(&source, &dest, |_| Ok(()))?;
             writeln!(out, "Updated {}", dest.display())?;
+        } else {
+            writeln!(
+                out,
+                "Note: {} is left at its old version: the {target} release has no {companion}.\n\
+                 Delete it if you no longer use it, or reinstall a build that includes it.",
+                dest.display()
+            )?;
         }
     }
     if let Some(app) = app {
@@ -766,21 +1148,79 @@ pub async fn perform(
             )?;
         }
     }
+    replace_executable(&new_porch, exe, version_check(latest.clone()))?;
+    writeln!(out, "Updated {} to {latest}", exe.display())?;
     Ok(Outcome::Updated(latest.text))
 }
 
 fn proxy_running() -> Option<u32> {
+    let dir = crate::state::dir();
+    if dir.as_os_str().is_empty() {
+        return None; // No home directory: never read a path relative to the cwd.
+    }
     let identity: crate::state::ProcessIdentity =
-        serde_json::from_slice(&fs::read(crate::state::dir().join("proxy.identity")).ok()?).ok()?;
+        serde_json::from_slice(&fs::read(dir.join("proxy.identity")).ok()?).ok()?;
     crate::state::matches(&identity).then_some(identity.pid)
 }
 
+/// The version the Homebrew tap's formula installs. Releases reach the tap
+/// a few minutes after GitHub (or later, if the tap update is skipped), and
+/// `brew upgrade` can't install a release the tap doesn't have yet.
+pub fn parse_formula_version(formula: &str) -> Option<Version> {
+    formula.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("version ")?;
+        Version::parse(rest.trim().trim_matches('"'))
+    })
+}
+
+impl GitHub {
+    /// Whether this client looks at Porch's own releases, which the tap follows.
+    fn is_default(&self) -> bool {
+        self.api == DEFAULT_API && self.repo == DEFAULT_REPO
+    }
+
+    /// The newest version a Homebrew install can upgrade to: the tap
+    /// formula's version (anonymous; it's public), or the latest release when
+    /// `PORCH_UPDATE_REPO`/`PORCH_UPDATE_API` point elsewhere.
+    pub async fn latest_for_homebrew(&self) -> Result<Version> {
+        if !self.is_default() {
+            return self.latest().await?.version();
+        }
+        let response = self
+            .client
+            .get(TAP_FORMULA_URL)
+            .send()
+            .await
+            .with_context(|| format!("cannot reach {TAP_FORMULA_URL}"))?;
+        if !response.status().is_success() {
+            bail!("{TAP_FORMULA_URL} returned {}", response.status());
+        }
+        parse_formula_version(&response.text().await?)
+            .with_context(|| format!("{TAP_FORMULA_URL} has no version"))
+    }
+}
+
+fn is_homebrew_install() -> bool {
+    // Matching `Cellar/porch` in the resolved path needs no `brew` process.
+    current_exe().is_ok_and(|exe| is_homebrew_path(&exe, &[]))
+}
+
 async fn check(github: &GitHub) -> Result<i32> {
-    let latest = github.latest().await?.version()?;
+    let homebrew = is_homebrew_install();
+    let latest = if homebrew {
+        github.latest_for_homebrew().await?
+    } else {
+        github.latest().await?.version()?
+    };
     let current = current_version();
     remember(&latest);
     if latest > current {
-        println!("porch {current} (current)\nporch {latest} (latest)\nUpdate available: run porch self-update");
+        let how = if homebrew {
+            format!("brew upgrade {BREW_FORMULA}")
+        } else {
+            "porch self-update".to_owned()
+        };
+        println!("porch {current} (current)\nporch {latest} (latest)\nUpdate available: run {how}");
         Ok(1)
     } else {
         println!("porch {current} is up to date (latest release {latest}).");
@@ -790,7 +1230,7 @@ async fn check(github: &GitHub) -> Result<i32> {
 
 pub async fn run(args: SelfUpdateArgs) -> Result<i32> {
     if args.check {
-        let github = GitHub::from_env(Duration::from_secs(30), true)?;
+        let github = GitHub::from_env(Duration::from_secs(30), Auth::EnvOrGhCli)?;
         return Ok(match check(&github).await {
             Ok(code) => code,
             Err(error) => {
@@ -802,6 +1242,11 @@ pub async fn run(args: SelfUpdateArgs) -> Result<i32> {
     let exe = current_exe()?;
     if is_homebrew_path(&exe, &homebrew_prefixes()) {
         println!("porch is managed by Homebrew; running: brew upgrade {BREW_FORMULA}");
+        if args.force {
+            println!(
+                "(--force has no effect on a Homebrew install; to reinstall, run: brew reinstall {BREW_FORMULA})"
+            );
+        }
         if args.dry_run {
             return Ok(0);
         }
@@ -820,8 +1265,14 @@ pub async fn run(args: SelfUpdateArgs) -> Result<i32> {
             exe.display()
         );
     }
+    // Before any download, so a typo fails fast instead of skipping the check.
+    let provenance = Provenance::from_env()?;
     let target = current_target().context("no prebuilt Porch release exists for this platform")?;
-    let github = GitHub::from_env(Duration::from_secs(300), true)?;
+    let target = match exe.parent() {
+        Some(dir) => update_target(target, dir),
+        None => target,
+    };
+    let github = GitHub::from_env(Duration::from_secs(300), Auth::EnvOrGhCli)?;
     let app = if cfg!(target_os = "macos") {
         installed_app()
     } else {
@@ -829,6 +1280,7 @@ pub async fn run(args: SelfUpdateArgs) -> Result<i32> {
     };
     let outcome = perform(
         &github,
+        &provenance,
         target,
         &exe,
         app.as_deref(),
@@ -875,17 +1327,21 @@ impl NoticeCache {
             && now.saturating_sub(self.attempted_at) >= RETRY_AFTER_FAILURE
     }
 
-    /// The notice to print now, if a newer release is known and none was shown today.
+    /// The newer release to announce now, if one is known and no notice was
+    /// shown today.
     pub fn notice_due(&self, current: &str, now: u64) -> Option<String> {
         let latest = Version::parse(self.latest.as_deref()?)?;
         let current = Version::parse(current)?;
-        (latest > current && now.saturating_sub(self.notified_at) >= DAY)
-            .then(|| notice_message(&latest.text))
+        (latest > current && now.saturating_sub(self.notified_at) >= DAY).then_some(latest.text)
     }
 }
 
-pub fn notice_message(latest: &str) -> String {
-    format!("porch {latest} is available — run porch self-update")
+pub fn notice_message(latest: &str, homebrew: bool) -> String {
+    if homebrew {
+        format!("porch {latest} is available — run brew upgrade {BREW_FORMULA}")
+    } else {
+        format!("porch {latest} is available — run porch self-update")
+    }
 }
 
 fn now() -> u64 {
@@ -902,16 +1358,33 @@ fn read_cache(path: &Path) -> NoticeCache {
         .unwrap_or_default()
 }
 
+/// An existing state directory that is not a symlink. The passive notice
+/// only writes into one: creating it is `state`'s job, which also sets its
+/// permissions and ownership.
+fn usable_state_dir(dir: &Path) -> bool {
+    fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+}
+
+/// Best-effort cache write for the passive notice; never creates the state
+/// directory.
 fn write_cache(path: &Path, cache: &NoticeCache) {
     let Some(dir) = path.parent() else { return };
-    if fs::create_dir_all(dir).is_err() {
+    if !usable_state_dir(dir) {
         return;
     }
     let temporary = dir.join(format!("{CACHE_FILE}.{}.tmp", std::process::id()));
-    let written = serde_json::to_vec(cache)
-        .ok()
-        .and_then(|bytes| fs::write(&temporary, bytes).ok())
-        .and_then(|_| fs::rename(&temporary, path).ok());
+    let written = serde_json::to_vec(cache).ok().and_then(|bytes| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&temporary).ok()?;
+        file.write_all(&bytes).ok()?;
+        fs::rename(&temporary, path).ok()
+    });
     if written.is_none() {
         let _ = fs::remove_file(&temporary);
     }
@@ -921,14 +1394,22 @@ fn cache_path(state_dir: &Path) -> PathBuf {
     state_dir.join(CACHE_FILE)
 }
 
-/// Record a freshly observed latest version (after `--check` or an update).
+/// Record a freshly observed latest version (after `--check` or an update),
+/// through `state`, which prepares the directory (and under sudo, gives it
+/// and the file to the invoking user).
 fn remember(latest: &Version) {
-    let path = cache_path(&crate::state::dir());
+    let dir = crate::state::dir();
+    if dir.as_os_str().is_empty() {
+        return; // No home directory: nowhere to record it.
+    }
+    let path = cache_path(&dir);
     let mut cache = read_cache(&path);
     cache.latest = Some(latest.text.clone());
     cache.checked_at = now();
     cache.attempted_at = cache.checked_at;
-    write_cache(&path, &cache);
+    if let Ok(bytes) = serde_json::to_vec(&cache) {
+        let _ = crate::state::atomic_write(CACHE_FILE, &bytes);
+    }
 }
 
 fn truthy(key: &str) -> bool {
@@ -1001,30 +1482,52 @@ impl Notice {
             return None; // Never create root-owned files in a user's state dir.
         }
         let path = cache_path(&state_dir_from(args));
+        if !path.parent().is_some_and(usable_state_dir) {
+            // No state yet (or a symlink, which `state` refuses): nothing to
+            // cache into. The first command that needs state creates it.
+            return None;
+        }
         let mut cache = read_cache(&path);
         let now = now();
         let mut pending = None;
         if cache.check_due(now) {
-            if let Ok(github) = GitHub::from_env(BACKGROUND_TIMEOUT, false) {
-                cache.attempted_at = now;
-                write_cache(&path, &cache);
-                pending = std::thread::Builder::new()
-                    .name("porch-update-check".into())
-                    .spawn(move || {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .ok()?;
-                        let release = runtime
-                            .block_on(async {
-                                tokio::time::timeout(BACKGROUND_TIMEOUT, github.latest()).await
+            cache.attempted_at = now;
+            write_cache(&path, &cache);
+            let cache_file = path.clone();
+            // Everything slow happens on this thread, including building the
+            // HTTP client (which loads the OS trust store). It records its
+            // answer itself, so a check that outlasts `finish` still counts
+            // when the command runs long enough.
+            pending = std::thread::Builder::new()
+                .name("porch-update-check".into())
+                .spawn(move || {
+                    let github = GitHub::from_env(BACKGROUND_TIMEOUT, Auth::Anonymous).ok()?;
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok()?;
+                    let homebrew = is_homebrew_install();
+                    let latest = runtime
+                        .block_on(async {
+                            tokio::time::timeout(BACKGROUND_TIMEOUT, async {
+                                if homebrew {
+                                    github.latest_for_homebrew().await
+                                } else {
+                                    github.latest().await?.version()
+                                }
                             })
-                            .ok()?
-                            .ok()?;
-                        Some(release.version().ok()?.text)
-                    })
-                    .ok();
-            }
+                            .await
+                        })
+                        .ok()?
+                        .ok()?;
+                    // Re-read: a concurrent porch may have written in the meantime.
+                    let mut cache = read_cache(&cache_file);
+                    cache.latest = Some(latest.text.clone());
+                    cache.checked_at = self::now();
+                    write_cache(&cache_file, &cache);
+                    Some(latest.text)
+                })
+                .ok();
         }
         Some(Notice {
             path,
@@ -1043,16 +1546,13 @@ impl Notice {
             }
             if handle.is_finished() {
                 if let Ok(Some(latest)) = handle.join() {
-                    // Re-read: a concurrent porch may have written in the meantime.
-                    self.cache = read_cache(&self.path);
                     self.cache.latest = Some(latest);
-                    self.cache.checked_at = now();
-                    write_cache(&self.path, &self.cache);
                 }
             }
         }
         let now = now();
-        if let Some(message) = self.cache.notice_due(CURRENT_VERSION, now) {
+        if let Some(latest) = self.cache.notice_due(CURRENT_VERSION, now) {
+            let message = notice_message(&latest, is_homebrew_install());
             if std::env::var_os("NO_COLOR").is_some() {
                 eprintln!("{message}");
             } else {
@@ -1088,6 +1588,302 @@ mod tests {
         assert!(Version::parse("1.2.3.4").is_none());
         assert!(Version::parse("latest").is_none());
         assert!(Version::parse(CURRENT_VERSION).is_some());
+        // Numeric pre-release identifiers compare as numbers (semver 11.4).
+        assert!(v("1.0.0-rc.10") > v("1.0.0-rc.2"));
+        assert!(v("1.0.0-alpha") < v("1.0.0-alpha.1"));
+        assert!(v("1.0.0-alpha.1") < v("1.0.0-alpha.beta"));
+        assert!(v("1.0.0-beta.11") < v("1.0.0-rc.1"));
+        assert!(v("1.0.0-1") < v("1.0.0-alpha"));
+        // Build metadata parses, is kept in the text, and doesn't affect order.
+        assert_eq!(v("1.0.0+build-1").to_string(), "1.0.0+build-1");
+        assert_eq!(v("1.0.0+build-1"), v("1.0.0"));
+        assert!(v("1.0.0-rc.1+b.2") < v("1.0.0"));
+        for bad in [
+            "1.0.0-",
+            "1.0.0+",
+            "1.0.0-rc..1",
+            "1.0.0-r!c",
+            "1.+0.0",
+            "01.x.0",
+            "1.0.0 rc",
+        ] {
+            assert!(Version::parse(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn verify_mode_rejects_unknown_values() {
+        assert_eq!(VerifyMode::parse(None).unwrap(), VerifyMode::Auto);
+        assert_eq!(VerifyMode::parse(Some(" ")).unwrap(), VerifyMode::Auto);
+        assert_eq!(VerifyMode::parse(Some("auto")).unwrap(), VerifyMode::Auto);
+        assert_eq!(
+            VerifyMode::parse(Some("require")).unwrap(),
+            VerifyMode::Require
+        );
+        assert_eq!(
+            VerifyMode::parse(Some("REQUIRE")).unwrap(),
+            VerifyMode::Require
+        );
+        for typo in ["required", "1", "true", "yes", "off"] {
+            let err = VerifyMode::parse(Some(typo)).unwrap_err().to_string();
+            assert!(
+                err.contains("PORCH_UPDATE_VERIFY") && err.contains(typo),
+                "{err}"
+            );
+        }
+    }
+
+    /// A provenance setting whose gh does not exist.
+    #[cfg(unix)]
+    fn auto() -> Provenance {
+        Provenance {
+            mode: VerifyMode::Auto,
+            gh: PathBuf::from("/nonexistent/porch-test/gh"),
+        }
+    }
+
+    #[test]
+    fn tokens_go_only_to_the_api_origin_over_https() {
+        let github =
+            |api: &str| GitHub::new(api, "owner/porch", Some("t".into()), Duration::from_secs(1));
+        assert!(github("http://api.example.com").is_err());
+        assert!(github("ftp://api.example.com").is_err());
+        assert!(github("not a url").is_err());
+        let api = github("https://api.github.com/").unwrap();
+        assert_eq!(
+            api.token_for("https://api.github.com/repos/o/r/releases/assets/1"),
+            Some("t")
+        );
+        assert_eq!(api.token_for("https://evil.example/asset"), None);
+        assert_eq!(api.token_for("http://api.github.com/asset"), None);
+        assert_eq!(api.token_for("https://api.github.com:8443/asset"), None);
+        let local = github("http://127.0.0.1:9").unwrap();
+        assert_eq!(local.token_for("http://127.0.0.1:9/assets/x"), Some("t"));
+        assert_eq!(local.token_for("http://127.0.0.1:10/assets/x"), None);
+    }
+
+    #[test]
+    fn homebrew_formula_version_is_read_from_the_tap() {
+        let formula = "class Porch < Formula\n  desc \"x\"\n  version \"0.5.2\"\nend\n";
+        assert_eq!(parse_formula_version(formula).unwrap().to_string(), "0.5.2");
+        assert!(parse_formula_version("class Porch\nend\n").is_none());
+        assert_eq!(
+            notice_message("1.0.0", true),
+            format!("porch 1.0.0 is available — run brew upgrade {BREW_FORMULA}")
+        );
+        assert_eq!(
+            notice_message("1.0.0", false),
+            "porch 1.0.0 is available — run porch self-update"
+        );
+    }
+
+    #[test]
+    fn tray_installs_update_to_the_build_with_the_tray() {
+        let dir = temp("target-test");
+        assert_eq!(
+            update_target("x86_64-unknown-linux-musl", &dir.0),
+            "x86_64-unknown-linux-musl"
+        );
+        fs::write(dir.0.join("porch-tray"), b"tray").unwrap();
+        assert_eq!(
+            update_target("x86_64-unknown-linux-musl", &dir.0),
+            "x86_64-unknown-linux-gnu"
+        );
+        assert_eq!(
+            update_target("aarch64-unknown-linux-musl", &dir.0),
+            "aarch64-unknown-linux-musl"
+        );
+    }
+
+    #[test]
+    fn stale_windows_asides_are_found() {
+        let dir = temp("aside-test");
+        for name in [
+            "porch.exe",
+            "porch.exe.old",
+            "porch.exe.123.old",
+            "porch.exe.x1.old",
+            "porch.exe.old.txt",
+            "porch-tray.exe.old",
+            "porch.exe..old",
+        ] {
+            fs::write(dir.0.join(name), b"").unwrap();
+        }
+        let mut found: Vec<_> = stale_asides(&dir.0.join("porch.exe"))
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        assert_eq!(found, ["porch.exe.123.old", "porch.exe.old"]);
+    }
+
+    #[test]
+    fn notice_cache_is_never_written_into_a_missing_state_dir() {
+        let dir = temp("cache-missing-test");
+        let state = dir.0.join("state");
+        write_cache(&cache_path(&state), &NoticeCache::default());
+        assert!(
+            !state.exists(),
+            "the notice must not create the state directory"
+        );
+    }
+
+    /// A fake `gh`: `--version` works; `attestation verify --help` prints
+    /// `help`; `attestation verify FILE ...` exits `verify` after printing
+    /// `porch-test-stderr` and its arguments; `api` exits `api`.
+    #[cfg(unix)]
+    fn fake_gh(dir: &Path, help: &str, verify: i32, api: i32) -> PathBuf {
+        let path = dir.join(format!("gh-{verify}-{api}-{}", help.len()));
+        crate::test_support::write_executable(
+            &path,
+            &format!(
+                "#!/bin/sh\n\
+                 case \"$1 $2 $3\" in\n\
+                 '--version  ') exit 0 ;;\n\
+                 'attestation verify --help') printf '%s\\n' '{help}'; exit 0 ;;\n\
+                 'attestation verify '*) echo porch-test-stderr \"$@\" >&2; exit {verify} ;;\n\
+                 'api '*) exit {api} ;;\n\
+                 esac\n\
+                 exit 1\n"
+            ),
+        );
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attestation_results_are_classified() {
+        let dir = temp("gh-test");
+        let tarball = dir.0.join("porch.tar.gz");
+        fs::write(&tarball, b"archive").unwrap();
+        let check = |gh: &Path| check_attestation(gh, "owner/porch", "v1.2.3", &tarball);
+        let flags = "--signer-workflow --source-ref";
+
+        assert_eq!(
+            check(&fake_gh(&dir.0, flags, 0, 0)),
+            Attestation::Verified { pinned_ref: true }
+        );
+        // An older gh without --source-ref still checks repository and workflow.
+        assert_eq!(
+            check(&fake_gh(&dir.0, "--signer-workflow", 0, 0)),
+            Attestation::Verified { pinned_ref: false }
+        );
+        // Not logged in (gh exits 4): can't check, not a failure.
+        assert!(matches!(
+            check(&fake_gh(&dir.0, flags, 4, 0)),
+            Attestation::Unavailable { reason, detail }
+                if reason.contains("not logged in") && detail.contains("porch-test-stderr")
+        ));
+        // Verification failed while the API answers: a real failure, with gh's stderr.
+        match check(&fake_gh(&dir.0, flags, 1, 0)) {
+            Attestation::Failed { detail } => {
+                assert!(detail.contains("porch-test-stderr"), "{detail}");
+                assert!(detail.contains("--source-ref refs/tags/v1.2.3"), "{detail}");
+                assert!(
+                    detail.contains("--signer-workflow owner/porch/.github/workflows/release.yml"),
+                    "{detail}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // Verification failed and the API is unreachable (offline, bad token).
+        assert!(matches!(
+            check(&fake_gh(&dir.0, flags, 1, 1)),
+            Attestation::Unavailable { reason, .. } if reason.contains("could not reach")
+        ));
+        // gh without the attestation command, and no gh at all.
+        let old = dir.0.join("gh-old");
+        crate::test_support::write_executable(
+            &old,
+            "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nexit 1\n",
+        );
+        assert!(matches!(
+            check(&old),
+            Attestation::Unavailable { reason, .. } if reason.contains("2.49")
+        ));
+        assert!(matches!(
+            check(Path::new("/nonexistent/porch-test/gh")),
+            Attestation::Unavailable { reason, .. } if reason.contains("not installed")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verification_modes_report_and_enforce() {
+        let dir = temp("provenance-test");
+        let tarball = dir.0.join("porch.tar.gz");
+        fs::write(&tarball, b"archive").unwrap();
+        let github = GitHub::new(DEFAULT_API, "owner/porch", None, Duration::from_secs(1)).unwrap();
+        let run = |gh: PathBuf, mode| {
+            let mut out = Vec::new();
+            let result = verify_provenance(
+                &github,
+                &Provenance { mode, gh },
+                "v1.2.3",
+                &tarball,
+                &mut out,
+            );
+            (result, String::from_utf8(out).unwrap())
+        };
+        let flags = "--signer-workflow --source-ref";
+
+        let (result, out) = run(fake_gh(&dir.0, flags, 0, 0), VerifyMode::Require);
+        result.unwrap();
+        assert!(out.contains("refs/tags/v1.2.3"), "{out}");
+
+        // Can't check: a clear note in auto mode, an error when required.
+        let (result, out) = run(fake_gh(&dir.0, flags, 4, 0), VerifyMode::Auto);
+        result.unwrap();
+        assert!(
+            out.contains("Skipped the build attestation check: gh is not logged in"),
+            "{out}"
+        );
+        assert!(
+            out.contains("porch-test-stderr"),
+            "gh's stderr is shown: {out}"
+        );
+        assert!(out.contains("PORCH_UPDATE_VERIFY=require"), "{out}");
+        let (result, _) = run(fake_gh(&dir.0, flags, 4, 0), VerifyMode::Require);
+        assert!(format!("{:#}", result.unwrap_err()).contains("not logged in"));
+
+        // A real failure stops the update in every mode.
+        let (result, _) = run(fake_gh(&dir.0, flags, 1, 0), VerifyMode::Auto);
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("did not verify") && err.contains("porch-test-stderr"),
+            "{err}"
+        );
+
+        // Required, but gh can't pin the tag.
+        let (result, _) = run(
+            fake_gh(&dir.0, "--signer-workflow", 0, 0),
+            VerifyMode::Require,
+        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("--source-ref"));
+
+        // A mirror API: attestations can't be checked there.
+        let mirror = GitHub::new(
+            "https://mirror.example",
+            "owner/porch",
+            None,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let gh = fake_gh(&dir.0, flags, 0, 0);
+        let required = Provenance {
+            mode: VerifyMode::Require,
+            gh: gh.clone(),
+        };
+        let err = verify_provenance(&mirror, &required, "v1.2.3", &tarball, &mut out).unwrap_err();
+        assert!(format!("{err:#}").contains("PORCH_UPDATE_API"), "{err:#}");
+        let auto = Provenance {
+            mode: VerifyMode::Auto,
+            gh,
+        };
+        verify_provenance(&mirror, &auto, "v1.2.3", &tarball, &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out)
+            .contains("Skipped the build attestation check: PORCH_UPDATE_API"));
     }
 
     fn release(tag: &str, names: &[&str]) -> Release {
@@ -1268,6 +2064,72 @@ mod tests {
             .exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper process for windows_replacement_moves_a_running_executable_aside"]
+    fn windows_running_helper() {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// Windows can't overwrite or delete a running executable, only rename
+    /// it. `replace_executable` moves it aside (`porch.exe.old`, or a unique
+    /// name while an older aside still runs) and removes asides once free.
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_moves_a_running_executable_aside() {
+        let dir = temp("windows-replace-test");
+        let dest = dir.0.join("porch.exe");
+        fs::copy(std::env::current_exe().unwrap(), &dest).unwrap();
+        let mut running = Command::new(&dest)
+            .args([
+                "--exact",
+                "update::tests::windows_running_helper",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let while_running = || {
+            let first = dir.0.join("first.exe");
+            fs::write(&first, b"first build").unwrap();
+            replace_executable(&first, &dest, |_| Ok(())).unwrap();
+            assert_eq!(fs::read(&dest).unwrap(), b"first build");
+            let aside = backup_path(&dest);
+            assert!(aside.exists(), "the running copy stays as porch.exe.old");
+
+            // porch.exe.old is still running: this update uses a unique aside.
+            let second = dir.0.join("second.exe");
+            fs::write(&second, b"second build").unwrap();
+            replace_executable(&second, &dest, |_| Ok(())).unwrap();
+            assert_eq!(fs::read(&dest).unwrap(), b"second build");
+            assert!(aside.exists());
+            assert_eq!(stale_asides(&dest), vec![aside.clone()]);
+
+            // A failed verification restores the previous file.
+            let broken = dir.0.join("broken.exe");
+            fs::write(&broken, b"broken build").unwrap();
+            let err = replace_executable(&broken, &dest, |_| bail!("does not start")).unwrap_err();
+            assert!(format!("{err:#}").contains("verification"), "{err:#}");
+            assert_eq!(fs::read(&dest).unwrap(), b"second build");
+            aside
+        };
+        let result = while_running();
+        let _ = running.kill();
+        let _ = running.wait();
+        std::thread::sleep(Duration::from_millis(200));
+        let aside = result;
+        // Once nothing runs it, the next update removes the old aside.
+        let third = dir.0.join("third.exe");
+        fs::write(&third, b"third build").unwrap();
+        replace_executable(&third, &dest, |_| Ok(())).unwrap();
+        assert!(!aside.exists());
+        assert!(stale_asides(&dest).is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn app_replacement_refuses_unrelated_bundles() {
@@ -1321,10 +2183,7 @@ mod tests {
         assert!(!failed.check_due(now));
         assert!(failed.check_due(now + RETRY_AFTER_FAILURE));
 
-        assert_eq!(
-            checked.notice_due("0.2.0", now).as_deref(),
-            Some("porch 99.0.0 is available — run porch self-update")
-        );
+        assert_eq!(checked.notice_due("0.2.0", now).as_deref(), Some("99.0.0"));
         let notified = NoticeCache {
             notified_at: now - 10,
             ..checked.clone()
@@ -1391,6 +2250,9 @@ mod tests {
     /// Serve a fake GitHub API + asset host on loopback. The release lists
     /// every file, with asset URLs pointing back at this server.
     #[cfg(unix)]
+    const REJECT_TOKENS: &str = "!reject-tokens";
+
+    #[cfg(unix)]
     async fn fixture(
         tag: &str,
         files: BTreeMap<String, Vec<u8>>,
@@ -1413,21 +2275,27 @@ mod tests {
                 "browser_download_url": format!("{base}/download/{n}"),
             })).collect::<Vec<_>>(),
         });
+        // `REJECT_TOKENS` acts like GitHub given an expired token: 401 for
+        // any Authorization header, while anonymous requests work.
         let authorized = move |headers: &HeaderMap| match expect_token {
-            None => true,
+            None => Ok(()),
+            Some(REJECT_TOKENS) if headers.contains_key("authorization") => {
+                Err(StatusCode::UNAUTHORIZED)
+            }
+            Some(REJECT_TOKENS) => Ok(()),
             Some(token) => headers
                 .get("authorization")
-                .is_some_and(|v| v == format!("Bearer {token}").as_str()),
+                .is_some_and(|v| v == format!("Bearer {token}").as_str())
+                .then_some(())
+                .ok_or(StatusCode::NOT_FOUND),
         };
         let app = Router::new()
             .route(
                 "/repos/{owner}/{repo}/releases/latest",
                 get(
                     move |State(s): State<Shared>, headers: HeaderMap| async move {
-                        if !authorized(&headers) {
-                            return Err(StatusCode::NOT_FOUND);
-                        }
-                        Ok(axum::Json(s.0.clone()))
+                        authorized(&headers)?;
+                        Ok::<_, StatusCode>(axum::Json(s.0.clone()))
                     },
                 ),
             )
@@ -1440,10 +2308,10 @@ mod tests {
                         if headers
                             .get("accept")
                             .is_none_or(|v| v != "application/octet-stream")
-                            || !authorized(&headers)
                         {
                             return Err(StatusCode::NOT_FOUND);
                         }
+                        authorized(&headers)?;
                         s.1.get(&name).cloned().ok_or(StatusCode::NOT_FOUND)
                     },
                 ),
@@ -1519,6 +2387,7 @@ mod tests {
         let anonymous = GitHub::new(&base, "owner/porch", None, Duration::from_secs(10)).unwrap();
         let err = perform(
             &anonymous,
+            &auto(),
             target,
             &exe,
             None,
@@ -1552,15 +2421,24 @@ mod tests {
             dry_run: true,
             ..Default::default()
         };
-        let planned = perform(&github, target, &exe, Some(&app), &dry_run, &mut Vec::new())
-            .await
-            .unwrap();
+        let planned = perform(
+            &github,
+            &auto(),
+            target,
+            &exe,
+            Some(&app),
+            &dry_run,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(planned, Outcome::Planned("99.1.0".into()));
         assert!(fs::read_to_string(&exe).unwrap().contains("0.0.1"));
 
         let mut out = Vec::new();
         let outcome = perform(
             &github,
+            &auto(),
             target,
             &exe,
             Some(&app),
@@ -1594,6 +2472,7 @@ mod tests {
         // A release for another platform is reported, not guessed.
         let err = perform(
             &github,
+            &auto(),
             "aarch64-apple-darwin",
             &exe,
             None,
@@ -1613,6 +2492,7 @@ mod tests {
             GitHub::new(&tampered_base, "owner/porch", None, Duration::from_secs(10)).unwrap();
         let err = perform(
             &github,
+            &auto(),
             target,
             &exe,
             None,
@@ -1630,6 +2510,7 @@ mod tests {
             GitHub::new(&current_base, "owner/porch", None, Duration::from_secs(10)).unwrap();
         let outcome = perform(
             &github,
+            &auto(),
             target,
             &exe,
             None,
@@ -1639,5 +2520,170 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome, Outcome::UpToDate(CURRENT_VERSION.into()));
+    }
+
+    /// A release fixture whose archive holds `porch` printing `prints`.
+    #[cfg(unix)]
+    async fn release_fixture(
+        dir: &Path,
+        version: &str,
+        prints: &str,
+        target: &str,
+        token: Option<&'static str>,
+    ) -> String {
+        let (asset, bytes) = tarball(dir, version, target);
+        // Swap in a porch that prints `prints` and repack.
+        let package = dir.join("pkg").join(format!("porch-{version}-{target}"));
+        if prints != version {
+            fake_binary(&package.join("porch"), prints);
+            let status = Command::new("tar")
+                .arg("-czf")
+                .arg(dir.join(&asset))
+                .arg("-C")
+                .arg(dir.join("pkg"))
+                .arg(format!("porch-{version}-{target}"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let bytes = if prints != version {
+            fs::read(dir.join(&asset)).unwrap()
+        } else {
+            bytes
+        };
+        let sums = format!("{}  {asset}\n", sha256_hex(&bytes));
+        let files: BTreeMap<_, _> =
+            [(asset, bytes), ("SHA256SUMS".to_owned(), sums.into_bytes())].into();
+        fixture(&format!("v{version}"), files, token).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_token_falls_back_to_anonymous() {
+        let dir = temp("reject-token-test");
+        let target = "x86_64-unknown-linux-gnu";
+        let base = release_fixture(&dir.0, "99.3.0", "99.3.0", target, Some(REJECT_TOKENS)).await;
+        let install = dir.0.join("bin");
+        fs::create_dir_all(&install).unwrap();
+        let exe = install.join("porch");
+        fake_binary(&exe, "0.0.1");
+        let github = GitHub::new(
+            &base,
+            "owner/porch",
+            Some("expired".into()),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let outcome = perform(
+            &github,
+            &auto(),
+            target,
+            &exe,
+            None,
+            &SelfUpdateArgs::default(),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, Outcome::Updated("99.3.0".into()));
+        assert!(fs::read_to_string(&exe).unwrap().contains("99.3.0"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn porch_is_replaced_last_so_a_failed_update_is_retried() {
+        let dir = temp("order-test");
+        let target = "x86_64-unknown-linux-gnu";
+        // The new porch reports the wrong version, so it fails verification.
+        let base = release_fixture(&dir.0, "99.2.0", "0.0.0-broken", target, None).await;
+        let install = dir.0.join("bin");
+        fs::create_dir_all(&install).unwrap();
+        let exe = install.join("porch");
+        fake_binary(&exe, "0.0.1");
+        fake_binary(&install.join("porch-tray"), "0.0.1");
+        fs::write(install.join("porch-login"), "#!/bin/sh\n# old login\n").unwrap();
+        let github = GitHub::new(&base, "owner/porch", None, Duration::from_secs(10)).unwrap();
+        let mut out = Vec::new();
+        let err = perform(
+            &github,
+            &auto(),
+            target,
+            &exe,
+            None,
+            &SelfUpdateArgs::default(),
+            &mut out,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("verification"), "{err:#}");
+        // porch keeps its old version, so the next self-update tries again.
+        assert!(fs::read_to_string(&exe).unwrap().contains("0.0.1"));
+        assert!(fs::read_to_string(install.join("porch-tray"))
+            .unwrap()
+            .contains("99.2.0"));
+        // A companion the archive lacks is reported, not silently left behind.
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("porch-login is left at its old version"),
+            "{out}"
+        );
+        assert!(fs::read_to_string(install.join("porch-login"))
+            .unwrap()
+            .contains("old login"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_does_not_downgrade_and_require_is_enforced() {
+        let dir = temp("downgrade-test");
+        let install = dir.0.join("bin");
+        fs::create_dir_all(&install).unwrap();
+        let exe = install.join("porch");
+        fake_binary(&exe, "0.0.1");
+        let target = "x86_64-unknown-linux-gnu";
+
+        let old = fixture("v0.0.1", BTreeMap::new(), None).await;
+        let github = GitHub::new(&old, "owner/porch", None, Duration::from_secs(10)).unwrap();
+        let force = SelfUpdateArgs {
+            force: true,
+            ..Default::default()
+        };
+        let err = perform(
+            &github,
+            &auto(),
+            target,
+            &exe,
+            None,
+            &force,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("does not downgrade"), "{err:#}");
+
+        // PORCH_UPDATE_VERIFY=require with a server that isn't api.github.com
+        // stops before anything is replaced.
+        let base = release_fixture(&dir.0, "99.4.0", "99.4.0", target, None).await;
+        let github = GitHub::new(&base, "owner/porch", None, Duration::from_secs(10)).unwrap();
+        let required = Provenance {
+            mode: VerifyMode::Require,
+            ..auto()
+        };
+        let err = perform(
+            &github,
+            &required,
+            target,
+            &exe,
+            None,
+            &SelfUpdateArgs::default(),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("PORCH_UPDATE_VERIFY=require"),
+            "{err:#}"
+        );
+        assert!(fs::read_to_string(&exe).unwrap().contains("0.0.1"));
     }
 }

@@ -353,6 +353,68 @@ def json_kind(line):
     return json.loads(line)[0]
 
 
+@unittest.skipIf(os.name == 'nt', 'POSIX shell installer')
+class ShellInstallerTests(unittest.TestCase):
+    """scripts/install.sh, without touching the network or this user's home."""
+    SCRIPT = ROOT / 'scripts/install.sh'
+
+    def run_script(self, text, root, **env):
+        """Run `text` with sh in a temp HOME, with curl and wget replaced by
+        stubs that only record that they were called."""
+        import shutil
+        stubs = root / 'stubs'
+        stubs.mkdir(exist_ok=True)
+        marker = root / 'network-called'
+        for tool in ['curl', 'wget', 'gh']:
+            (stubs / tool).write_text(f'#!/bin/sh\necho "$0 $*" >> "{marker}"\nexit 1\n')
+            (stubs / tool).chmod(0o755)
+        environment = {'HOME': str(root / 'home'), 'PATH': f'{stubs}:/usr/bin:/bin'}
+        environment.update(env)
+        result = subprocess.run([shutil.which('sh') or '/bin/sh'], input=text, capture_output=True,
+                                text=True, env=environment, timeout=30)
+        return result, marker.exists()
+
+    def test_syntax_and_shellcheck(self):
+        import shutil
+        subprocess.run(['sh', '-n', str(self.SCRIPT)], check=True)
+        if shutil.which('shellcheck'):
+            subprocess.run(['shellcheck', str(self.SCRIPT)], check=True)
+
+    def test_a_truncated_download_runs_nothing(self):
+        text = self.SCRIPT.read_text()
+        self.assertTrue(text.rstrip().endswith('main "$@"'))
+        with tempfile.TemporaryDirectory(prefix='porch-install-sh-') as temporary:
+            root = Path(temporary)
+            for cut in range(200, len(text) - len('main "$@"\n'), 397):
+                result, network = self.run_script(text[:cut], root, PORCH_VERSION='0.5.0')
+                self.assertFalse(network, f'cut at {cut} reached the network')
+                self.assertNotIn('Downloading', result.stdout, f'cut at {cut}')
+            self.assertFalse((root / 'home').exists())
+
+    def test_bad_settings_fail_before_downloading(self):
+        text = self.SCRIPT.read_text()
+        with tempfile.TemporaryDirectory(prefix='porch-install-sh-') as temporary:
+            root = Path(temporary)
+            for env, message in [
+                ({'PORCH_UPDATE_VERIFY': 'required'}, "must be 'require' or 'auto'"),
+                ({'PORCH_UPDATE_VERIFY': '1'}, "must be 'require' or 'auto'"),
+                ({'PORCH_VERSION': '1.2;rm -rf x'}, 'is not a release version'),
+                ({'PORCH_VERSION': 'latest'}, 'is not a release version'),
+            ]:
+                result, network = self.run_script(text, root, **env)
+                self.assertNotEqual(result.returncode, 0, env)
+                self.assertIn(message, result.stderr, env)
+                self.assertFalse(network, env)
+
+    def test_sudo_is_refused(self):
+        if os.geteuid() != 0:
+            self.skipTest('needs root')
+        with tempfile.TemporaryDirectory(prefix='porch-install-sh-') as temporary:
+            result, network = self.run_script(self.SCRIPT.read_text(), Path(temporary), SUDO_USER='someone')
+            self.assertIn("don't run this with sudo", result.stderr)
+            self.assertFalse(network)
+
+
 class FormulaTests(unittest.TestCase):
     DIGESTS = {target: f'{index:x}' * 64 for index, target in enumerate(formula.TARGETS, 1)}
 
@@ -372,6 +434,10 @@ class FormulaTests(unittest.TestCase):
             self.assertEqual(rendered[line:].splitlines()[1].strip(), f'sha256 "{digest}"')
         self.assertIn('bin.install "porch"', rendered)
         self.assertIn('porch --version', rendered)
+        # Homebrew installs the CLI only; on Linux that is the static build,
+        # which runs without glibc 2.39.
+        self.assertNotIn('linux-gnu', rendered)
+        self.assertIn('x86_64-unknown-linux-musl.tar.gz', rendered)
 
     def test_rejects_missing_targets_and_bad_input(self):
         template = (ROOT / 'packaging/homebrew/porch.rb').read_text()
