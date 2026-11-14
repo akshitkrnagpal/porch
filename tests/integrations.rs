@@ -451,6 +451,79 @@ fn service_install_replaces_a_root_service_from_older_versions() {
     }
 }
 #[test]
+fn clean_of_an_isolated_state_dir_keeps_another_installs_startup_service() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for platform in ["macos", "linux"] {
+        let s = Sandbox::new();
+        fake_service_managers(&s);
+        // The user's real install owns the (per-user, shared) startup file.
+        let real = s.dir.join("real-state");
+        fs::create_dir_all(&real).unwrap();
+        let run = |state: &Path, args: &[&str]| {
+            s.cmd()
+                .env("PORCH_STATE_DIR", state)
+                .env("PORCH_SERVICE_PLATFORM", platform)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let out = run(&real, &["service", "install"]);
+        assert!(
+            out.status.success(),
+            "{platform}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let body = fs::read_to_string(s.dir.join("service")).unwrap();
+        let loaded = |s: &Sandbox| {
+            fs::read_dir(&s.dir).unwrap().any(|e| {
+                let name = e.unwrap().file_name().to_string_lossy().into_owned();
+                name.starts_with("launchd-gui") || name == "systemd-user"
+            })
+        };
+        assert!(loaded(&s), "{platform}: {}", s.log());
+        // An isolated state directory, even one that once recorded a service
+        // of its own, cleans without touching it.
+        let isolated = s.dir.join("state");
+        fs::write(
+            isolated.join("service.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "platform": platform,
+                "path": s.dir.join("service"),
+                "state_dir": isolated,
+                "settings": {"port": 7462},
+                "scope": "user",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let log_before = s.log();
+        let out = run(&isolated, &["clean"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{platform}: {err}");
+        assert!(err.contains("Left the startup service in place"), "{err}");
+        assert_eq!(
+            fs::read_to_string(s.dir.join("service")).unwrap(),
+            body,
+            "{platform}: the other install's startup file survives"
+        );
+        assert!(loaded(&s), "{platform}: still loaded");
+        let log = s.log()[log_before.len()..].to_owned();
+        assert!(
+            !log.contains("bootout") && !log.contains("disable"),
+            "{platform}: {log}"
+        );
+        // Cleaning the state directory it serves still removes it.
+        let out = run(&real, &["clean"]);
+        assert!(
+            out.status.success(),
+            "{platform}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!s.dir.join("service").exists(), "{platform}");
+        assert!(!loaded(&s), "{platform}: {}", s.log());
+    }
+}
+#[test]
 fn hosts_manage_only_own_block_and_reject_symlinks() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let s = Sandbox::new();
