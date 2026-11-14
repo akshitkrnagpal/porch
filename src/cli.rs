@@ -3346,11 +3346,12 @@ async fn clean_discovery() -> Result<()> {
 }
 /// Whether `name` in the state directory is a file Porch creates.
 fn porch_state_file(name: &str) -> bool {
-    const FILES: [&str; 29] = [
+    const FILES: [&str; 31] = [
         "state.json",
         "state.lock",
         "proxy.json",
         "proxy.log",
+        "proxy.log.1",
         "proxy.pid",
         "proxy.identity",
         "proxy.ready",
@@ -3362,6 +3363,7 @@ fn porch_state_file(name: &str) -> bool {
         "proxy.hosts-sync-token",
         "proxy.hosts-capability",
         "startup.lock",
+        "startup.owner",
         "ca.pem",
         "ca-key.pem",
         "hosts-sync.token",
@@ -3379,7 +3381,7 @@ fn porch_state_file(name: &str) -> bool {
     ];
     // Pairing keys, credentials, peers and logs; per-run files; retired CAs;
     // and temporary files a crash left behind.
-    const PREFIXES: [&str; 8] = [
+    const PREFIXES: [&str; 9] = [
         "discovery",
         "dev-manifest-",
         "turbo-env-loader-",
@@ -3388,6 +3390,8 @@ fn porch_state_file(name: &str) -> bool {
         "compose-",
         "cloudflare-",
         "sharing-",
+        // Apps' CA bundles (Porch's CA plus their own NODE_EXTRA_CA_CERTS).
+        "ca-bundle-",
     ];
     FILES.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p)) || name.ends_with(".tmp")
 }
@@ -3410,7 +3414,9 @@ fn clean_state() -> Result<()> {
             for log in fs::read_dir(entry.path())? {
                 let log = log?;
                 let n = log.file_name().to_string_lossy().into_owned();
-                if log.file_type()?.is_file() && (n.ends_with(".log") || n.ends_with(".logref")) {
+                if log.file_type()?.is_file()
+                    && [".log", ".log.1", ".logref"].iter().any(|e| n.ends_with(e))
+                {
                     fs::remove_file(log.path())?;
                 } else {
                     kept.push(format!("logs/{n}"));
