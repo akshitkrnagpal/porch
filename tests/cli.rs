@@ -1245,3 +1245,206 @@ fn fields_from_a_newer_porch_survive_and_its_marker_is_respected() {
     assert_eq!(s.state()["min_writer"], 99);
     assert_eq!(s.state()["routes"].as_array().unwrap().len(), 1);
 }
+
+/// `porch mcp` over pipes, started the way an agent's client starts it: from
+/// an environment without `CI` or `NO_COLOR`.
+struct Mcp {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    next: u64,
+}
+impl Mcp {
+    fn start(s: &Sandbox, tools: &str) -> Self {
+        let mut child = s
+            .command(&["mcp", "--tools", tools])
+            .env_remove("CI")
+            .env_remove("NO_COLOR")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut mcp = Self {
+            stdin: child.stdin.take().unwrap(),
+            stdout: std::io::BufReader::new(child.stdout.take().unwrap()),
+            child,
+            next: 0,
+        };
+        mcp.request("initialize", serde_json::json!({}));
+        mcp
+    }
+    fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        use std::io::{BufRead, Write};
+        self.next += 1;
+        let id = self.next;
+        writeln!(
+            self.stdin,
+            "{}",
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+        )
+        .unwrap();
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], id, "{response}");
+        response["result"].clone()
+    }
+    /// A tool's result and its text.
+    fn call(&mut self, name: &str, arguments: serde_json::Value) -> (bool, String) {
+        let result = self.request(
+            "tools/call",
+            serde_json::json!({"name":name,"arguments":arguments}),
+        );
+        (
+            result["isError"] == true,
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        )
+    }
+}
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+/// Stops an app when the test ends, passed or failed, so a failing assertion
+/// never leaves it running.
+struct StopOnDrop<'a>(&'a Sandbox, &'static str);
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.run(&["stop", self.1]);
+    }
+}
+const LISTEN_FOREVER: &str = "import os,socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',int(os.environ['PORT'])))\ns.listen()\nwhile True: time.sleep(1)";
+
+#[test]
+fn mcp_run_leaves_the_apps_environment_alone() {
+    let s = Sandbox::new();
+    s.write_server();
+    let mut mcp = Mcp::start(&s, "core,apps");
+    let _app = StopOnDrop(&s, "envcheck");
+    let root = s.root.display().to_string();
+    let (error, text) = mcp.call(
+        "run",
+        serde_json::json!({"command":["python3","server.py"],"name":"envcheck","cwd":root}),
+    );
+    assert!(!error, "{text}");
+    let env: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(s.root.join("child-env.json")).unwrap()).unwrap();
+    // The MCP server keeps porch non-interactive without changing what the
+    // app sees: no CI or NO_COLOR it didn't have in a terminal.
+    for key in ["CI", "NO_COLOR", "PORCH_READ_ONLY"] {
+        assert!(env.get(key).is_none(), "{key} leaked into the app");
+    }
+    let (error, text) = mcp.call("stop", serde_json::json!({"name":"envcheck"}));
+    assert!(!error, "{text}");
+}
+
+#[test]
+fn mcp_alias_cannot_stop_an_app_without_the_apps_profile() {
+    let s = Sandbox::new();
+    let _app = StopOnDrop(&s, "bg");
+    s.ok(&[
+        "run",
+        "--detach",
+        "--name",
+        "bg",
+        "python3",
+        "-c",
+        LISTEN_FOREVER,
+    ]);
+    let owner = s.state()["owners"]["bg"]["pid"].clone();
+    assert!(owner.is_u64(), "{}", s.state());
+    let mut core = Mcp::start(&s, "core");
+    let (error, text) = core.call(
+        "alias_add",
+        serde_json::json!({"name":"bg","port":9,"force":true}),
+    );
+    assert!(error, "{text}");
+    assert!(text.contains("belongs to an app"), "{text}");
+    // The app and its route are untouched.
+    assert_eq!(s.state()["owners"]["bg"]["pid"], owner);
+    assert!(s.ok(&["list", "--json"]).contains("bg.localhost"));
+    // Aliases made over MCP stay off paired machines unless asked.
+    assert!(
+        !core
+            .call("alias_add", serde_json::json!({"name":"db","port":9}))
+            .0
+    );
+    assert!(
+        !core
+            .call(
+                "alias_add",
+                serde_json::json!({"name":"shared","port":9,"private":false})
+            )
+            .0
+    );
+    let private = s.state()["private"].clone();
+    assert_eq!(private, serde_json::json!(["db"]), "{}", s.state());
+    // Replacing another alias with force still works.
+    let (error, text) = core.call(
+        "alias_add",
+        serde_json::json!({"name":"db","port":10,"force":true}),
+    );
+    assert!(!error, "{text}");
+    drop(core);
+    // With the apps profile, where stop exists, force may take over the name.
+    let mut apps = Mcp::start(&s, "core,apps");
+    let (error, text) = apps.call(
+        "alias_add",
+        serde_json::json!({"name":"bg","port":9,"force":true}),
+    );
+    assert!(!error, "{text}");
+    assert!(s.state()["owners"].get("bg").is_none(), "{}", s.state());
+}
+
+#[test]
+fn mcp_run_that_times_out_stops_the_app_it_started() {
+    let s = Sandbox::new();
+    let mut mcp = Mcp::start(&s, "core,apps");
+    let _app = StopOnDrop(&s, "slow");
+    let root = s.root.display().to_string();
+    // Never listens, so `porch run --detach` would wait its full 15 seconds.
+    let (error, text) = mcp.call(
+        "run",
+        serde_json::json!({"command":["python3","-c","import time\ntime.sleep(60)"],"name":"slow","cwd":root,"timeoutMs":2000}),
+    );
+    assert!(error, "{text}");
+    assert!(text.contains("slow was stopped"), "{text}");
+    assert!(
+        !s.state()["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "slow"),
+        "{}",
+        s.state()
+    );
+    // A retry starts clean instead of reporting "already running".
+    let (error, text) = mcp.call(
+        "run",
+        serde_json::json!({"command":["python3","-c",LISTEN_FOREVER],"name":"slow","cwd":root}),
+    );
+    assert!(!error, "{text}");
+    assert!(!mcp.call("stop", serde_json::json!({"name":"slow"})).0);
+}
+
+/// The menu runs `porch open|copy [--peer=ID] -- APP`, so ids from a paired
+/// machine that start with "-" reach the lookup instead of the option parser.
+#[test]
+fn open_and_copy_take_dash_ids_in_the_form_the_menu_uses() {
+    let s = Sandbox::new();
+    for verb in ["open", "copy"] {
+        let o = s.run(&[verb, "--peer=-machine", "--", "-app"]);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{verb}: {err}");
+        assert!(err.contains("no paired machine named -machine"), "{err}");
+        let o = s.run(&[verb, "--", "-app"]);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{verb}: {err}");
+        assert!(!err.contains("unexpected argument"), "{err}");
+    }
+}

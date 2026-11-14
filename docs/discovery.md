@@ -48,7 +48,7 @@ Remote apps open at `http://APP.MACHINE.localhost:PROXY_PORT`, served by your lo
 
 Pairing grants access. A paired machine can open every HTTP and WebSocket dev app registered on this machine, including apps behind a loopback-only proxy, and can see their names and health. Only pair machines you'd trust with your dev apps. `porch peers list` shows paired machines. To stop sharing with one, run `porch unpair mac-mini`: this removes the pairing on both machines if they can reach each other, and always revokes the other machine's access on this one. `porch unpair` and `--peer` find a machine by its ID, then its URL name, then its name. A paired machine can't rename itself to another paired machine's name.
 
-In the tray, **Pair a device…** shows a code in the menu. Enter it on the other machine with `porch pair CODE`.
+In the tray, **Pair a device…** opens a submenu that says pairing turns on sharing; **Show a pairing code** there shows the code in the menu until it expires. Enter it on the other machine with `porch pair CODE`.
 
 ### Pairing security
 

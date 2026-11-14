@@ -296,7 +296,7 @@ enum Commands {
     },
     /// Run an MCP server over stdio so coding agents can find and manage your apps
     Mcp {
-        /// Tool profiles: core, proxy, diagnostics, readonly or all
+        /// Tool profiles: core, proxy, diagnostics, apps, readonly or all
         #[arg(long, alias = "tools-profiles")]
         tools: Option<String>,
         /// Same as --tools
@@ -1803,7 +1803,7 @@ fn list(json: bool) -> Result<()> {
     }
     Ok(())
 }
-fn alias_names(name: &str, selected: &[String]) -> Result<Vec<String>> {
+pub(crate) fn alias_names(name: &str, selected: &[String]) -> Result<Vec<String>> {
     let n = normalize(name)?;
     let settings = state::proxy_settings()?;
     if selected.is_empty() {
@@ -1823,7 +1823,11 @@ fn route_hostnames(name: &str, p: &ProxySettings) -> Vec<String> {
     }
     p.tlds.iter().map(|t| format!("{name}.{t}")).collect()
 }
-fn conflicting_names(s: &state::State, names: &[String], p: &ProxySettings) -> Vec<String> {
+pub(crate) fn conflicting_names(
+    s: &state::State,
+    names: &[String],
+    p: &ProxySettings,
+) -> Vec<String> {
     let hosts: Vec<_> = names.iter().flat_map(|n| route_hostnames(n, p)).collect();
     s.routes
         .iter()

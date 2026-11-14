@@ -32,6 +32,9 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - Abandoned pairing attempts can no longer fill the agent's table and block pairing: each address keeps only its newest two, and the oldest gives way when the table is full. Devices from more than 4,096 addresses no longer lock everyone out of pairing.
 - `porch pair CODE` reads at most 4 KB of an error reply, so a machine answering on the network can't stream a large body into it.
 - LAN discovery hints can't crowd out real machines: each advertised address and machine ID is limited to a few entries, a paired machine's hints displace others when the cache is full, and a paired machine's possible addresses are tried in parallel rather than one after another.
+- The default MCP profile can no longer stop your apps. `alias_add` with `force` used to end the app holding the name, although only the `apps` profile is meant to stop processes. Without `apps`, `alias_add` now refuses a name that belongs to an app Porch started, and `force` only replaces another alias.
+- Aliases an agent creates over MCP stay off paired machines unless it passes `private: false`.
+- The MCP `logs` and `machines` tools describe their output as untrusted, since it comes from apps and paired machines.
 
 ### Fixed
 - Launch options before `--name` (`-d`, `--detach`, `--private`, `--prefix=…`, `--app-port=…`, `--framework`, `--state-dir`) no longer make Porch treat the command as the app's name, and `porch --private -- --filter=web` passes `--filter=web` to the dev script. `porch web --name api …` is refused instead of quietly ignoring `--name`.
@@ -82,6 +85,18 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - The discovery agent kept running when accepting a connection failed (for example when it ran out of file descriptors). Before, one failed accept stopped it. It also raises its open-file limit on macOS and Linux.
 - On Windows, pairing attempts in the first minute after boot could make the agent refuse every later pairing attempt until it restarted.
 - The discovery agent no longer rewrites and syncs a state file each time it reads the machine's identity, which every app list did twice.
+- Apps started through the MCP `run` tool get the same environment as from a terminal. MCP used to set `CI=1` and `NO_COLOR=1` for every command it ran, and the app and proxy inherited them.
+- The MCP server answers `ping` and other requests while a slow call is running, honours `notifications/cancelled`, and no longer exits on a line that isn't UTF-8. Lines over 1 MiB are refused with a parse error.
+- An MCP `run` that runs out of `timeoutMs` stops the app it was starting, so a retry no longer reports "already running".
+- MCP `logs` returns the last 200 lines unless asked for more (at most 5000), instead of the whole log.
+- `extraArgs: ["--json"]` on `list`, and `--no-worktree` with `noWorktree: true` on `get`, no longer fail with a duplicate-flag error. `run` refuses an empty `command` instead of running the package's default script.
+- `tools_profiles` and `porch mcp --help` list every profile, including `apps`.
+- The menu bar and tray app no longer wakes several times a second while idle. It refreshes apps once a minute and looks for nearby machines every five minutes on its own, and refreshes as soon as the pointer reaches the icon.
+- A click on the proxy switch could be undone if the app list refreshed at the same moment.
+- Opening or copying a paired machine's app from the menu works when its id starts with "-".
+- Menu messages go away after a few seconds, and a pairing code leaves the menu when it expires.
+- **Pair a device…** in the menu now opens a submenu that says pairing turns on sharing, and the code needs a second click.
+- Running `porch tray` again while the menu is open no longer adds a second icon.
 
 ### Improved
 - The proxy no longer reads the process table every 5 seconds when no app is running, nor connects to every app each time.
@@ -89,6 +104,7 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - Launching in a workspace looks up the Git worktree and the workspace's packages once instead of once per package, and `porch run --detach` doesn't repeat it in the background launcher. A command that exits without handing its port to a daemon no longer runs `lsof` for a second.
 - Requests no longer wait on each other while the proxy re-reads routes or checks whether apps are alive, and route matching does less work per request.
 - An app Porch launched that listens only on IPv6 loopback is reached without a blocking check on every request. An `--upstream` alias moves to IPv6 loopback only when nothing listens on IPv4, never because the app was slow.
+
 
 ## 0.5.2 (2026-11-14)
 

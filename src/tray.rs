@@ -11,8 +11,11 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::mpsc::{self, Receiver, Sender},
-    time::Duration,
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 use tokio::io::AsyncReadExt;
 
@@ -35,6 +38,9 @@ pub enum Action {
     /// Show a pairing code (host side of `porch pair`) in the menu.
     Pair,
     Refresh,
+    /// The pointer is on the icon, so the menu is about to open: refresh the
+    /// catalog unless it is only seconds old.
+    Peek,
     Reconnect,
     Quit,
 }
@@ -43,25 +49,25 @@ impl Action {
     pub fn cli_args(&self) -> Option<Vec<String>> {
         let args = match self {
             Self::Open { app, peer, .. } | Self::Copy { app, peer } => {
-                let mut args = vec![
-                    if matches!(self, Self::Open { .. }) {
-                        "open"
-                    } else {
-                        "copy"
-                    }
-                    .into(),
-                    app.clone(),
-                ];
-                if let Some(peer) = peer {
-                    args.extend(["--peer".into(), peer.clone()]);
+                let mut args = vec![if matches!(self, Self::Open { .. }) {
+                    "open"
+                } else {
+                    "copy"
                 }
+                .into()];
+                // Ids come from paired machines. `--peer=ID` and `--` keep one
+                // that starts with "-" from reading as an option.
+                if let Some(peer) = peer {
+                    args.push(format!("--peer={peer}"));
+                }
+                args.extend(["--".into(), app.clone()]);
                 args
             }
             Self::StartProxy => vec!["proxy".into(), "start".into()],
             Self::StopProxy => vec!["proxy".into(), "stop".into()],
             Self::Reconnect => vec!["peers".into(), "refresh".into()],
             Self::Pair => vec!["pair".into(), "--no-wait".into(), "--json".into()],
-            Self::Refresh | Self::Quit => return None,
+            Self::Refresh | Self::Peek | Self::Quit => return None,
         };
         Some(args)
     }
@@ -484,7 +490,14 @@ pub fn menu_model(
         }));
     }
     entries.extend([
-        Entry::action("Pair a device…", Action::Pair, true),
+        // Pairing turns on sharing, so it takes a second, explicit click.
+        Entry::group(
+            "Pair a device…",
+            vec![
+                Entry::text("Turns on sharing so a paired machine can open your apps"),
+                Entry::action("Show a pairing code", Action::Pair, true),
+            ],
+        ),
         Entry::action("Refresh apps", Action::Refresh, true),
         Entry::action("Reconnect discovery", Action::Reconnect, true),
         Entry::separator(),
@@ -572,22 +585,64 @@ async fn invoke(cli: &Path, args: &[String]) -> Result<Vec<u8>> {
     result
 }
 
-/// The code stays valid in the agent after the CLI returns; show it in the menu.
-fn pairing_notice(out: &[u8]) -> String {
-    let code = serde_json::from_slice::<serde_json::Value>(out)
-        .ok()
+/// How long a notice stays in the menu: a confirmation briefly, a failure
+/// long enough to read.
+const NOTICE_TTL: Duration = Duration::from_secs(8);
+const ERROR_TTL: Duration = Duration::from_secs(30);
+/// How often the catalog and discovery refresh on their own. Hovering over
+/// the icon or using the menu refreshes the catalog sooner.
+const POLL: Duration = Duration::from_secs(60);
+const DISCOVERY: Duration = Duration::from_secs(300);
+/// A hover refreshes only a catalog at least this old.
+const PEEK_AFTER: Duration = Duration::from_secs(3);
+/// The code stays valid in the agent after the CLI returns; show it in the
+/// menu until it expires.
+fn pairing_notice(out: &[u8]) -> (String, Duration) {
+    let value = serde_json::from_slice::<serde_json::Value>(out).ok();
+    let code = value
+        .as_ref()
         .and_then(|v| v["code"].as_str().map(str::to_owned))
         .filter(|c| c.len() == 6 && c.bytes().all(|b| b.is_ascii_digit()));
+    let valid = value
+        .as_ref()
+        .and_then(|v| v["expires_in"].as_u64())
+        .filter(|s| *s > 0)
+        .map_or(Duration::from_secs(300), |s| {
+            Duration::from_secs(s.min(600))
+        });
     match code {
-        Some(code) => format!(
-            "Pairing code {code} — on the other machine run: porch pair {code} (valid 5 minutes)"
+        Some(code) => (
+            format!(
+                "Pairing code {code} — on the other machine run: porch pair {code} (valid 5 minutes)"
+            ),
+            valid,
         ),
-        None => "Porch did not return a pairing code".into(),
+        None => ("Porch did not return a pairing code".into(), ERROR_TTL),
+    }
+}
+/// Called after each update is queued, so the menu wakes only when there is
+/// something new instead of polling.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+/// Queues updates for the menu and wakes it.
+#[derive(Clone)]
+struct Notify {
+    tx: Sender<Update>,
+    wake: Waker,
+}
+impl Notify {
+    fn send(&self, update: Update) {
+        if self.tx.send(update).is_ok() {
+            (self.wake)();
+        }
     }
 }
 enum Update {
     Snapshot(Result<Snapshot, String>),
-    Notice(String),
+    /// A message for the menu, shown for `ttl`.
+    Notice {
+        text: String,
+        ttl: Duration,
+    },
     /// The proxy reached (or failed to reach) the state the switch asked for,
     /// settling `flips` clicks at once.
     ProxyDone {
@@ -619,7 +674,7 @@ fn dispatch(
     action: Action,
     click: u64,
     commands: &Sender<Action>,
-    notices: &Sender<Update>,
+    notices: &Notify,
     opener: Opener,
 ) {
     if let Action::Open { url: Some(url), .. } = &action {
@@ -629,7 +684,7 @@ fn dispatch(
             std::thread::spawn(move || {
                 if let Err(error) = opener(&url) {
                     let error = format!("{error:#}");
-                    let _ = notices.send(Update::OpenFailed { click, error });
+                    notices.send(Update::OpenFailed { click, error });
                 }
             });
             return;
@@ -637,18 +692,20 @@ fn dispatch(
     }
     let _ = commands.send(action);
 }
-fn worker(cli: PathBuf) -> (Sender<Action>, Sender<Update>, Receiver<Update>) {
-    worker_with_intervals(cli, Duration::from_secs(15), Duration::from_secs(60))
+fn worker(cli: PathBuf, wake: Waker) -> (Sender<Action>, Notify, Receiver<Update>) {
+    worker_with_intervals(cli, POLL, DISCOVERY, wake)
 }
 /// The command queue, a sender for notices from outside the worker (direct
-/// opens), and the updates the menu draws from.
+/// opens), and the updates the menu draws from. `wake` runs after each update.
 fn worker_with_intervals(
     cli: PathBuf,
     poll: Duration,
     discovery: Duration,
-) -> (Sender<Action>, Sender<Update>, Receiver<Update>) {
+    wake: Waker,
+) -> (Sender<Action>, Notify, Receiver<Update>) {
     let (commands, command_rx) = mpsc::channel();
-    let (updates, update_rx) = mpsc::channel();
+    let (tx, update_rx) = mpsc::channel();
+    let updates = Notify { tx, wake };
     let notices = updates.clone();
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -658,7 +715,7 @@ fn worker_with_intervals(
         {
             Ok(runtime) => runtime,
             Err(error) => {
-                let _ = updates.send(Update::Snapshot(Err(error.to_string())));
+                updates.send(Update::Snapshot(Err(error.to_string())));
                 return;
             }
         };
@@ -676,8 +733,8 @@ fn worker_with_intervals(
                 })
                 .map_err(|error| format!("{error:#}"))
         };
-        let refresh = |updates: &Sender<Update>, discover: bool| {
-            let _ = updates.send(Update::Snapshot(fetch(discover)));
+        let refresh = |updates: &Notify, discover: bool| {
+            updates.send(Update::Snapshot(fetch(discover)));
         };
         // Commands read while gathering queued switch flips wait here.
         let mut backlog = std::collections::VecDeque::new();
@@ -696,11 +753,13 @@ fn worker_with_intervals(
             (latest, flips)
         };
         refresh(&updates, true);
-        let mut last_discovery = std::time::Instant::now();
+        let mut last_discovery = Instant::now();
+        // The catalog refreshes `poll` after the last refresh, whatever caused it.
+        let mut last_refresh = Instant::now();
         loop {
             let next = match backlog.pop_front() {
                 Some(action) => Ok(action),
-                None => command_rx.recv_timeout(poll),
+                None => command_rx.recv_timeout(poll.saturating_sub(last_refresh.elapsed())),
             };
             match next {
                 Ok(Action::Quit) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -743,35 +802,48 @@ fn worker_with_intervals(
                     // Send the fresh state first, then settle the switch, so it
                     // never redraws from a catalog taken before the change.
                     refresh(&updates, false);
-                    let _ = updates.send(Update::ProxyDone { flips, error });
+                    last_refresh = Instant::now();
+                    updates.send(Update::ProxyDone { flips, error });
+                }
+                Ok(Action::Peek) => {
+                    if last_refresh.elapsed() >= PEEK_AFTER {
+                        refresh(&updates, false);
+                        last_refresh = Instant::now();
+                    }
                 }
                 Ok(action) => {
                     let reconnect = action == Action::Reconnect;
                     if let Some(args) = action.cli_args() {
                         let result = runtime.block_on(invoke(&cli, &args));
-                        let message = match result {
+                        let (text, ttl) = match result {
                             Ok(out) if action == Action::Pair => pairing_notice(&out),
-                            Ok(_) => match action {
-                                Action::Copy { .. } => "URL copied".to_owned(),
-                                Action::Open { .. } => "Opened in browser".to_owned(),
-                                Action::Reconnect => "Discovery refreshed".to_owned(),
-                                _ => "Updated".to_owned(),
-                            },
-                            Err(error) => format!("{error:#}"),
+                            Ok(_) => (
+                                match action {
+                                    Action::Copy { .. } => "URL copied",
+                                    Action::Open { .. } => "Opened in browser",
+                                    Action::Reconnect => "Discovery refreshed",
+                                    _ => "Updated",
+                                }
+                                .to_owned(),
+                                NOTICE_TTL,
+                            ),
+                            Err(error) => (format!("{error:#}"), ERROR_TTL),
                         };
-                        let _ = updates.send(Update::Notice(message));
+                        updates.send(Update::Notice { text, ttl });
                     }
                     let discover = !reconnect && last_discovery.elapsed() >= discovery;
                     refresh(&updates, discover);
+                    last_refresh = Instant::now();
                     if reconnect || discover {
-                        last_discovery = std::time::Instant::now();
+                        last_discovery = Instant::now();
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let discover = last_discovery.elapsed() >= discovery;
                     refresh(&updates, discover);
+                    last_refresh = Instant::now();
                     if discover {
-                        last_discovery = std::time::Instant::now();
+                        last_discovery = Instant::now();
                     }
                 }
             }
@@ -787,8 +859,41 @@ mod native {
     use tray_icon::menu::CheckMenuItem;
     use tray_icon::{
         menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
-        Icon, TrayIcon, TrayIconBuilder,
+        Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
     };
+
+    /// What the loop does after a tick: exit, or sleep until something wakes
+    /// it or, when set, until this deadline (a notice expiring).
+    pub enum Next {
+        Quit,
+        Wait(Option<Instant>),
+    }
+    /// Menu clicks arrive through a channel, and each one wakes the loop.
+    fn menu_events(wake: Waker) -> Receiver<MenuEvent> {
+        let (tx, rx) = mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        MenuEvent::set_event_handler(Some(move |event| {
+            if tx.lock().is_ok_and(|tx| tx.send(event).is_ok()) {
+                wake();
+            }
+        }));
+        rx
+    }
+    /// The pointer reaching the icon means the menu is about to open: ask the
+    /// worker for a fresh catalog. Linux tray hosts report no such events.
+    fn peek_on_hover(commands: &Sender<Action>) {
+        let commands = std::sync::Mutex::new(commands.clone());
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            if matches!(
+                event,
+                TrayIconEvent::Enter { .. } | TrayIconEvent::Click { .. }
+            ) {
+                if let Ok(commands) = commands.lock() {
+                    let _ = commands.send(Action::Peek);
+                }
+            }
+        }));
+    }
 
     /// The live control behind a toggle row, kept so its state can be read at
     /// click time and updated in place without rebuilding the menu.
@@ -863,7 +968,8 @@ mod native {
         /// The local proxy's naming, used to label paired machines' app URLs.
         settings: ProxySettings,
         error: Option<String>,
-        notice: Option<String>,
+        /// A message and when it leaves the menu.
+        notice: Option<(String, Instant)>,
         /// Proxy starts/stops sent but not yet finished, and the state the user
         /// last asked for. While any are in flight the switch keeps showing
         /// that state instead of whatever an older catalog says.
@@ -1332,10 +1438,43 @@ mod native {
         }
         pub fn tick(
             &mut self,
+            clicks: &Receiver<MenuEvent>,
             updates: &Receiver<Update>,
             commands: &Sender<Action>,
-            notices: &Sender<Update>,
-        ) -> bool {
+            notices: &Notify,
+        ) -> Next {
+            // Clicks first. A switch flip has already moved the control, so
+            // read it before a snapshot that arrived in the same tick redraws
+            // the switch from the older state.
+            while let Ok(event) = clicks.try_recv() {
+                self.clicks += 1;
+                if let Some(toggle) = self.toggles.get(&event.id.0) {
+                    // The control has already flipped itself. Ask for the state it
+                    // now shows, not the action captured when the menu was drawn,
+                    // so quick on-off-on flips each send the right command.
+                    let on = toggle_is_on(toggle);
+                    self.wanted = on;
+                    self.pending += 1;
+                    let _ = commands.send(if on {
+                        Action::StartProxy
+                    } else {
+                        Action::StopProxy
+                    });
+                } else if let Some(action) = self.actions.get(&event.id.0) {
+                    if *action == Action::Quit {
+                        let _ = commands.send(Action::Quit);
+                        return Next::Quit;
+                    }
+                    dispatch(
+                        action.clone(),
+                        self.clicks,
+                        commands,
+                        notices,
+                        crate::discovery::open_url,
+                    );
+                }
+            }
+            let now = Instant::now();
             let mut changed = false;
             for update in updates.try_iter() {
                 match update {
@@ -1347,18 +1486,22 @@ mod native {
                         self.error = None;
                     }
                     Update::Snapshot(Err(error)) => self.error = Some(error),
-                    Update::Notice(notice) => self.notice = Some(notice),
+                    Update::Notice { text, ttl } => self.notice = Some((text, now + ttl)),
                     Update::OpenFailed { click, error } => {
                         if still_latest(click, self.clicks) {
-                            self.notice = Some(error);
+                            self.notice = Some((error, now + ERROR_TTL));
                         }
                     }
                     Update::ProxyDone { flips, error } => {
                         self.pending = self.pending.saturating_sub(flips);
                         // Success needs no message: the switch is the message.
-                        self.notice = error;
+                        self.notice = error.map(|error| (error, now + ERROR_TTL));
                     }
                 }
+                changed = true;
+            }
+            if self.notice.as_ref().is_some_and(|(_, until)| *until <= now) {
+                self.notice = None;
                 changed = true;
             }
             let open = menu_is_open();
@@ -1383,7 +1526,7 @@ mod native {
                     self.snapshot.as_ref(),
                     &self.settings,
                     self.error.as_deref(),
-                    self.notice.as_deref(),
+                    self.notice.as_ref().map(|(text, _)| text.as_str()),
                 );
                 if self.pending > 0 {
                     for entry in model.iter_mut().filter(|entry| entry.toggle.is_some()) {
@@ -1429,38 +1572,17 @@ mod native {
                     }
                 }
             }
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
-                self.clicks += 1;
-                if let Some(toggle) = self.toggles.get(&event.id.0) {
-                    // The control has already flipped itself. Ask for the state it
-                    // now shows, not the action captured when the menu was drawn,
-                    // so quick on-off-on flips each send the right command.
-                    let on = toggle_is_on(toggle);
-                    self.wanted = on;
-                    self.pending += 1;
-                    let _ = commands.send(if on {
-                        Action::StartProxy
-                    } else {
-                        Action::StopProxy
-                    });
-                } else if let Some(action) = self.actions.get(&event.id.0) {
-                    if *action == Action::Quit {
-                        let _ = commands.send(Action::Quit);
-                        return false;
-                    }
-                    dispatch(
-                        action.clone(),
-                        self.clicks,
-                        commands,
-                        notices,
-                        crate::discovery::open_url,
-                    );
-                }
-            }
             for toggle in self.toggles.values() {
                 set_busy(toggle, self.pending > 0);
             }
-            true
+            // Wake for the notice to leave, and, while rows wait for an open
+            // menu to close, often enough to redraw them soon after.
+            let mut next = self.notice.as_ref().map(|(_, until)| *until);
+            if self.stale {
+                let soon = now + Duration::from_millis(250);
+                next = Some(next.map_or(soon, |next| next.min(soon)));
+            }
+            Next::Wait(next)
         }
     }
     #[cfg(any(target_os = "macos", windows))]
@@ -1470,36 +1592,103 @@ mod native {
             event_loop::{ControlFlow, EventLoopBuilder},
         };
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-        let mut event_loop = EventLoopBuilder::new().build();
+        let mut event_loop = EventLoopBuilder::<()>::with_user_event().build();
         #[cfg(target_os = "macos")]
         {
             use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
             event_loop.set_activation_policy(ActivationPolicy::Accessory);
         }
-        let (commands, notices, updates) = worker(cli);
+        // The worker and menu clicks wake the loop with a user event; it
+        // never polls.
+        let proxy = std::sync::Mutex::new(event_loop.create_proxy());
+        let wake: Waker = Arc::new(move || {
+            if let Ok(proxy) = proxy.lock() {
+                let _ = proxy.send_event(());
+            }
+        });
+        let (commands, notices, updates) = worker(cli, wake.clone());
+        let clicks = menu_events(wake);
+        peek_on_hover(&commands);
         let mut ui: Option<Ui> = None;
         event_loop.run(move |event, _, control_flow| {
-            *control_flow =
-                ControlFlow::WaitUntil(std::time::Instant::now() + Duration::from_millis(150));
-            if matches!(event, Event::NewEvents(StartCause::Init)) {
-                match Ui::new() {
+            match event {
+                Event::NewEvents(StartCause::Init) => match Ui::new() {
                     Ok(native) => ui = Some(native),
                     Err(error) => {
                         eprintln!("Porch: {error:#}");
                         *control_flow = ControlFlow::Exit;
+                        return;
                     }
-                }
+                },
+                Event::UserEvent(()) | Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {}
+                // Window, device and redraw events don't concern the menu.
+                _ => return,
             }
-            if let Some(ui) = &mut ui {
-                if !ui.tick(&updates, &commands, &notices) {
-                    *control_flow = ControlFlow::Exit;
+            let Some(ui) = &mut ui else { return };
+            *control_flow = match ui.tick(&clicks, &updates, &commands, &notices) {
+                Next::Quit => ControlFlow::Exit,
+                Next::Wait(Some(deadline)) => ControlFlow::WaitUntil(deadline),
+                Next::Wait(None) => ControlFlow::Wait,
+            };
+        });
+    }
+    /// The GTK main thread's menu, reached from glib callbacks.
+    #[cfg(target_os = "linux")]
+    struct Linux {
+        ui: Ui,
+        clicks: Receiver<MenuEvent>,
+        updates: Receiver<Update>,
+        commands: Sender<Action>,
+        notices: Notify,
+        timer: Option<gtk::glib::SourceId>,
+    }
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        static LINUX: std::cell::RefCell<Option<Linux>> = const { std::cell::RefCell::new(None) };
+    }
+    /// Tick the menu on the GTK thread and arm a timer for its next deadline.
+    #[cfg(target_os = "linux")]
+    fn linux_tick() {
+        use gtk::glib;
+        let quit = LINUX.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            let Some(tray) = cell.as_mut() else {
+                return false;
+            };
+            match tray
+                .ui
+                .tick(&tray.clicks, &tray.updates, &tray.commands, &tray.notices)
+            {
+                Next::Quit => true,
+                Next::Wait(next) => {
+                    if let Some(timer) = tray.timer.take() {
+                        timer.remove();
+                    }
+                    tray.timer = next.map(|at| {
+                        glib::timeout_add_local_once(
+                            at.saturating_duration_since(Instant::now()),
+                            || {
+                                LINUX.with(|cell| {
+                                    if let Some(tray) = cell.borrow_mut().as_mut() {
+                                        tray.timer = None;
+                                    }
+                                });
+                                linux_tick();
+                            },
+                        )
+                    });
+                    false
                 }
             }
         });
+        if quit {
+            gtk::main_quit();
+        }
     }
     #[cfg(target_os = "linux")]
     pub fn run(cli: PathBuf) -> Result<()> {
         use gtk::glib::{self, variant::ToVariant};
+        use std::sync::atomic::{AtomicBool, Ordering};
         gtk::init()
             .context("No graphical desktop is available. Use `porch list --all` in this session")?;
         let connection =
@@ -1554,18 +1743,56 @@ mod native {
         if !indicator_library {
             bail!("AppIndicator is unavailable. Install libayatana-appindicator3-1, or use `porch list --all`");
         }
-        let (commands, notices, updates) = worker(cli);
-        let mut ui = Ui::new()?;
-        glib::timeout_add_local(Duration::from_millis(150), move || {
-            if ui.tick(&updates, &commands, &notices) {
-                glib::ControlFlow::Continue
-            } else {
-                gtk::main_quit();
-                glib::ControlFlow::Break
+        // Any thread may wake the menu; the tick runs once on the GTK thread
+        // however many wakes arrive before it.
+        static SCHEDULED: AtomicBool = AtomicBool::new(false);
+        let wake: Waker = Arc::new(|| {
+            if !SCHEDULED.swap(true, Ordering::SeqCst) {
+                glib::idle_add_once(|| {
+                    SCHEDULED.store(false, Ordering::SeqCst);
+                    linux_tick();
+                });
             }
+        });
+        let (commands, notices, updates) = worker(cli, wake.clone());
+        let clicks = menu_events(wake);
+        peek_on_hover(&commands);
+        let ui = Ui::new()?;
+        LINUX.with(|cell| {
+            *cell.borrow_mut() = Some(Linux {
+                ui,
+                clicks,
+                updates,
+                commands,
+                notices,
+                timer: None,
+            })
         });
         gtk::main();
         Ok(())
+    }
+}
+
+/// One menu per state directory, so a second `porch tray` doesn't add a
+/// second icon. `None` when another menu holds the lock; the returned file
+/// holds it until it is dropped or the process exits.
+fn single_instance(dir: &Path) -> Result<Option<std::fs::File>> {
+    use fs2::FileExt;
+    std::fs::create_dir_all(dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("tray.lock"))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1585,6 +1812,16 @@ pub fn run() -> Result<()> {
         _ => bail!("usage: porch-tray [--state-dir DIR]"),
     }
     let cli = cli_path()?;
+    // Held until the menu exits. A state directory Porch can't write to still
+    // gets a menu, just without the guard.
+    let _instance = match single_instance(&crate::state::dir()) {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            eprintln!("Porch: the menu is already running");
+            return Ok(());
+        }
+        Err(_) => None,
+    };
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     return native::run(cli);
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -1656,21 +1893,110 @@ mod tests {
             warnings: vec![],
         }
     }
+    fn no_wake() -> Waker {
+        Arc::new(|| {})
+    }
+    /// A `Notify` whose updates a test reads directly.
+    fn notify() -> (Notify, Receiver<Update>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            Notify {
+                tx,
+                wake: no_wake(),
+            },
+            rx,
+        )
+    }
+    #[test]
+    fn ids_that_look_like_options_stay_arguments() {
+        let open = Action::Open {
+            app: "-rf".into(),
+            peer: Some("--help".into()),
+            url: None,
+        };
+        assert_eq!(
+            open.cli_args().unwrap(),
+            vec!["open", "--peer=--help", "--", "-rf"]
+        );
+        let copy = Action::Copy {
+            app: "-x".into(),
+            peer: None,
+        };
+        assert_eq!(copy.cli_args().unwrap(), vec!["copy", "--", "-x"]);
+    }
+    #[test]
+    fn a_second_menu_finds_the_first_one_running() {
+        let dir = std::env::temp_dir().join(format!(
+            "porch-tray-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let first = single_instance(&dir).unwrap();
+        assert!(first.is_some());
+        assert!(single_instance(&dir).unwrap().is_none());
+        drop(first);
+        assert!(single_instance(&dir).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    /// Hovering over the icon refreshes a catalog only once it is a few
+    /// seconds old, so passing the pointer over it doesn't run the CLI.
+    #[cfg(unix)]
+    #[test]
+    fn a_peek_right_after_a_refresh_runs_nothing() {
+        use std::fs;
+        let directory = std::env::temp_dir().join(format!(
+            "porch-tray-peek-{}-{}",
+            std::process::id(),
+            unique()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let cli = directory.join("porch");
+        let log = directory.join("calls");
+        let quoted_log = format!("'{}'", log.display());
+        let json = serde_json::to_string(&snapshot()).unwrap();
+        crate::test_support::write_executable(&cli, &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"));
+        let (commands, _, updates) = worker_with_intervals(
+            cli,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            no_wake(),
+        );
+        assert!(matches!(
+            updates.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Update::Snapshot(Ok(_))
+        ));
+        commands.send(Action::Peek).unwrap();
+        commands.send(Action::Quit).unwrap();
+        while updates.recv_timeout(Duration::from_secs(5)).is_ok() {}
+        let calls = fs::read_to_string(&log).unwrap();
+        assert_eq!(calls, "peers refresh --json\n");
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn the_menu_refreshes_slowly_on_its_own() {
+        assert!(POLL >= Duration::from_secs(60));
+        assert!(DISCOVERY >= Duration::from_secs(300));
+    }
     #[test]
     fn apps_are_flat_url_rows_that_open_and_copy_on_their_machine() {
         let entries = model(Some(&snapshot()), None, None);
         assert!(
-            entries.iter().all(|entry| entry.children.is_empty()),
+            entries
+                .iter()
+                .all(|entry| entry.children.is_empty() || entry.label == "Pair a device…"),
             "no machine submenus: {entries:#?}"
         );
         let local = row(&entries, "web.localhost:7462");
         assert_eq!(
             local.action.as_ref().unwrap().cli_args().unwrap(),
-            vec!["open", "app-stable-id"]
+            vec!["open", "--", "app-stable-id"]
         );
         let (copy_label, copy) = local.alternate.as_ref().unwrap();
         assert_eq!(copy_label, "Copy web.localhost:7462");
-        assert_eq!(copy.cli_args().unwrap(), vec!["copy", "app-stable-id"]);
+        assert_eq!(
+            copy.cli_args().unwrap(),
+            vec!["copy", "--", "app-stable-id"]
+        );
         assert!(
             local.enabled,
             "local app stays usable when remote sharing is off"
@@ -1680,11 +2006,11 @@ mod tests {
         let remote = row(&entries, "web.workbench.localhost:");
         assert_eq!(
             remote.action.as_ref().unwrap().cli_args().unwrap(),
-            vec!["open", "app-stable-id", "--peer", "peer-stable-id"]
+            vec!["open", "--peer=peer-stable-id", "--", "app-stable-id"]
         );
         assert_eq!(
             remote.alternate.as_ref().unwrap().1.cli_args().unwrap(),
-            vec!["copy", "app-stable-id", "--peer", "peer-stable-id"]
+            vec!["copy", "--peer=peer-stable-id", "--", "app-stable-id"]
         );
         assert!(remote.enabled);
         // Each machine's apps sit under a heading naming it.
@@ -1811,12 +2137,25 @@ mod tests {
         crate::test_support::write_executable(&cli, &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"));
         // Discovery is due far less often than the catalog poll, so catalog
         // refreshes happen in between even when each CLI call is slow.
-        let (commands, _, updates) =
-            worker_with_intervals(cli, Duration::from_millis(30), Duration::from_millis(400));
+        let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake: Waker = {
+            let woken = woken.clone();
+            Arc::new(move || {
+                woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let (commands, _, updates) = worker_with_intervals(
+            cli,
+            Duration::from_millis(30),
+            Duration::from_millis(400),
+            wake,
+        );
         assert!(matches!(
             updates.recv_timeout(Duration::from_secs(5)).unwrap(),
             Update::Snapshot(Ok(_))
         ));
+        // Each update wakes the menu, which never polls for them.
+        assert!(woken.load(std::sync::atomic::Ordering::SeqCst) >= 1);
         commands
             .send(Action::Open {
                 app: "app-stable-id".into(),
@@ -1832,7 +2171,7 @@ mod tests {
             let _ = updates.recv_timeout(Duration::from_secs(5)).unwrap();
             let calls = fs::read_to_string(&log).unwrap();
             let after_open = calls
-                .split_once("open app-stable-id --peer peer-stable-id\n")
+                .split_once("open --peer=peer-stable-id -- app-stable-id\n")
                 .map_or("", |(_, after)| after);
             found_catalog = after_open.lines().any(|line| line == "list --all --json");
             found_scan = after_open
@@ -1847,7 +2186,7 @@ mod tests {
             "initial discovery: {calls}"
         );
         assert!(
-            calls.contains("open app-stable-id --peer peer-stable-id\n"),
+            calls.contains("open --peer=peer-stable-id -- app-stable-id\n"),
             "remote open: {calls}"
         );
         assert!(found_catalog, "catalog refresh: {calls}");
@@ -1859,19 +2198,30 @@ mod tests {
     #[test]
     fn pair_a_device_runs_host_side_and_shows_the_code() {
         let entries = model(Some(&snapshot()), None, None);
-        let pair = entries
-            .iter()
-            .find(|e| e.action == Some(Action::Pair))
-            .expect("Pair a device… menu item");
-        assert_eq!(pair.label, "Pair a device…");
+        // Pairing turns on sharing, so the top-level row only opens a submenu
+        // that says so; the code needs a second click.
+        let group = row(&entries, "Pair a device…");
+        assert_eq!(group.action, None);
+        assert!(entries.iter().all(|e| e.action != Some(Action::Pair)));
+        assert!(group.children[0].label.contains("sharing"));
+        let pair = &group.children[1];
+        assert_eq!(pair.action, Some(Action::Pair));
         assert!(pair.enabled);
         assert_eq!(
             Action::Pair.cli_args().unwrap(),
             vec!["pair", "--no-wait", "--json"]
         );
-        let notice = pairing_notice(br#"{"version":1,"code":"482913","expires":1}"#);
+        let (notice, valid) =
+            pairing_notice(br#"{"version":1,"code":"482913","expires":1,"expires_in":120}"#);
         assert!(notice.contains("482913") && notice.contains("porch pair 482913"));
-        assert!(!pairing_notice(b"{}").contains("porch pair "));
+        // The code leaves the menu when it expires.
+        assert_eq!(valid, Duration::from_secs(120));
+        assert_eq!(
+            pairing_notice(br#"{"code":"482913"}"#).1,
+            Duration::from_secs(300)
+        );
+        let (failed, _) = pairing_notice(b"{}");
+        assert!(!failed.contains("porch pair "));
         let shown = model(Some(&snapshot()), None, Some(&notice));
         assert!(shown.iter().any(|e| e.label.contains("482913")));
     }
@@ -1932,8 +2282,12 @@ mod tests {
             &cli,
             &format!("#!/bin/sh\ncase \"$1\" in proxy) exit 0;; esac\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"),
         );
-        let (commands, _, updates) =
-            worker_with_intervals(cli, Duration::from_secs(60), Duration::from_secs(60));
+        let (commands, _, updates) = worker_with_intervals(
+            cli,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            no_wake(),
+        );
         assert!(matches!(
             updates.recv_timeout(Duration::from_secs(5)).unwrap(),
             Update::Snapshot(Ok(_))
@@ -1975,8 +2329,12 @@ mod tests {
             &cli,
             &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted_log}\ncase \"$1\" in peers) while [ ! -e {quoted_release} ]; do sleep 0.01; done;; proxy) exit 0;; esac\ncat <<'PORCH_SNAPSHOT'\n{json}\nPORCH_SNAPSHOT\n"),
         );
-        let (commands, _, updates) =
-            worker_with_intervals(cli, Duration::from_secs(60), Duration::from_secs(60));
+        let (commands, _, updates) = worker_with_intervals(
+            cli,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            no_wake(),
+        );
         // Queue the flips only once the worker is inside that discovery.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while !fs::read_to_string(&log)
@@ -2102,7 +2460,7 @@ mod tests {
                     "the row opens the URL it shows"
                 );
                 let (commands, command_rx) = mpsc::channel();
-                let (notices, notice_rx) = mpsc::channel();
+                let (notices, notice_rx) = notify();
                 dispatch(
                     row.action.clone().unwrap(),
                     1,
@@ -2132,20 +2490,20 @@ mod tests {
         let relay = row(&entries, "web/admin on Workbench");
         assert_eq!(open_url_of(relay), None);
         let (commands, command_rx) = mpsc::channel();
-        let (notices, notice_rx) = mpsc::channel();
+        let (notices, notice_rx) = notify();
         let open = relay.action.clone().unwrap();
         dispatch(open.clone(), 1, &commands, &notices, record_open);
         assert_eq!(command_rx.try_recv().unwrap(), open);
         assert_eq!(
             open.cli_args().unwrap(),
-            vec!["open", "app-stable-id", "--peer", "peer-stable-id"]
+            vec!["open", "--peer=peer-stable-id", "--", "app-stable-id"]
         );
         assert!(notice_rx.try_recv().is_err());
     }
     #[test]
     fn a_failed_direct_open_reports_why() {
         let (commands, command_rx) = mpsc::channel();
-        let (notices, notice_rx) = mpsc::channel();
+        let (notices, notice_rx) = notify();
         let open = Action::Open {
             app: "app-stable-id".into(),
             peer: None,
