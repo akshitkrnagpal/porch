@@ -1,6 +1,6 @@
 [package]
 name = "porch"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 # The oldest Rust that builds everything, tray included (tray-icon 0.26 needs
 # 1.90; the CLI alone needs 1.88). Checked with `cargo +1.90.0 check

@@ -2,7 +2,7 @@
 
 All notable changes to Porch. Versions follow [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.6.0 (2026-11-14)
 
 ### Security
 - `--private` now works wherever you put it. After the subcommand or app name (`porch run --private …`, `porch web --private …`, `porch --name web --private …`) and from the MCP `run` tool, it used to be ignored, so the app was offered to paired machines.
