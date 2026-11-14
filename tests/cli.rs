@@ -1007,8 +1007,17 @@ fn detached_runs_answer_log_and_stop() {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
-    let logs = s.ok(&["logs", "bg"]);
-    assert!(logs.contains("hello from bg"), "{logs}");
+    // The app listens before it prints, so its line can land in the log just
+    // after health turns ok.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let logs = s.ok(&["logs", "bg"]);
+        if logs.contains("hello from bg") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{logs}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     // A second copy is refused without touching the running one or its log.
     let again = s.run(&["run", "--detach", "--name", "bg", "python3", "-c", "pass"]);
     assert!(!again.status.success());

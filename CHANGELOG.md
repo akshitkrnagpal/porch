@@ -15,6 +15,7 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - New local CAs can sign TLS server certificates only, and `porch trust` trusts the CA for TLS only on macOS. Before, someone who stole the CA key could also sign email or code-signing certificates your account trusted. Your existing CA is kept so its trust stays in place; `porch doctor` explains how to replace it, and on macOS running `porch trust` again limits its trust to TLS.
 - Porch no longer keeps the private key of a CA it has replaced, and deletes ones older versions kept.
 - A web page that requests made-up `*.localhost` HTTPS names can no longer use up the certificate budget your apps need: names that serve something (routes, the dashboard, apps on paired machines) have their own budget and stay cached.
+- Made-up names under a paired machine (`r0.mini.localhost`, `r1.mini.localhost`, …) no longer use up that budget either. Porch doesn't ask the paired machine which apps it has, so any such name used to count as a real app and could block first-time HTTPS connections to your local apps and the dashboard. Names under paired machines now have a budget of their own.
 - The Tailscale sharing lock no longer sits under a guessable name in a shared `/tmp`, where another user on a Linux machine could create it first and make `--tailscale` fail.
 - Other devices (LAN mode) can no longer set any forwarding header your app might trust: every `X-Forwarded-*` header (including `X-Forwarded-Prefix` and `X-Forwarded-Ssl`), `Forwarded`, `X-Real-IP`, `X-Client-IP`, `True-Client-IP`, `X-Original-*` and `X-Rewrite-URL` are removed.
 - One device on your network can no longer tie up the proxy (LAN mode). Each device gets a share of the connections, connections doing nothing are closed after a minute, a request body that stalls for a minute is cut off, and connections from devices that left the network are detected and closed. Event streams and WebSockets keep working.
@@ -42,6 +43,7 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - Release builds no longer restore caches, pin every GitHub Action to a commit, and build with `--locked`.
 
 ### Fixed
+- `porch clean` with an isolated state directory (`PORCH_STATE_DIR=/tmp/x porch clean`) no longer stops your real proxy or removes its start-at-login entry. On macOS and Linux that entry is shared by every state directory, so `clean` now removes it only when it serves the state directory being cleaned, and otherwise says it left it in place. `porch service uninstall` is unchanged.
 - Launch options before `--name` (`-d`, `--detach`, `--private`, `--prefix=…`, `--app-port=…`, `--framework`, `--state-dir`) no longer make Porch treat the command as the app's name, and `porch --private -- --filter=web` passes `--filter=web` to the dev script. `porch web --name api …` is refused instead of quietly ignoring `--name`.
 - On/off environment variables (`PORCH_PRIVATE`, `PORCH_HTTPS`, `PORCH_LAN`, `PORCH_CLEAN_URLS` and the rest) all accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off` in any case. Anything else is an error; `PORCH_PRIVATE=yes` used to mean off.
 - Fields that a newer Porch adds to `state.json` and `proxy.json` are kept when this version rewrites them. Versions up to 0.5.2 drop them, which turned private apps shared and `--upstream https` aliases back into plain HTTP when an older `porch` was still running.
@@ -92,7 +94,7 @@ All notable changes to Porch. Versions follow [semantic versioning](https://semv
 - The discovery agent no longer rewrites and syncs a state file each time it reads the machine's identity, which every app list did twice.
 - Apps started through the MCP `run` tool get the same environment as from a terminal. MCP used to set `CI=1` and `NO_COLOR=1` for every command it ran, and the app and proxy inherited them.
 - The MCP server answers `ping` and other requests while a slow call is running, honours `notifications/cancelled`, and no longer exits on a line that isn't UTF-8. Lines over 1 MiB are refused with a parse error.
-- An MCP `run` that runs out of `timeoutMs` stops the app it was starting, so a retry no longer reports "already running".
+- An MCP `run` that runs out of `timeoutMs` stops the app it was starting, so a retry no longer reports "already running". If the app's launcher outlives the timeout, the error says the app may still be starting and to check `list`, and the tool's description now says so too instead of promising the app is always stopped.
 - MCP `logs` returns the last 200 lines unless asked for more (at most 5000), instead of the whole log.
 - `extraArgs: ["--json"]` on `list`, and `--no-worktree` with `noWorktree: true` on `get`, no longer fail with a duplicate-flag error. `run` refuses an empty `command` instead of running the package's default script.
 - `tools_profiles` and `porch mcp --help` list every profile, including `apps`.

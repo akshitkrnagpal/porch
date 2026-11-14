@@ -80,13 +80,27 @@ struct LocalResolver {
     /// entries for unknown names are evicted first).
     cache: Mutex<HashMap<String, Cached>>,
     settings: crate::state::ProxySettings,
-    /// Which names serve something: routes, the dashboard, paired machines.
-    known: fn(&str, &crate::state::ProxySettings) -> bool,
-    /// Names that serve something get their own budget, so a page cycling
-    /// random names (which only reach the 404 page) can't stop your apps'
-    /// certificates.
+    /// What a name serves: a local route or the dashboard, an app on a
+    /// paired machine, or nothing.
+    known: fn(&str, &crate::state::ProxySettings) -> NameKind,
+    /// Each kind of name has its own budget, so a page cycling random names
+    /// (which only reach the 404 page) can't stop your apps' certificates.
     known_budget: Budget,
+    /// Any `NAME.MACHINE.<domain>` counts as a paired machine's app without
+    /// asking that machine, so made-up ones draw from their own budget and
+    /// can't stop local apps' or the dashboard's certificates either.
+    peer_budget: Budget,
     unknown_budget: Budget,
+}
+/// What a TLS name serves, which decides the issuance budget it draws from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameKind {
+    /// The dashboard, a configured domain, or a local route.
+    Local,
+    /// A name under a paired machine (`APP.MACHINE.<domain>`).
+    Peer,
+    /// Nothing: typos, probes, random names.
+    Unknown,
 }
 impl std::fmt::Debug for LocalResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -105,6 +119,7 @@ impl LocalResolver {
             settings,
             known: known_name,
             known_budget: Budget::new(),
+            peer_budget: Budget::new(),
             unknown_budget: Budget::new(),
         })
     }
@@ -192,11 +207,12 @@ impl LocalResolver {
         }
         // Each new name costs a key generation: cap the rate, so a client
         // cycling random names can't burn CPU (names in use stay cached).
-        let known = (self.known)(name, &self.settings);
-        let budget = if known {
-            &self.known_budget
-        } else {
-            &self.unknown_budget
+        let kind = (self.known)(name, &self.settings);
+        let known = kind != NameKind::Unknown;
+        let budget = match kind {
+            NameKind::Local => &self.known_budget,
+            NameKind::Peer => &self.peer_budget,
+            NameKind::Unknown => &self.unknown_budget,
         };
         if !budget.take() {
             // Out of budget: an expiring (still valid) leaf beats none.
@@ -236,10 +252,10 @@ impl LocalResolver {
         Some(cert)
     }
 }
-/// Whether `name` serves something: the dashboard, a route, or an app on a
-/// paired machine (`APP.MACHINE.<domain>`). Costs a `stat` of the route state
+/// What `name` serves: the dashboard or a route, an app on a paired machine
+/// (`APP.MACHINE.<domain>`), or nothing. Costs a `stat` of the route state
 /// and, at most every few seconds, a read of the paired machines.
-fn known_name(name: &str, settings: &crate::state::ProxySettings) -> bool {
+fn known_name(name: &str, settings: &crate::state::ProxySettings) -> NameKind {
     let routes = crate::state::live_routes()
         .map(|s| s.routes.iter().map(|r| r.name.clone()).collect::<Vec<_>>())
         .unwrap_or_default();
@@ -267,7 +283,7 @@ fn known_in(
     settings: &crate::state::ProxySettings,
     routes: &[String],
     peers: &[String],
-) -> bool {
+) -> NameKind {
     let mut domains: Vec<String> = settings
         .tlds
         .iter()
@@ -277,7 +293,7 @@ fn known_in(
         domains.push("local".into());
     }
     if name == "localhost" || name == "porch.localhost" || domains.iter().any(|d| d == name) {
-        return true;
+        return NameKind::Local;
     }
     let under =
         |host: &str| name == host || (settings.wildcard && name.ends_with(&format!(".{host}")));
@@ -285,17 +301,22 @@ fn known_in(
         let route = route.trim_end_matches('.').to_ascii_lowercase();
         if domains.iter().any(|d| route.ends_with(&format!(".{d}"))) {
             if under(&route) {
-                return true;
+                return NameKind::Local;
             }
         } else if domains.iter().any(|d| under(&format!("{route}.{d}"))) {
-            return true;
+            return NameKind::Local;
         }
     }
-    peers.iter().filter(|s| !s.is_empty()).any(|slug| {
+    // Any app name under a paired machine counts: the peer's catalog isn't
+    // consulted here, so these names get a budget of their own.
+    if peers.iter().filter(|s| !s.is_empty()).any(|slug| {
         domains
             .iter()
             .any(|d| name.ends_with(&format!(".{slug}.{d}")))
-    })
+    }) {
+        return NameKind::Peer;
+    }
+    NameKind::Unknown
 }
 // Root DNS name constraints are deliberately not fixed to the initial settings: TLDs
 // and registered domains can change without replacing a system-trusted root. All
@@ -609,7 +630,7 @@ mod tests {
         let mut resolver =
             LocalResolver::new(pem, &key, crate::state::ProxySettings::default()).unwrap();
         // Never read this machine's real routes or paired machines.
-        resolver.known = |_, _| true;
+        resolver.known = |_, _| NameKind::Local;
         resolver
     }
     #[test]
@@ -642,7 +663,13 @@ mod tests {
     #[test]
     fn random_names_cannot_starve_or_evict_real_ones() {
         let mut resolver = test_resolver();
-        resolver.known = |name, _| name == "web.localhost";
+        resolver.known = |name, _| {
+            if name == "web.localhost" {
+                NameKind::Local
+            } else {
+                NameKind::Unknown
+            }
+        };
         let web = resolver.resolve_name("web.localhost").unwrap();
         // A page cycling made-up names exhausts only their own budget.
         let mut refused = 0;
@@ -680,7 +707,7 @@ mod tests {
         };
         let routes = vec!["web".to_owned(), "api.dev.test".to_owned()];
         let peers = vec!["laptop".to_owned()];
-        let known = |n: &str, s: &crate::state::ProxySettings| known_in(n, s, &routes, &peers);
+        let kind = |n: &str, s: &crate::state::ProxySettings| known_in(n, s, &routes, &peers);
         for name in [
             "localhost",
             "porch.localhost",
@@ -688,20 +715,40 @@ mod tests {
             "web.localhost",
             "web.dev.test",
             "api.dev.test",
-            "shop.laptop.localhost",
         ] {
-            assert!(known(name, &settings), "{name}");
+            assert_eq!(kind(name, &settings), NameKind::Local, "{name}");
         }
+        assert_eq!(kind("shop.laptop.localhost", &settings), NameKind::Peer);
         for name in [
             "r1.localhost",
             "x.web.localhost",
             "api.localhost",
             "laptop.localhost",
         ] {
-            assert!(!known(name, &settings), "{name}");
+            assert_eq!(kind(name, &settings), NameKind::Unknown, "{name}");
         }
         settings.wildcard = true;
-        assert!(known("x.web.localhost", &settings));
+        assert_eq!(kind("x.web.localhost", &settings), NameKind::Local);
+    }
+    #[test]
+    fn made_up_peer_names_cannot_starve_local_apps_or_the_dashboard() {
+        let mut resolver = test_resolver();
+        resolver.known = |n, s| known_in(n, s, &["web".to_owned()], &["mini".to_owned()]);
+        // Any name under a paired machine looks like one of its apps, so a
+        // flood of invented ones exhausts the peer budget...
+        let refused = (0..40)
+            .filter(|i| {
+                resolver
+                    .resolve_name(&format!("r{i}.mini.localhost"))
+                    .is_none()
+            })
+            .count();
+        assert!(refused >= 10, "peer names are rate limited");
+        assert!(resolver.resolve_name("r99.mini.localhost").is_none());
+        // ...but not the local one: first-time handshakes to a real app and
+        // to the dashboard still get certificates.
+        assert!(resolver.resolve_name("web.localhost").is_some());
+        assert!(resolver.resolve_name("porch.localhost").is_some());
     }
     #[test]
     fn tls_policy_rejects_foreign_names() {
