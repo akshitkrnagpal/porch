@@ -27,6 +27,23 @@ pub struct State {
     /// Unix seconds when a route's processes were first seen job-control stopped.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub stopped_since: BTreeMap<String, u64>,
+    /// The oldest state format version allowed to rewrite this file. A future
+    /// Porch that stores a field older writers must not drop sets it, and
+    /// writers older than that refuse to save instead of silently erasing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_writer: Option<u32>,
+    /// Fields written by a newer Porch, kept as they are on every rewrite.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+/// This binary's state format version, compared with `min_writer` before it
+/// rewrites `state.json` or `proxy.json`.
+pub const FORMAT_VERSION: u32 = 1;
+fn check_writer(file: &str, min_writer: Option<u32>) -> Result<()> {
+    if let Some(v) = min_writer.filter(|v| *v > FORMAT_VERSION) {
+        bail!("{file} was written by a newer Porch (format {v}, this one understands {FORMAT_VERSION}); update porch before changing it")
+    }
+    Ok(())
 }
 /// How the proxy talks to an alias's loopback port.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +129,18 @@ pub struct ProxySettings {
     /// after a busy moment made this run fall back to a high port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_port: Option<u16>,
+    /// Set while LAN mode was turned on by an app launch (`porch NAME --lan`,
+    /// `PORCH_LAN=1`) rather than saved with `porch proxy start --lan`: the
+    /// domains to go back to when the proxy next starts. LAN mode then lasts
+    /// only as long as this proxy runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_temporary: Option<Vec<String>>,
+    /// See [`State::min_writer`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_writer: Option<u32>,
+    /// Settings written by a newer Porch, kept as they are on every rewrite.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 impl Default for ProxySettings {
     fn default() -> Self {
@@ -128,6 +157,9 @@ impl Default for ProxySettings {
             key: None,
             redirect_port: None,
             preferred_port: None,
+            lan_temporary: None,
+            min_writer: None,
+            extra: Default::default(),
         }
     }
 }
@@ -167,12 +199,46 @@ pub fn env(key: &str) -> Option<String> {
         .ok()
         .or_else(|| std::env::var(format!("PORTLESS_{key}")).ok())
 }
+/// Read an on/off value: 1/true/yes/on or 0/false/no/off, in any case.
+pub fn parse_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+/// The on/off environment variable `PORCH_{key}` (or `PORTLESS_{key}`), or an
+/// error naming it when it holds anything else.
+pub fn env_flag(key: &str) -> Result<Option<bool>> {
+    for name in [format!("PORCH_{key}"), format!("PORTLESS_{key}")] {
+        if let Ok(v) = std::env::var(&name) {
+            return parse_flag(&v).map(Some).with_context(|| {
+                format!(
+                    "{name}={v:?} is not on or off; use 1, true, yes or on, or 0, false, no or off"
+                )
+            });
+        }
+    }
+    Ok(None)
+}
 pub fn dir() -> PathBuf {
     env("STATE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| invoking_home().join(".porch"))
+        .or_else(|| invoking_home().map(|h| h.join(".porch")))
+        // Never a relative `.porch`: that would load whatever the current
+        // directory ships. `check_dir` and `prepare` refuse this empty path.
+        .unwrap_or_default()
+}
+/// Fail clearly when there is no state directory: no PORCH_STATE_DIR and no
+/// home directory in HOME or the user database.
+pub fn check_dir() -> Result<()> {
+    if dir().as_os_str().is_empty() {
+        bail!("cannot find your home directory for Porch's state: HOME is unset and the user database has no home for this user; set HOME, or choose a directory with PORCH_STATE_DIR")
+    }
+    Ok(())
 }
 fn prepare() -> Result<()> {
+    check_dir()?;
     let d = dir();
     if fs::symlink_metadata(&d).is_ok_and(|m| m.file_type().is_symlink()) {
         bail!("state directory cannot be a symlink")
@@ -236,6 +302,7 @@ pub fn transaction<T>(f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
     inherit_owner(&dir().join("state.lock"))?;
     lock.lock_exclusive()?;
     let mut s = load()?;
+    check_writer("state.json", s.min_writer)?;
     let result = f(&mut s)?;
     atomic_write("state.json", &serde_json::to_vec_pretty(&s)?)?;
     Ok(result)
@@ -255,6 +322,15 @@ pub fn proxy_settings() -> Result<ProxySettings> {
     }
 }
 pub fn save_proxy_settings(s: &ProxySettings) -> Result<()> {
+    // A newer Porch's marker on disk wins over the copy this one loaded.
+    let saved = match fs::read(dir().join("proxy.json")) {
+        Ok(b) => serde_json::from_slice::<serde_json::Value>(&b)
+            .ok()
+            .and_then(|v| v["min_writer"].as_u64())
+            .map(|v| v as u32),
+        Err(_) => None,
+    };
+    check_writer("proxy.json", saved.max(s.min_writer))?;
     atomic_write("proxy.json", &serde_json::to_vec_pretty(s)?)
 }
 pub fn identity(pid: u32) -> Option<ProcessIdentity> {
@@ -390,29 +466,53 @@ pub fn remove_route(s: &mut State, name: &str) {
     }
 }
 
-fn invoking_home() -> PathBuf {
+/// The home directory of the user Porch acts for, always absolute: the sudo
+/// caller's, then HOME (USERPROFILE on Windows), then the user database.
+/// `None` when none of them gives one.
+fn invoking_home() -> Option<PathBuf> {
+    home_with(std::env::var_os("HOME"))
+}
+fn home_with(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let absolute = |p: PathBuf| p.is_absolute().then_some(p);
     #[cfg(unix)]
-    if let Ok(user) = std::env::var("SUDO_USER") {
-        if let Ok(user) = std::ffi::CString::new(user) {
-            unsafe {
-                let info = libc::getpwnam(user.as_ptr());
-                if !info.is_null() {
-                    return PathBuf::from(
-                        std::ffi::CStr::from_ptr((*info).pw_dir)
-                            .to_string_lossy()
-                            .into_owned(),
-                    );
-                }
-            }
-        }
+    if let Some(home) = std::env::var("SUDO_USER")
+        .ok()
+        .and_then(|user| std::ffi::CString::new(user).ok())
+        .and_then(|user| passwd_home(unsafe { libc::getpwnam(user.as_ptr()) }))
+    {
+        return Some(home);
     }
     // Windows does not set HOME; without this the state directory would be a
     // relative `.porch` in whatever directory Porch was started from.
     #[cfg(windows)]
-    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|p| !p.is_empty()) {
-        return PathBuf::from(profile);
+    if let Some(profile) = std::env::var_os("USERPROFILE").and_then(|p| absolute(p.into())) {
+        return Some(profile);
     }
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+    if let Some(home) = home.and_then(|h| absolute(h.into())) {
+        return Some(home);
+    }
+    #[cfg(unix)]
+    return passwd_home(unsafe { libc::getpwuid(libc::getuid()) });
+    #[cfg(not(unix))]
+    None
+}
+#[cfg(unix)]
+fn passwd_home(info: *mut libc::passwd) -> Option<PathBuf> {
+    if info.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null entry from getpwnam/getpwuid, read before any other
+    // user-database call can reuse its storage.
+    let dir = unsafe { (*info).pw_dir };
+    if dir.is_null() {
+        return None;
+    }
+    let dir = PathBuf::from(
+        unsafe { std::ffi::CStr::from_ptr(dir) }
+            .to_string_lossy()
+            .into_owned(),
+    );
+    dir.is_absolute().then_some(dir)
 }
 #[cfg(unix)]
 fn chown(path: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
@@ -618,5 +718,37 @@ mod upstream_tests {
             Upstream::parse("http://x", true).is_err(),
             "--insecure needs https"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod home_tests {
+    use super::home_with;
+    #[test]
+    fn missing_or_relative_home_falls_back_to_the_user_database() {
+        if std::env::var_os("SUDO_USER").is_some() {
+            return; // the sudo caller's home wins over everything below
+        }
+        let from_passwd = home_with(None).expect("this user has a home in the user database");
+        assert!(from_passwd.is_absolute(), "{}", from_passwd.display());
+        assert_eq!(home_with(Some("".into())), Some(from_passwd.clone()));
+        assert_eq!(home_with(Some(".".into())), Some(from_passwd.clone()));
+        assert_eq!(home_with(Some("repo".into())), Some(from_passwd));
+        assert_eq!(
+            home_with(Some("/somewhere/else".into())),
+            Some("/somewhere/else".into())
+        );
+    }
+    #[test]
+    fn on_off_values() {
+        for v in ["1", "true", "TRUE", "yes", "On", " on "] {
+            assert_eq!(super::parse_flag(v), Some(true), "{v}");
+        }
+        for v in ["0", "false", "No", "off", "OFF"] {
+            assert_eq!(super::parse_flag(v), Some(false), "{v}");
+        }
+        for v in ["", "y", "2", "enabled", "maybe"] {
+            assert_eq!(super::parse_flag(v), None, "{v}");
+        }
     }
 }

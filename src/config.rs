@@ -956,21 +956,22 @@ pub fn launch_plans(
                 Some(s) => format!("; try `porch --script {s}`"),
                 None => String::new(),
             };
+            // Script names come from the repository: escape terminal controls.
+            let printable = crate::style::printable;
+            let dir = printable(&cwd.display().to_string());
+            let script = printable(script);
             if !cwd.join("package.json").is_file() {
                 format!(
-                    "{} has no package.json; give a command to run, e.g. `porch run python3 app.py`, or see `porch --help`",
-                    cwd.display()
+                    "{dir} has no package.json; give a command to run, e.g. `porch run python3 app.py`, or see `porch --help`"
                 )
             } else if scripts.is_empty() {
                 format!(
-                    "no \"{script}\" script in {}/package.json; give a command instead, e.g. `porch run node server.js`",
-                    cwd.display()
+                    "no \"{script}\" script in {dir}/package.json; give a command instead, e.g. `porch run node server.js`"
                 )
             } else {
                 format!(
-                    "no \"{script}\" script in {}/package.json (it has: {}){hint}, or give a command: `porch run <command>`",
-                    cwd.display(),
-                    scripts.join(", ")
+                    "no \"{script}\" script in {dir}/package.json (it has: {}){hint}, or give a command: `porch run <command>`",
+                    printable(&scripts.join(", "))
                 )
             }
         })?,
@@ -1649,15 +1650,69 @@ pub fn adapt_command(
 }
 
 /// Package-local executables win, then parent workspace bins, then the inherited PATH.
+///
+/// Only `node_modules/.bin` directories inside the project are added: up to the
+/// workspace or Git root, whichever is higher, or else the home directory. A
+/// directory above that (`/tmp`, `C:\`) may belong to someone else, who could
+/// plant a `node` there. On Unix, directories owned by another user are skipped.
 pub fn augmented_path(cwd: &Path) -> std::ffi::OsString {
-    let mut paths: Vec<PathBuf> = cwd
-        .ancestors()
-        .map(|p| p.join("node_modules/.bin"))
+    let mut paths: Vec<PathBuf> = project_ancestors(cwd)
+        .into_iter()
+        .map(|p| p.join("node_modules").join(".bin"))
+        .filter(|bin| owned_by_user(bin))
         .collect();
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
     std::env::join_paths(paths).unwrap_or_default()
+}
+/// `cwd` and its parents up to the project's top: the higher of the workspace
+/// root and the nearest Git root, else the home directory when `cwd` is inside
+/// it, else `cwd` alone. Never above the home directory when `cwd` is inside
+/// it, and never a filesystem root (`/`, `C:\`) other than `cwd` itself:
+/// anyone can create `C:\.git` or `C:\node_modules`.
+fn project_ancestors(cwd: &Path) -> Vec<&Path> {
+    let workspace = find_workspace_root(cwd);
+    let git = cwd.ancestors().find(|d| d.join(".git").exists());
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute() && h.parent().is_some() && cwd.starts_with(h));
+    let mut top = [workspace.as_deref(), git]
+        .into_iter()
+        .flatten()
+        // The shortest path is the higher one: both are ancestors of cwd.
+        .min_by_key(|p| p.components().count())
+        .map(Path::to_path_buf)
+        .or_else(|| home.clone())
+        .unwrap_or_else(|| cwd.to_path_buf());
+    if let Some(home) = home.filter(|h| !top.starts_with(h)) {
+        top = home;
+    }
+    let mut out = vec![cwd];
+    for dir in cwd.ancestors().skip(1) {
+        if !dir.starts_with(&top) || dir.parent().is_none() {
+            break;
+        }
+        out.push(dir);
+    }
+    out
+}
+/// The directory exists and, on Unix, it and the `node_modules` holding it
+/// belong to this user (or root). Windows ownership isn't a simple uid, so
+/// there only the project boundary applies.
+fn owned_by_user(bin: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = unsafe { libc::geteuid() };
+        let owned = |p: &Path| fs::metadata(p).is_ok_and(|m| m.uid() == uid || m.uid() == 0);
+        owned(bin) && bin.parent().is_some_and(owned)
+    }
+    #[cfg(not(unix))]
+    {
+        bin.is_dir()
+    }
 }
 
 fn is_porch_wrapper(raw: &str) -> bool {

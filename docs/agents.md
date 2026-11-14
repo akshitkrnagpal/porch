@@ -131,7 +131,7 @@ Except `tools_profiles`, every tool accepts `cwd` (directory to run in) and `tim
 | `machines` | none | `porch list --all --json` | This computer's and every paired machine's apps, with the local URL for each remote app. Read-only |
 | `alias_remove` | `name` (required), `tld` | `porch remove NAME` | Removes an alias; app routes aren't touched |
 | `tools_profiles` | none | — | Active and available profiles. Read-only |
-| `proxy_start` | `port`, `noTls`, `lan`, `tld`, `wildcard`, `unprivileged` | `porch proxy start` | `--foreground` is refused over MCP |
+| `proxy_start` | `port`, `noTls`, `lan`, `noLan`, `tld`, `wildcard`, `unprivileged` | `porch proxy start` | `--foreground` is refused over MCP |
 | `proxy_stop` | `port` | `porch proxy stop` | Apps keep running |
 | `doctor` | none | `porch doctor` | Report only; exits 1 when it finds a problem. Read-only |
 | `doctor_fix` | `yes` | `porch doctor --fix` | Applies safe fixes; stops stopped or orphaned launches only with `yes`. Destructive |

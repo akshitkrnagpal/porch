@@ -2,6 +2,21 @@
 
 All notable changes to Porch. Versions follow [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+### Security
+- `--private` now works wherever you put it. After the subcommand or app name (`porch run --private …`, `porch web --private …`, `porch --name web --private …`) and from the MCP `run` tool, it used to be ignored, so the app was offered to paired machines.
+- An app launched with `--lan` no longer leaves the proxy in LAN mode for good. LAN mode from an app lasts until the proxy next restarts; `porch proxy start --lan` (or a startup service with `--lan`) still saves it. `porch proxy start --no-lan` turns it off, and `porch list` and `porch doctor` warn while the proxy accepts connections from other devices, including LAN mode saved by an earlier version.
+- `porch clean` now unpairs from every paired machine (telling each one that answers), stops the discovery agent and its relays, removes discovery's start-at-login entry, and deletes the pairing keys and credentials, `--detach` logs, `trust.json`, Compose port records and leftover temporary files. Files in the state directory that Porch didn't create are kept and listed.
+- Apps get `node_modules/.bin` directories on their PATH only from inside the project (up to the workspace or Git root, or your home directory), no longer from every directory up to `/` or `C:\`, where another user could plant a `node`. On macOS and Linux, directories owned by another user are skipped.
+- With `HOME` unset, Porch finds your home directory in the user database instead of using `.porch` in the current directory, and stops with an error if it can't.
+- `porch workspace` and the "no dev script" error escape control characters in script names and commands from `package.json` and `porch.json`, so a repository can't send terminal escape sequences.
+
+### Fixed
+- Launch options before `--name` (`-d`, `--detach`, `--private`, `--prefix=…`, `--app-port=…`, `--framework`, `--state-dir`) no longer make Porch treat the command as the app's name, and `porch --private -- --filter=web` passes `--filter=web` to the dev script. `porch web --name api …` is refused instead of quietly ignoring `--name`.
+- On/off environment variables (`PORCH_PRIVATE`, `PORCH_HTTPS`, `PORCH_LAN`, `PORCH_CLEAN_URLS` and the rest) all accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off` in any case. Anything else is an error; `PORCH_PRIVATE=yes` used to mean off.
+- Fields that a newer Porch adds to `state.json` and `proxy.json` are kept when this version rewrites them. Versions up to 0.5.2 drop them, which turned private apps shared and `--upstream https` aliases back into plain HTTP when an older `porch` was still running.
+
 ## 0.5.2 (2026-11-14)
 
 ### Fixed

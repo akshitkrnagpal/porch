@@ -44,6 +44,17 @@ pub async fn run(fix: bool, yes: bool) -> Result<usize> {
     let interactive = crate::setup::interactive(yes);
     let settings = state::proxy_settings()?;
 
+    // Not a problem when chosen on purpose, so it doesn't fail doctor; but say
+    // it plainly, since it exposes every app to the network.
+    if let Some(warning) = cli::lan_warning(&settings) {
+        use crate::style::{self, Stream::Stdout};
+        println!(
+            "\n{} {}",
+            style::yellow(Stdout, "!"),
+            style::yellow(Stdout, &warning)
+        );
+    }
+
     // Hosts sync on a high port is the legacy split-setting path that produced
     // hosts-sync 403s; high ports imply no-sudo mode.
     if !settings.unprivileged

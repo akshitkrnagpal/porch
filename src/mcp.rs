@@ -118,6 +118,7 @@ fn definition(n: &str) -> Value {
             "https",
             "noTls",
             "lan",
+            "noLan",
             "tld",
             "wildcard",
             "unprivileged",
@@ -266,6 +267,7 @@ async fn call(n: &str, a: &Value, p: &[String]) -> Result<Value> {
         ("force", "--force"),
         ("noTls", "--no-tls"),
         ("lan", "--lan"),
+        ("noLan", "--no-lan"),
         ("wildcard", "--wildcard"),
         ("unprivileged", "--unprivileged"),
         ("yes", "--yes"),
@@ -559,6 +561,7 @@ mod tests {
                 // saved settings an agent shouldn't change behind the user.
                 vec![
                     "foreground",
+                    "lan-temporary",
                     "skip-trust",
                     "ip",
                     "cert",

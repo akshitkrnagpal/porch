@@ -110,4 +110,4 @@ Porch's own error responses are JSON when the client doesn't ask for HTML: `{"er
 - Don't hardcode `localhost:3000`-style ports in code, tests or env files. Use `PORCH_URL` or `porch get`.
 - Don't kill processes by port. Use Ctrl-C on the launcher, `porch prune --force` or `porch doctor --fix`.
 - Don't use `--force` on a name you didn't start without asking.
-- Don't run `porch clean` unless asked: it removes trust, services, hosts entries and all state.
+- Don't run `porch clean` unless asked: it removes trust, services, hosts entries, pairing with other machines and all state.
