@@ -579,32 +579,46 @@ pub fn process_owned(pid: u32) -> bool {
 }
 
 /// Identify surviving members even when an orphaned group's original leader exited.
+///
+/// Apps start in their own session (`setsid`), so every genuine member's
+/// session id is the group id: a process can't join a group in another
+/// session. Without the leader, its recorded start time still has to fit:
+/// it must be from this boot, and no member can be older than its leader.
+/// Together these keep a route recorded before a reboot, or before the group
+/// id was reused, from matching someone else's processes.
 pub fn group_matches(group: u32, started: Option<&str>) -> bool {
     #[cfg(unix)]
     {
-        let Ok(out) = std::process::Command::new("ps")
-            .args(["-axo", "pid=,pgid=,stat="])
-            .output()
-        else {
+        let Some(members) = crate::process::group_members(group) else {
             return false;
         };
-        let members: Vec<u32> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|line| {
-                let mut p = line.split_whitespace();
-                let pid = p.next()?.parse().ok()?;
-                let pgid: u32 = p.next()?.parse().ok()?;
-                let status = p.next()?;
-                (pgid == group && !status.starts_with('Z')).then_some(pid)
-            })
-            .collect();
         if members.is_empty() || members.iter().any(|pid| !process_owned(*pid)) {
             return false;
         }
         if members.contains(&group) {
             return identity(group).is_some_and(|i| Some(i.started.as_str()) == started);
         }
-        true
+        if members
+            .iter()
+            .any(|pid| crate::process::session(*pid) != Some(group))
+        {
+            return false;
+        }
+        let Some(started) = started else {
+            return false;
+        };
+        if crate::process::started_this_boot(started) == Some(false) {
+            return false;
+        }
+        match crate::process::start_key(started) {
+            Some(leader) => members.iter().all(|pid| {
+                identity(*pid)
+                    .and_then(|i| crate::process::start_key(&i.started))
+                    // Exited since the listing: no longer a member.
+                    .is_none_or(|member| member >= leader)
+            }),
+            None => true,
+        }
     }
     #[cfg(windows)]
     {

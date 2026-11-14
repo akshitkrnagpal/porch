@@ -14,8 +14,8 @@ The executable is `porch`. Configuration lives in `porch.json` or the `porch` ke
 | `porch --name NAME COMMAND...` | Same, for names that clash with a subcommand |
 | `porch NAME --app-port 4500 -- COMMAND...` | Uses a fixed app port; `--` ends Porch's options |
 | `porch NAME --force COMMAND...` | Takes over an existing route and stops the app that owned it |
-| `porch run --detach COMMAND...` (`-d`) | Runs in the background: returns once the app answers and prints its URL. Output goes to `STATE_DIR/logs/NAME.log` |
-| `porch logs NAME [--follow] [--lines N]` | Shows a background app's output |
+| `porch run --detach COMMAND...` (`-d`) | Runs in the background: returns once the app answers and prints its URL. Output goes to `STATE_DIR/logs/NAME.log`; the previous run's output is kept as `NAME.log.1`, a log over 10 MB moves to `NAME.log.1`, and logs of apps stopped more than 14 days ago are deleted |
+| `porch logs NAME [--follow] [--lines N]` | Shows a background app's output. `--lines N` reads only the end of the log; invalid UTF-8 shows as `�` |
 | `porch stop NAME` | Stops an app Porch started, here or in another terminal, with its whole process tree |
 | `porch setup [--yes] [--port N] [--https\|--no-https]` | Guided first run; safe to repeat, and current values are the defaults |
 | `porch doctor [--fix] [--yes]` | Diagnoses problems; `--fix` applies the safe fixes |
@@ -24,7 +24,7 @@ Launch options are `--name`, `--script`, `--prefix`, `--app-port`, `--force`, `-
 
 A launch starts the proxy if needed and waits for it to accept connections before starting the app. It then waits up to `PORCH_LISTEN_TIMEOUT` seconds (default 15, `0` disables) for something to accept TCP on the assigned port. If nothing does, Porch prints a warning and leaves the app running. If a process in the app's tree is listening on another port, the warning names it (`app is listening on 4321 instead`) and suggests `porch run --app-port 4321 COMMAND`. Porch never reroutes on its own. Unless you pick one, app ports come from 4000–4999 (set `PORCH_APP_PORTS=START-END` for another range), starting at a random port and skipping 4045 and 4190, which browsers block. A fixed port must be free and not reserved by another route.
 
-Porch exits with the child's exit code. On Unix, each child leads its own process group, so signals and cleanup reach its descendants. Route ownership records store each process's start time as well as its PID, so a reused PID isn't mistaken for the original app. When a command exits successfully but leaves a daemon it started listening, the route moves to that daemon. `porch prune --force` removes orphaned routes and stops the processes they own.
+Porch exits with the child's exit code. On Unix, each child leads its own process group, so signals and cleanup reach its descendants. Route ownership records store each process's start time as well as its PID, so a reused PID isn't mistaken for the original app. When a command exits successfully but leaves a daemon it started listening, the route moves to that daemon. Porch only takes on a daemon the command started: one still in its process group or below it, or one that started after it. A server that was already running and was only asked to listen (`docker run -p` with Docker Desktop, `pm2 start` with its daemon up) is left alone, and the route ends. A daemon outside the command's process group is recorded and stopped on its own, never with the group it is in. When an app exits, what is left of its process group gets SIGTERM and up to 3 seconds to exit before SIGKILL. `porch prune --force` removes orphaned routes and stops the processes they own.
 
 On Windows, each child gets its own console process group and receives Ctrl+Break from its launcher. Porch's own processes (proxy, discovery agent, launchers) stop when asked through a named event and are force-ended only as a fallback. Job Objects make sure a whole process tree ends together.
 
@@ -145,7 +145,7 @@ On/off variables take `1`, `true`, `yes` or `on`, and `0`, `false`, `no` or `off
 
 `PORCH=0` or `PORTLESS=0` (also `false` or `skip`) turns Porch off for a run. The command runs as normal with its inherited environment and no assigned port or URL.
 
-Porch sets these variables for the app: `PORT`, `HOST`, `PORCH_URL`, `NODE_EXTRA_CA_CERTS` (the local CA), `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS` (the configured domains), and when sharing, `PORCH_TAILSCALE_URL`, `PORCH_NGROK_URL` or `PORCH_CLOUDFLARE_URL`. The matching `PORTLESS_*` names are set too, for apps that read them. Expo in LAN mode gets no `HOST`. Other internal variables are not configuration and may change.
+Porch sets these variables for the app: `PORT`, `HOST`, `PORCH_URL`, `NODE_EXTRA_CA_CERTS` (the local CA; if it was already set, a bundle in the state directory with both that file's certificates and the local CA), `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS` (the configured domains), and when sharing, `PORCH_TAILSCALE_URL`, `PORCH_NGROK_URL` or `PORCH_CLOUDFLARE_URL`. The matching `PORTLESS_*` names are set too, for apps that read them. Expo in LAN mode gets no `HOST`. Other internal variables are not configuration and may change.
 
 ## HTTPS and trust
 
@@ -181,7 +181,7 @@ Porch issues certificates only for configured TLDs, registered route names and, 
 
 1. **HTTPS** (default no). Keeps the proxy port and adds a local CA to your user's trust store, without sudo.
 2. **URLs without a port** (offered when this OS allows port 80/443 without sudo), otherwise the **proxy port** (default 7462, for HTTP and HTTPS). If the port is busy, Porch names the process using it and offers the next free port.
-3. **Start at login.** Installs or removes the `porch service` entry, which asks for sudo. If sharing is also on, discovery starts at login too (`porch discovery autostart`, per user, no sudo).
+3. **Start at login.** Installs or removes the `porch service` entry, which asks for sudo. The default answer is whether the service is installed. If sharing is also on, discovery starts at login too (`porch discovery autostart`, per user, no sudo). Discovery's own login item is only removed when you turn start at login off here.
 4. **Share with your other machines.** Turns sharing on or off on this machine's private address. Other machines still have to pair.
 
 Setup then saves the settings, starts or restarts the proxy, and prints a short summary and the next command to run. `--yes`, or input that isn't a terminal, accepts every default. `--port`, `--https` and `--no-https` answer those questions in advance.

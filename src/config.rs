@@ -212,12 +212,20 @@ fn branch_prefix(branch: &str, style: &str) -> Option<String> {
     (!p.is_empty()).then_some(p)
 }
 pub fn detect_worktree_prefix(cwd: &Path, style: &str) -> Option<String> {
-    if let Some(p) =
-        std::env::var_os("PORCH_PREFIX").or_else(|| std::env::var_os("PORTLESS_PREFIX"))
-    {
-        let p = sanitize_for_hostname(&p.to_string_lossy());
-        return (!p.is_empty()).then_some(p);
+    if let Some(p) = env_prefix() {
+        return p;
     }
+    branch_prefix(&worktree_branch(cwd)?, style)
+}
+/// `PORCH_PREFIX` (or `PORTLESS_PREFIX`), sanitized, when set.
+fn env_prefix() -> Option<Option<String>> {
+    let p = std::env::var_os("PORCH_PREFIX").or_else(|| std::env::var_os("PORTLESS_PREFIX"))?;
+    let p = sanitize_for_hostname(&p.to_string_lossy());
+    Some((!p.is_empty()).then_some(p))
+}
+/// The branch checked out in `cwd` when it is a linked Git worktree (not the
+/// main checkout). Runs up to four `git` commands.
+fn worktree_branch(cwd: &Path) -> Option<String> {
     if let Some(list) = git(cwd, &["worktree", "list", "--porcelain"]) {
         if list.lines().filter(|l| l.starts_with("worktree ")).count() <= 1 {
             return None;
@@ -230,9 +238,7 @@ pub fn detect_worktree_prefix(cwd: &Path, style: &str) -> Option<String> {
                 return None;
             }
         }
-        if let Some(b) = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]) {
-            return branch_prefix(&b, style);
-        }
+        return git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
     }
     for d in cwd.ancestors() {
         let p = d.join(".git");
@@ -250,10 +256,36 @@ pub fn detect_worktree_prefix(cwd: &Path, style: &str) -> Option<String> {
                 return None;
             }
             let head = fs::read_to_string(d.join(t).join("HEAD")).ok()?;
-            return branch_prefix(head.trim().strip_prefix("ref: refs/heads/")?, style);
+            return Some(head.trim().strip_prefix("ref: refs/heads/")?.to_owned());
         }
     }
     None
+}
+/// Worktree branches already looked up during one launch, by the checkout
+/// (the nearest directory with a `.git`) they belong to. A workspace's
+/// packages share one checkout, so its `git` commands run once, not once per
+/// package.
+#[derive(Default)]
+struct Branches(std::collections::HashMap<Option<PathBuf>, Option<String>>);
+impl Branches {
+    fn prefix(&mut self, cwd: &Path, style: &str) -> Option<String> {
+        if let Some(p) = env_prefix() {
+            return p;
+        }
+        let checkout = cwd
+            .ancestors()
+            .find(|d| d.join(".git").exists())
+            .map(Path::to_path_buf);
+        let branch = match self.0.get(&checkout) {
+            Some(branch) => branch.clone(),
+            None => {
+                let branch = worktree_branch(cwd);
+                self.0.insert(checkout, branch.clone());
+                branch
+            }
+        };
+        branch_prefix(&branch?, style)
+    }
 }
 /// Root worktree defaults survive app overrides. Per-app root fields only apply
 /// in the configuration directory; descendants inherit only a matching apps entry.
@@ -756,7 +788,7 @@ fn canonical_cwd(cwd: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// A fully resolved app invocation. The lifecycle owner reserves the port and starts it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LaunchPlan {
     pub cwd: PathBuf,
     pub name: String,
@@ -786,7 +818,12 @@ fn merge_config(base: &Value, leaf: &Value) -> Value {
 pub fn effective_config(cwd: &Path) -> Result<Value> {
     let root = find_workspace_root(cwd).unwrap_or_else(|| cwd.to_owned());
     let config = load(&root)?;
-    let root_app = resolve_app_config(&config, &root, cwd);
+    effective_config_in(&root, &config, cwd)
+}
+/// [`effective_config`] for `cwd` inside workspace `root`, whose own
+/// configuration `config` is already loaded.
+fn effective_config_in(root: &Path, config: &Value, cwd: &Path) -> Result<Value> {
+    let root_app = resolve_app_config(config, root, cwd);
     let leaf = if root != cwd { load(cwd)? } else { json!({}) };
     let leaf = resolve_app_config(&leaf, cwd, cwd);
     let out = merge_config(&root_app, &leaf);
@@ -795,9 +832,25 @@ pub fn effective_config(cwd: &Path) -> Result<Value> {
 }
 
 pub fn configured_name(cwd: &Path, base: &str, prefix: Option<&str>) -> Result<String> {
-    let effective = effective_config(cwd)?;
+    named(
+        cwd,
+        &effective_config(cwd)?,
+        base,
+        prefix,
+        &mut Branches::default(),
+    )
+}
+/// [`configured_name`] with the app's effective configuration already
+/// resolved and worktree branches shared across one launch's apps.
+fn named(
+    cwd: &Path,
+    effective: &Value,
+    base: &str,
+    prefix: Option<&str>,
+    branches: &mut Branches,
+) -> Result<String> {
     let worktree = prefix.map(sanitize_for_hostname).or_else(|| {
-        detect_worktree_prefix(
+        branches.prefix(
             cwd,
             effective["worktree"]["prefix"]
                 .as_str()
@@ -894,14 +947,33 @@ pub fn launch_plans(
     let root = find_workspace_root(&cwd);
     let config = effective_config(&cwd)?;
     let env_port = env_app_port()?;
+    // Each is worked out at most once per launch, and only when needed.
+    let mut branches = Branches::default();
+    let mut workspace: Option<(PathBuf, Vec<WorkspacePackage>)> = None;
+    let mut packages_of = |root: &Path| -> Vec<WorkspacePackage> {
+        match &workspace {
+            Some((r, packages)) if r == root => packages.clone(),
+            _ => {
+                let packages = discover_workspace_packages(root);
+                workspace = Some((root.to_owned(), packages.clone()));
+                packages
+            }
+        }
+    };
     if command.is_none() && name.is_none() && root.as_deref() == Some(cwd.as_path()) {
         let root_config = load(&cwd)?;
         let default_script = script.or(root_config["script"].as_str()).unwrap_or("dev");
-        let packages = discover_workspace_packages(&cwd);
+        let packages = packages_of(&cwd);
         let project = workspace_project_name(&cwd, &packages)?;
         let mut plans = Vec::new();
         for pkg in &packages {
-            let app = effective_config(&pkg.dir)?;
+            // The root configuration is already loaded; a package that is a
+            // workspace of its own resolves from its own root.
+            let app = if find_workspace_root(&pkg.dir).as_deref() == Some(cwd.as_path()) {
+                effective_config_in(&cwd, &root_config, &pkg.dir)?
+            } else {
+                effective_config(&pkg.dir)?
+            };
             let target_script = script.or(app["script"].as_str()).unwrap_or(default_script);
             let Some(raw) = resolve_script_raw(target_script, &pkg.dir) else {
                 continue;
@@ -910,7 +982,7 @@ pub fn launch_plans(
             let base = app["name"].as_str().unwrap_or(&inferred);
             plans.push(LaunchPlan {
                 cwd: pkg.dir.clone(),
-                name: configured_name(&pkg.dir, base, prefix)?,
+                name: named(&pkg.dir, &app, base, prefix, &mut branches)?,
                 command: resolve_script_command(target_script, &pkg.dir)
                     .context("workspace script disappeared")?,
                 app_port: env_port.or_else(|| app["appPort"].as_u64().map(|p| p as u16)),
@@ -930,21 +1002,22 @@ pub fn launch_plans(
             return Ok(plans);
         }
     }
-    let inferred = if let Some(root) = root.as_deref().filter(|root| *root != cwd) {
-        let packages = discover_workspace_packages(root);
-        if let Some(pkg) = packages.iter().find(|pkg| cwd.starts_with(&pkg.dir)) {
-            let project = workspace_project_name(root, &packages)?;
-            workspace_package_name(root, pkg, &project)
-        } else {
-            infer_name(&cwd)?
+    let base = match name.or(config["name"].as_str()) {
+        Some(base) => base.to_owned(),
+        None => {
+            if let Some(root) = root.as_deref().filter(|root| *root != cwd) {
+                let packages = packages_of(root);
+                if let Some(pkg) = packages.iter().find(|pkg| cwd.starts_with(&pkg.dir)) {
+                    let project = workspace_project_name(root, &packages)?;
+                    workspace_package_name(root, pkg, &project)
+                } else {
+                    infer_name(&cwd)?
+                }
+            } else {
+                infer_name(&cwd)?
+            }
         }
-    } else {
-        infer_name(&cwd)?
     };
-    let base = name
-        .map(str::to_owned)
-        .or_else(|| config["name"].as_str().map(str::to_owned))
-        .unwrap_or(inferred);
     let script = script.or(config["script"].as_str()).unwrap_or("dev");
     let command = match command {
         Some(c) if !c.is_empty() => c,
@@ -977,8 +1050,8 @@ pub fn launch_plans(
         })?,
     };
     if root.as_deref() == Some(cwd.as_path())
-        && discover_workspace_packages(&cwd).len() > 1
         && runs_workspace_graph(&command, &cwd)
+        && packages_of(&cwd).len() > 1
     {
         bail!(
             "an explicit workspace Turbo command can start multiple apps with one PORT; \
@@ -988,7 +1061,7 @@ pub fn launch_plans(
     }
     Ok(vec![LaunchPlan {
         cwd: cwd.clone(),
-        name: configured_name(&cwd, &base, prefix)?,
+        name: named(&cwd, &config, &base, prefix, &mut branches)?,
         command,
         app_port: env_port.or_else(|| config["appPort"].as_u64().map(|p| p as u16)),
         proxy: config["proxy"].as_bool().unwrap_or(true),

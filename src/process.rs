@@ -156,6 +156,31 @@ impl TreeGuard {
         Ok(())
     }
 
+    /// Stop what is left of the tree: ask the group to exit (SIGTERM), give
+    /// it up to `grace` to finish, then drop the guard (SIGKILL whatever
+    /// remains). A server behind a package-manager wrapper gets time to clean
+    /// up after the wrapper exits.
+    ///
+    /// Call it while the launched command is still unreaped (see `wait_exit`).
+    pub async fn terminate(self, grace: std::time::Duration) {
+        #[cfg(unix)]
+        if self.group > 0 && unreaped(self.group) {
+            unsafe { libc::kill(-self.group, libc::SIGTERM) };
+            let group = self.group as u32;
+            let deadline = tokio::time::Instant::now() + grace;
+            let mut delay = std::time::Duration::from_millis(10);
+            while tokio::time::Instant::now() < deadline
+                && group_members(group).is_some_and(|m| !m.is_empty())
+            {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_millis(200));
+            }
+        }
+        #[cfg(windows)]
+        let _ = grace;
+        drop(self);
+    }
+
     pub fn new(child: &Child) -> Result<Self> {
         #[cfg(unix)]
         {
@@ -421,6 +446,260 @@ pub fn resolve_program(program: &str, paths: &std::ffi::OsStr) -> std::ffi::OsSt
         let _ = paths;
         program.into()
     }
+}
+
+/// Live (not zombie) members of process group `group`.
+///
+/// Linux reads `/proc` and macOS asks the kernel for the group's members, so
+/// polling this in a wait loop never spawns a process. `None` when the
+/// process table can't be read.
+#[cfg(unix)]
+pub fn group_members(group: u32) -> Option<Vec<u32>> {
+    if group == 0 || group > i32::MAX as u32 {
+        return Some(Vec::new());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut members = Vec::new();
+        for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Some(fields) = linux_stat(pid) else {
+                continue;
+            };
+            // Fields after the command: state, ppid, pgrp, session, ...
+            if !matches!(fields.first().map(String::as_str), Some("Z" | "X"))
+                && fields.get(2).and_then(|g| g.parse::<u32>().ok()) == Some(group)
+            {
+                members.push(pid);
+            }
+        }
+        Some(members)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        const PROC_PGRP_ONLY: u32 = 2;
+        let size = std::mem::size_of::<libc::pid_t>();
+        let mut pids: Vec<libc::pid_t> = vec![0; 64];
+        loop {
+            let bytes = (pids.len() * size) as libc::c_int;
+            let n = unsafe {
+                libc::proc_listpids(PROC_PGRP_ONLY, group, pids.as_mut_ptr().cast(), bytes)
+            };
+            if n < 0 {
+                return None;
+            }
+            let count = n as usize / size;
+            if count < pids.len() {
+                pids.truncate(count);
+                break;
+            }
+            // A full buffer may have cut the list short.
+            pids.resize(pids.len() * 2, 0);
+        }
+        Some(
+            pids.into_iter()
+                .filter(|p| *p > 0)
+                .map(|p| p as u32)
+                // `identity` is None for zombies and processes that just exited.
+                .filter(|p| crate::state::identity(*p).is_some())
+                .collect(),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-axo", "pid=,pgid=,stat="])
+            .output()
+            .ok()?;
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let mut p = line.split_whitespace();
+                    let pid = p.next()?.parse().ok()?;
+                    let pgid: u32 = p.next()?.parse().ok()?;
+                    let status = p.next()?;
+                    (pgid == group && !status.starts_with('Z')).then_some(pid)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The fields of `/proc/PID/stat` after the command name.
+#[cfg(target_os = "linux")]
+fn linux_stat(pid: u32) -> Option<Vec<String>> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    Some(
+        stat.rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// The session `pid` belongs to.
+#[cfg(unix)]
+pub fn session(pid: u32) -> Option<u32> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    let sid = unsafe { libc::getsid(pid as libc::pid_t) };
+    (sid > 0).then_some(sid as u32)
+}
+
+/// The parent of `pid`.
+#[cfg(unix)]
+fn parent(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_stat(pid)?.get(1)?.parse().ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as i32,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        (n == size).then(|| unsafe { info.assume_init() }.pbi_ppid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "ppid=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+}
+
+/// A start time recorded by [`crate::state::identity`] as a comparable key:
+/// seconds and microseconds on macOS, clock ticks since boot on Linux, a
+/// FILETIME on Windows. `None` for formats that don't compare (`ps lstart`).
+pub fn start_key(started: &str) -> Option<(u64, u64)> {
+    match started.split_once(':') {
+        Some((secs, micros)) => Some((secs.parse().ok()?, micros.parse().ok()?)),
+        None => Some((started.parse().ok()?, 0)),
+    }
+}
+
+/// Whether a process that started at `started` may have started during the
+/// current boot. `None` when the platform can't tell.
+///
+/// A route recorded before a reboot names process ids that now belong to
+/// whatever happens to run with them.
+pub fn started_this_boot(started: &str) -> Option<bool> {
+    let (value, _) = start_key(started)?;
+    #[cfg(target_os = "macos")]
+    {
+        let mut boot = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut size = std::mem::size_of::<libc::timeval>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+        let ok = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut boot as *mut libc::timeval).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+        // Seconds since the epoch; allow for the boot time's own rounding.
+        (ok && boot.tv_sec > 0).then(|| value + 1 >= boot.tv_sec as u64)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Clock ticks since boot: a start later than the current uptime
+        // belongs to an earlier boot.
+        let uptime: f64 = std::fs::read_to_string("/proc/uptime")
+            .ok()?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        (hz > 0).then_some(value as f64 <= (uptime + 1.0) * hz as f64)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = value;
+        None
+    }
+}
+
+/// How a launcher may take on the listener that answers on its app port
+/// after the launched command exited successfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Adoption {
+    /// The listener is still in the launched command's own process group,
+    /// which the route keeps owning.
+    Group,
+    /// A server the launched command started outside its group (a daemon
+    /// that called `setsid`). Only that process is recorded and signalled,
+    /// never the group it is in.
+    Process,
+}
+
+/// Whether the launched command `child` (started at `child_started`) started
+/// `listener`.
+///
+/// A command can also exit 0 after asking a server that was already running
+/// to listen on the port (`docker run -p` with Docker Desktop, `pm2 start`
+/// with its daemon up). That server isn't the app's and is never adopted:
+/// stopping the route would stop it, and everything else it runs.
+pub fn adoption(listener: u32, child: u32, child_started: Option<&str>) -> Option<Adoption> {
+    if listener == 0 || listener == child {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let pgid = unsafe { libc::getpgid(listener as libc::pid_t) };
+        if pgid > 0 && pgid as u32 == child {
+            return Some(Adoption::Group);
+        }
+        // The launched command's session: it called setsid, so its session
+        // id is its pid.
+        if session(listener) == Some(child) {
+            return Some(Adoption::Process);
+        }
+        // Still below the launched command in the process tree.
+        let mut pid = listener;
+        for _ in 0..64 {
+            match parent(pid) {
+                Some(p) if p == child => return Some(Adoption::Process),
+                Some(p) if p > 1 && p != pid => pid = p,
+                _ => break,
+            }
+        }
+    }
+    // A daemon that detached and was reparented: it can only be the app's if
+    // it started after the launched command did.
+    let listener_started = crate::state::identity(listener)?.started;
+    let (Some(listener_started), Some(child_started)) = (
+        start_key(&listener_started),
+        child_started.and_then(start_key),
+    ) else {
+        return None;
+    };
+    (listener_started >= child_started).then_some(Adoption::Process)
 }
 
 /// Find a TCP listener belonging to the state directory's user. The caller must
@@ -730,6 +1009,114 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "porch-process-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn terminate_gives_survivors_time_to_clean_up_before_sigkill() {
+        // The leader (a package-manager wrapper) exits at once; the server it
+        // started needs a moment after SIGTERM to clean up.
+        let dir = scratch("grace");
+        let done = dir.join("cleaned");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "(trap 'sleep 0.3; echo ok > \"$1\"; exit 0' TERM; echo ready; while :; do sleep 0.05; done) & read _",
+                "sh",
+            ])
+            .arg(&done)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        configure(&mut command);
+        let mut child = command.spawn().unwrap();
+        let guard = TreeGuard::new(&child).unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        drop(child.stdin.take());
+        wait_exit(&mut child).await.unwrap();
+        guard.terminate(Duration::from_secs(5)).await;
+        child.wait().await.unwrap();
+        let cleaned = done.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            cleaned,
+            "the survivor was killed before it finished cleaning up"
+        );
+    }
+
+    /// A recorded start time that can only be from an earlier boot: one
+    /// second after 1970 on macOS (seconds since the epoch); on Linux (clock
+    /// ticks since boot), far more ticks than this machine has been up.
+    fn previous_boot_start() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "1:0"
+        } else {
+            "18446744073709551"
+        }
+    }
+
+    #[test]
+    fn start_times_from_an_earlier_boot_never_match() {
+        let me = crate::state::identity(std::process::id()).unwrap();
+        assert!(start_key(&me.started).is_some());
+        assert_ne!(started_this_boot(&me.started), Some(false));
+        let ancient = previous_boot_start();
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert_eq!(started_this_boot(ancient), Some(false));
+        }
+    }
+
+    /// An orphaned group (leader gone, members alive) is a route's only when
+    /// its members are in the session the launch created.
+    #[tokio::test]
+    async fn orphaned_group_matches_only_inside_its_own_session() {
+        for own_session in [true, false] {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "sleep 30 & echo $!; read _"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            if own_session {
+                configure(&mut command);
+            } else {
+                // A new group inside the test's session, as a shell's job
+                // control would create, not the session Porch's apps get.
+                command.process_group(0);
+            }
+            let mut child = command.spawn().unwrap();
+            let leader = child.id().unwrap();
+            let started = crate::state::identity(leader).unwrap().started;
+            let mut line = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            let member: u32 = line.trim().parse().unwrap();
+            drop(child.stdin.take());
+            child.wait().await.unwrap();
+            let matched = crate::state::group_matches(leader, Some(&started));
+            let other_start = crate::state::group_matches(leader, Some(previous_boot_start()));
+            unsafe { libc::kill(member as i32, libc::SIGKILL) };
+            assert_eq!(matched, own_session, "own session: {own_session}");
+            assert!(
+                !other_start,
+                "matched a leader start time from another boot"
+            );
+        }
     }
 
     #[tokio::test]

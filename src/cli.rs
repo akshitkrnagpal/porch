@@ -1115,6 +1115,7 @@ async fn foreground(s: ProxySettings) -> Result<()> {
     state::atomic_write("proxy.version", PROXY_VERSION.as_bytes())?;
     crate::health::reconcile_quietly();
     let cleanup = tokio::spawn(crate::health::reconcile_forever(Duration::from_secs(5)));
+    let _log_cap = cap_log_forever(state::dir().join("proxy.log"));
     let result = tokio::select! {r=crate::proxy::serve_config(s)=>r,s=signals.recv()=>{s?;Ok(())}};
     cleanup.abort();
     result
@@ -1145,15 +1146,8 @@ pub(crate) async fn restart_outdated_proxy() -> Result<bool> {
     if !proxy_outdated() {
         return Ok(false);
     }
-    let settings = state::proxy_settings()?;
-    eprintln!(
-        "Restarting the Porch proxy: it runs {}, this porch is {PROXY_VERSION}. Routes are kept.",
-        running_proxy_version().unwrap_or_else(|| "an older version".into())
-    );
-    stop_proxy()
-        .await
-        .context("could not stop the outdated proxy; run `porch proxy stop` and retry")?;
-    Box::pin(start_proxy(settings, true, true)).await?;
+    // Starting re-checks under the startup lock and restarts it there.
+    start_proxy(state::proxy_settings()?, true, true).await?;
     Ok(true)
 }
 /// A busy proxy port: move to the next free port unless the user chose this one.
@@ -1268,15 +1262,29 @@ fn authenticate_sudo(interactive: bool, port: u16) -> Result<()> {
 }
 pub(crate) async fn start_proxy(
     mut s: ProxySettings,
-    skip_trust: bool,
-    port_explicit: bool,
+    mut skip_trust: bool,
+    mut port_explicit: bool,
 ) -> Result<()> {
     // Starting clears a deliberate stop, so launchers watch over it again.
     let _ = fs::remove_file(state::dir().join("proxy.stopped"));
-    if restart_outdated_proxy().await? {
-        return Ok(());
+    let mut startup = startup_lock().await?;
+    // Checked under the lock: two commands that start together after an
+    // update must not both stop the proxy, the second stopping the one the
+    // first just started.
+    if proxy_outdated() {
+        eprintln!(
+            "Restarting the Porch proxy: it runs {}, this porch is {PROXY_VERSION}. Routes are kept.",
+            running_proxy_version().unwrap_or_else(|| "an older version".into())
+        );
+        let saved = state::proxy_settings()?;
+        startup = stop_proxy_locked(startup)
+            .await
+            .context("could not stop the outdated proxy; run `porch proxy stop` and retry")?;
+        // The restarted proxy keeps its saved settings.
+        s = saved;
+        skip_trust = true;
+        port_explicit = true;
     }
-    let _startup = startup_lock().await?;
     if proxy_running() {
         let actual = state::proxy_settings()?;
         // Privilege mode is derived from the port; it alone never blocks reuse.
@@ -1290,6 +1298,7 @@ pub(crate) async fn start_proxy(
                 actual.url("<name>")
             )
         }
+        startup_phase(None);
         trust_if_needed(&s, skip_trust).await?;
         return Ok(());
     }
@@ -1303,6 +1312,7 @@ pub(crate) async fn start_proxy(
         }
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             let port = s.port;
+            startup_phase(Some(Duration::from_secs(80)));
             let released = tokio::task::spawn_blocking(move || {
                 crate::ports::wait_released(port, Duration::from_secs(60))
             })
@@ -1371,10 +1381,12 @@ pub(crate) async fn start_proxy(
             )
         }
         use std::io::IsTerminal;
-        authenticate_sudo(
-            std::io::stdin().is_terminal() && std::env::var_os("CI").is_none(),
-            privileged_port,
-        )?;
+        let interactive = std::io::stdin().is_terminal() && std::env::var_os("CI").is_none();
+        if interactive {
+            startup_phase(None);
+        }
+        authenticate_sudo(interactive, privileged_port)?;
+        startup_phase(Some(Duration::from_secs(20)));
         elevated = true;
     }
     state::load()?;
@@ -1386,13 +1398,14 @@ pub(crate) async fn start_proxy(
         use std::os::unix::fs::OpenOptionsExt;
         log_options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
+    let _ = cap_log(&state::dir().join("proxy.log"), LOG_CAP);
     let log = log_options.open(state::dir().join("proxy.log"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         log.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    let exe = std::env::current_exe()?;
+    let exe = porch_exe()?;
     let mut c = if elevated {
         let mut c = Command::new("sudo");
         c.args(["-n", "env"])
@@ -1436,24 +1449,24 @@ pub(crate) async fn start_proxy(
             if proxy_running() {
                 break;
             }
+            let log = state::dir().join("proxy.log");
             bail!(
-                "proxy exited {status}: {}",
-                fs::read_to_string(state::dir().join("proxy.log")).unwrap_or_default()
+                "proxy exited {status}; see {}:\n{}",
+                log.display(),
+                log_tail(&log, 20).trim_end()
             )
         }
         if tokio::time::Instant::now() >= deadline {
             let _ = child.kill();
             let log = state::dir().join("proxy.log");
-            let text = fs::read_to_string(&log).unwrap_or_default();
-            let tail: Vec<&str> = text.lines().rev().take(20).collect();
-            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            let tail = log_tail(&log, 20);
             bail!(
                 "proxy readiness timed out; see {}{}",
                 log.display(),
                 if tail.is_empty() {
                     " (empty)".to_owned()
                 } else {
-                    format!(":\n{}", tail.join("\n"))
+                    format!(":\n{}", tail.trim_end())
                 }
             )
         }
@@ -1469,7 +1482,9 @@ pub(crate) async fn start_proxy(
             )
         )
     );
+    startup_phase(None);
     trust_if_needed(&s, skip_trust).await?;
+    drop(startup);
     Ok(())
 }
 async fn trust_if_needed(s: &ProxySettings, skip: bool) -> Result<()> {
@@ -1503,7 +1518,11 @@ async fn ensure_proxy() -> Result<ProxySettings> {
     state::proxy_settings()
 }
 pub(crate) async fn stop_proxy() -> Result<()> {
-    let _startup = startup_lock().await?;
+    stop_proxy_locked(startup_lock().await?).await?;
+    Ok(())
+}
+/// Stop the proxy while holding the startup lock, and hand the lock back.
+async fn stop_proxy_locked(startup: fs::File) -> Result<fs::File> {
     // Tell running launchers this stop is deliberate, so they don't restart it.
     let _ = state::atomic_write("proxy.stopped", b"1\n");
     if let Some(i) = proxy_identity() {
@@ -1512,12 +1531,13 @@ pub(crate) async fn stop_proxy() -> Result<()> {
             if unsafe { libc::kill(i.pid as i32, 15) } != 0
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
             {
-                drop(_startup);
+                // The elevated `porch proxy stop` takes the lock itself.
+                drop(startup);
                 let code = elevate(&["proxy".into(), "stop".into()]).await?;
                 if code != 0 {
                     bail!("elevated proxy stop exited {code}")
                 }
-                return Ok(());
+                return startup_lock().await;
             }
             #[cfg(not(unix))]
             signal_pid(i.pid, 15);
@@ -1563,7 +1583,7 @@ pub(crate) async fn stop_proxy() -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(())
+    Ok(startup)
 }
 fn signal_pid(pid: u32, signal: i32) {
     if pid == 0 || pid > i32::MAX as u32 {
@@ -1988,6 +2008,18 @@ fn kill_route(s: &state::State, name: &str, signal: i32) -> Result<()> {
     }
     Ok(())
 }
+/// Sleeps for wait loops that poll process state: quick at first, when a
+/// process that was asked to exit usually has, then backing off to 250 ms.
+struct Backoff(Duration);
+impl Backoff {
+    fn new() -> Self {
+        Self(Duration::from_millis(10))
+    }
+    async fn wait(&mut self) {
+        tokio::time::sleep(self.0).await;
+        self.0 = (self.0 * 2).min(Duration::from_millis(250));
+    }
+}
 async fn evict_conflicts(names: &[String], settings: &ProxySettings, force: bool) -> Result<()> {
     let s = state::load()?;
     let conflicts = conflicting_names(&s, names, settings);
@@ -2004,13 +2036,14 @@ async fn evict_conflicts(names: &[String], settings: &ProxySettings, force: bool
                 signal_pid(owner.pid, 15);
             }
             let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+            let mut poll = Backoff::new();
             while (state::matches(owner)
                 || owner
                     .child
                     .is_some_and(|pid| state::group_matches(pid, owner.child_started.as_deref())))
                 && tokio::time::Instant::now() < deadline
             {
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                poll.wait().await;
             }
             kill_route(&s, &n, 9)?;
             if state::matches(owner) && state::process_owned(owner.pid) {
@@ -2029,11 +2062,12 @@ async fn evict_conflicts(names: &[String], settings: &ProxySettings, force: bool
                     })
             };
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut poll = Backoff::new();
             while !gone() {
                 if tokio::time::Instant::now() >= deadline {
                     bail!("route {n}: its launcher or app did not exit after SIGKILL; retry once it has")
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                poll.wait().await;
             }
         }
     }
@@ -2090,10 +2124,11 @@ pub(crate) async fn prune(force: bool) -> Result<()> {
         if let Some(owner) = old.owners.get(&n) {
             if let Some(pid) = owner.child {
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                let mut poll = Backoff::new();
                 while state::group_matches(pid, owner.child_started.as_deref())
                     && tokio::time::Instant::now() < deadline
                 {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    poll.wait().await;
                 }
                 if state::group_matches(pid, owner.child_started.as_deref()) {
                     eprintln!("{n} has surviving processes; run porch prune --force");
@@ -2188,7 +2223,7 @@ fn reserve(
     let identity = state::identity(owner).context("cannot identify launcher")?;
     let name = normalize(&plan.name)?;
     let settings = state::proxy_settings()?;
-    let listener = state::transaction(|s| {
+    let mut listener = state::transaction(|s| {
         let conflicts = conflicting_names(s, std::slice::from_ref(&name), &settings);
         for n in conflicts {
             if let Some(r) = s.routes.iter().find(|r| r.name == n) {
@@ -2215,7 +2250,12 @@ fn reserve(
             app_port_candidates(range)?
                 .filter(|p| !used.contains(p))
                 .find_map(|p| {
-                    crate::sockets::reserve(p)
+                    // Every other porch command waits for this lock: skip a
+                    // busy port with a plain bind, never the owner lookup
+                    // (lsof or ss) and connection probes a failed
+                    // reservation makes to tell a listener from TIME_WAIT.
+                    crate::sockets::probe(p)
+                        .and_then(|()| crate::sockets::reserve(p))
                         .map_err(|e| last_error = Some(e))
                         .ok()
                 })
@@ -2245,6 +2285,10 @@ fn reserve(
         Ok(listener)
     })?;
     let port = listener.port()?;
+    // Until the app starts, the proxy gets "waiting for the app" at once.
+    if let Err(e) = listener.close_connections() {
+        eprintln!("porch: {e}");
+    }
     Ok((
         port,
         Lease {
@@ -2279,12 +2323,52 @@ fn child_env(port: u16, name: &str, s: &ProxySettings) -> BTreeMap<String, Strin
         e.insert("PORCH_LAN".into(), "1".into());
     }
     if s.tls && state::dir().join("ca.pem").is_file() {
+        let existing = std::env::var_os("NODE_EXTRA_CA_CERTS");
+        let bundle = extra_ca_certs(&state::dir(), existing.as_deref());
         e.insert(
             "NODE_EXTRA_CA_CERTS".into(),
-            state::dir().join("ca.pem").to_string_lossy().into(),
+            bundle.to_string_lossy().into(),
         );
     }
     e
+}
+/// The file for an app's `NODE_EXTRA_CA_CERTS`: Porch's CA, plus whatever the
+/// variable already named (a corporate CA, say), which Node would otherwise
+/// stop loading. The combined bundle is written to the state directory.
+fn extra_ca_certs(dir: &std::path::Path, existing: Option<&std::ffi::OsStr>) -> PathBuf {
+    let ours = dir.join("ca.pem");
+    let Some(theirs) = existing
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| *p != ours)
+    else {
+        return ours;
+    };
+    let combined = (|| -> Result<PathBuf> {
+        let mut bundle = fs::read(&theirs)
+            .with_context(|| format!("reading NODE_EXTRA_CA_CERTS {}", theirs.display()))?;
+        if !bundle.ends_with(b"\n") {
+            bundle.push(b'\n');
+        }
+        bundle.extend(fs::read(&ours)?);
+        // One bundle per existing file; the name only needs to be stable.
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        theirs.hash(&mut hash);
+        let name = format!("ca-bundle-{:016x}.pem", hash.finish());
+        let path = dir.join(&name);
+        if fs::read(&path).ok().as_deref() != Some(bundle.as_slice()) {
+            // Written aside and renamed: an app starting now never reads half.
+            let partial = dir.join(format!("{name}.{}.tmp", std::process::id()));
+            fs::write(&partial, &bundle)?;
+            fs::rename(&partial, &path)?;
+        }
+        Ok(path)
+    })();
+    combined.unwrap_or_else(|e| {
+        eprintln!("porch: {e:#}; the app trusts only Porch's CA");
+        ours
+    })
 }
 fn child_status(s: std::process::ExitStatus) -> i32 {
     #[cfg(unix)]
@@ -2382,14 +2466,28 @@ async fn spawn_prepared(
                 let running = proxy_running();
                 if was_running && !running && !state::dir().join("proxy.stopped").exists() {
                     eprintln!("porch: the proxy stopped unexpectedly; restarting it");
-                    if let Ok(exe) = std::env::current_exe() {
-                        let _ = tokio::process::Command::new(exe)
+                    let restarted = match porch_exe() {
+                        Ok(exe) => tokio::process::Command::new(exe)
                             .args(["proxy", "start"])
                             .env("PORCH_SKIP_TRUST", "1")
                             .stdin(Stdio::null())
                             .stdout(Stdio::null())
                             .status()
-                            .await;
+                            .await
+                            .map_err(anyhow::Error::from)
+                            .and_then(|status| {
+                                if status.success() {
+                                    Ok(())
+                                } else {
+                                    Err(anyhow::anyhow!("`porch proxy start` exited {status}"))
+                                }
+                            }),
+                        Err(e) => Err(e.into()),
+                    };
+                    if let Err(e) = restarted {
+                        eprintln!(
+                            "porch: could not restart the proxy ({e:#}); run `porch proxy start`"
+                        );
                     }
                 }
                 was_running = proxy_running();
@@ -2438,32 +2536,58 @@ async fn spawn_prepared(
         if let (Some(port), Some(lease)) = (p.port, p.lease.as_ref()) {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
             let listener = loop {
-                if let Some(pid) = crate::process::listening_process(port).filter(|pid| *pid != id)
+                // A daemon can only have taken over if something answers on
+                // the port; connecting is cheap, the owner lookup (lsof) isn't.
+                if tokio::task::spawn_blocking(move || crate::ports::accepts(port))
+                    .await
+                    .unwrap_or(false)
                 {
-                    break Some(pid);
+                    if let Some(pid) =
+                        crate::process::listening_process(port).filter(|pid| *pid != id)
+                    {
+                        break Some(pid);
+                    }
                 }
                 if tokio::time::Instant::now() >= deadline {
                     break None;
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;
             };
-            if let Some(pid) = listener {
-                if let Some(mut identity) = state::identity(pid) {
-                    let group_started = state::load()?
-                        .owners
-                        .get(&lease.name)
-                        .and_then(|i| i.child_started.clone());
-                    #[cfg(unix)]
-                    let group = unsafe { libc::getpgid(pid as i32) } as u32;
-                    #[cfg(windows)]
-                    let group = pid;
-                    let retain_original_group = cfg!(windows) || group == id;
-                    identity.child = Some(group);
-                    identity.child_started = if group == id {
-                        group_started
+            let group_started = state::load()?
+                .owners
+                .get(&lease.name)
+                .filter(|i| i.pid == lease.owner)
+                .and_then(|i| i.child_started.clone());
+            // Only a server this command started takes over the route, never
+            // one that was already running and was only asked to listen.
+            let adopted = listener.and_then(|pid| {
+                let how = crate::process::adoption(pid, id, group_started.as_deref());
+                if how.is_none() {
+                    eprintln!(
+                        "porch: {} exited; the server now on port {port} (pid {pid}) was running before it started, so Porch doesn't manage it",
+                        p.plan.name
+                    );
+                }
+                Some((pid, how?, state::identity(pid)?))
+            });
+            if let Some((pid, how, mut identity)) = adopted {
+                {
+                    // Windows: the daemon is in the launched command's job,
+                    // which is released to it below.
+                    let retain_original_group =
+                        cfg!(windows) || how == crate::process::Adoption::Group;
+                    if how == crate::process::Adoption::Group {
+                        identity.child = Some(id);
+                        identity.child_started = group_started;
+                    } else if cfg!(windows) {
+                        identity.child = Some(pid);
+                        identity.child_started = Some(identity.started.clone());
                     } else {
-                        state::identity(group).map(|i| i.started)
-                    };
+                        // Outside the original group: stop signals reach this
+                        // process only, never the group it happens to be in.
+                        identity.child = None;
+                        identity.child_started = None;
+                    }
                     let result = state::transaction(|s| {
                         if shutdown.borrow().is_some() {
                             return Ok(());
@@ -2480,10 +2604,14 @@ async fn spawn_prepared(
                         }
                         Ok(())
                     });
-                    if result.is_err() || !transferred {
-                        signal_group(group, 9);
-                        result?;
+                    // Not handed over (the route was replaced or Porch is
+                    // stopping): a server in the original group goes with it
+                    // below; one outside it is asked to stop, never killed.
+                    #[cfg(unix)]
+                    if !transferred && how == crate::process::Adoption::Process {
+                        signal_pid(pid, libc::SIGTERM);
                     }
+                    result?;
                     if transferred && retain_original_group {
                         if let Some(guard) = tree.take() {
                             guard.release()?;
@@ -2493,10 +2621,11 @@ async fn spawn_prepared(
             }
         }
     }
-    if !transferred {
-        signal_group(id, 15);
-    } // Dispose descendants unless ownership moved to a daemon.
-    drop(tree.take());
+    // Dispose of what is left of the original group, unless it was handed
+    // to a daemon: SIGTERM, a few seconds to finish, then SIGKILL.
+    if let Some(tree) = tree.take() {
+        tree.terminate(Duration::from_secs(3)).await;
+    }
     // Reap last: the group is disposed of (or handed to the daemon) above.
     let _ = child.wait().await;
     drop(p.shares.take());
@@ -2507,8 +2636,164 @@ async fn spawn_prepared(
 async fn launch(options: RunOptions, command: Vec<String>) -> Result<i32> {
     launch_extra(options, command, vec![]).await
 }
+/// This porch's executable, for starting more of itself. On Linux, once
+/// `porch self-update` has replaced the file, a long-running launcher's own
+/// path reads `PATH (deleted)`; the updated binary is at PATH.
+fn porch_exe() -> std::io::Result<PathBuf> {
+    Ok(undeleted(std::env::current_exe()?))
+}
+fn undeleted(exe: PathBuf) -> PathBuf {
+    match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(path) if std::path::Path::new(path).is_file() => PathBuf::from(path),
+        _ => exe,
+    }
+}
 fn log_path(name: &str) -> PathBuf {
     state::dir().join("logs").join(format!("{name}.log"))
+}
+/// Largest a background app's log (or `proxy.log`) grows before its older
+/// half moves to `NAME.log.1`.
+const LOG_CAP: u64 = 10 * 1024 * 1024;
+/// Logs of apps that are no longer running are deleted after this long.
+const LOG_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// The previous log kept beside `path` (`NAME.log.1`).
+fn previous_log(path: &std::path::Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".1");
+    PathBuf::from(name)
+}
+/// Open a log for appending, creating it private to this user. Every writer
+/// appends at the current end, so the file can be truncated under them.
+fn open_log(path: &std::path::Path) -> std::io::Result<fs::File> {
+    let mut o = fs::OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    o.open(path)
+}
+/// Keep a log that is still being written under `max` bytes: copy it to
+/// `NAME.log.1` and empty it. Its writers opened it for appending, so they
+/// continue at the new end; a line written during the copy can be lost.
+fn cap_log(path: &std::path::Path, max: u64) -> std::io::Result<bool> {
+    if fs::metadata(path)?.len() <= max {
+        return Ok(false);
+    }
+    fs::copy(path, previous_log(path))?;
+    fs::OpenOptions::new().write(true).open(path)?.set_len(0)?;
+    Ok(true)
+}
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+/// Check a log's size every few seconds for as long as the caller runs.
+fn cap_log_forever(path: PathBuf) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let path = path.clone();
+            let _ = tokio::task::spawn_blocking(move || cap_log(&path, LOG_CAP)).await;
+        }
+    }))
+}
+/// Delete logs of apps that stopped long ago. A running app's log stays,
+/// however quiet the app has been.
+fn prune_logs(dir: &std::path::Path, keep: &[String]) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        let name = file
+            .strip_suffix(".log.1")
+            .or_else(|| file.strip_suffix(".log"))
+            .or_else(|| file.strip_suffix(".logref"));
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > LOG_MAX_AGE);
+        if name.is_some_and(|n| !keep.iter().any(|k| k == n)) && old {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+/// Where the last `lines` lines of a `len`-byte file start, reading backwards
+/// from the end so a large log is never read whole.
+fn tail_start(file: &mut fs::File, len: u64, lines: usize) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    if lines == 0 {
+        return Ok(len);
+    }
+    let mut end = len;
+    let mut found = 0;
+    let mut skip_final_newline = true;
+    let mut block = vec![0u8; 64 * 1024];
+    while end > 0 {
+        let start = end.saturating_sub(block.len() as u64);
+        let chunk = &mut block[..(end - start) as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(chunk)?;
+        for i in (0..chunk.len()).rev() {
+            if chunk[i] != b'\n' {
+                skip_final_newline = false;
+                continue;
+            }
+            // The newline ending the last line doesn't start another one.
+            if std::mem::take(&mut skip_final_newline) {
+                continue;
+            }
+            found += 1;
+            if found == lines {
+                return Ok(start + i as u64 + 1);
+            }
+        }
+        end = start;
+    }
+    Ok(0)
+}
+/// Write `pending` as UTF-8, replacing invalid bytes with U+FFFD. An
+/// incomplete character at the end waits for the next read unless `last`.
+fn write_lossy(
+    out: &mut impl std::io::Write,
+    pending: &mut Vec<u8>,
+    last: bool,
+) -> std::io::Result<()> {
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(text) => {
+                out.write_all(text.as_bytes())?;
+                pending.clear();
+                return Ok(());
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                out.write_all(&pending[..valid])?;
+                match e.error_len() {
+                    Some(bad) => {
+                        out.write_all("\u{FFFD}".as_bytes())?;
+                        pending.drain(..valid + bad);
+                    }
+                    None if last => {
+                        out.write_all("\u{FFFD}".as_bytes())?;
+                        pending.clear();
+                        return Ok(());
+                    }
+                    None => {
+                        pending.drain(..valid);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
 }
 /// `porch run --detach`: start this same command as a background launcher
 /// writing to a log, wait until its app answers, print the URL and return.
@@ -2546,8 +2831,27 @@ async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
             }
         }
     }
-    fs::create_dir_all(log.parent().unwrap())?;
-    let out = fs::File::create(&log)?;
+    let logs = log.parent().unwrap();
+    fs::create_dir_all(logs)?;
+    {
+        let s = state::load()?;
+        let running: Vec<String> = s
+            .routes
+            .iter()
+            .filter(|r| state::route_alive(&s, r))
+            .map(|r| r.name.clone())
+            .collect();
+        prune_logs(logs, &running);
+    }
+    // Keep the previous run's output as NAME.log.1. A launcher replaced with
+    // --force keeps writing to that file until it exits, never into a hole
+    // in the new one.
+    match fs::rename(&log, previous_log(&log)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("rotating {}", log.display())),
+    }
+    let out = open_log(&log)?;
     for other in &shared_with {
         let _ = fs::remove_file(log_path(other));
         fs::write(
@@ -2555,10 +2859,17 @@ async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
             format!("{log_name}\n"),
         )?;
     }
-    let mut child = Command::new(std::env::current_exe()?);
+    let mut child = Command::new(porch_exe()?);
+    // The background launcher runs these same plans rather than discovering
+    // the workspace again (small enough for any platform's environment).
+    let plans_json = serde_json::to_string(&plans)?;
+    if plans_json.len() <= 16 * 1024 {
+        child.env("PORCH_DETACHED_PLANS", plans_json);
+    }
     child
         .args(std::env::args_os().skip(1))
         .env("PORCH_DETACHED", "1")
+        .env("PORCH_DETACHED_LOG", &log)
         .stdin(Stdio::null())
         .stdout(out.try_clone()?)
         .stderr(out);
@@ -2585,11 +2896,7 @@ async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
-            let tail = fs::read_to_string(&log).unwrap_or_default();
-            let tail: Vec<_> = tail.lines().rev().take(20).collect();
-            for line in tail.into_iter().rev() {
-                eprintln!("{line}");
-            }
+            eprint!("{}", log_tail(&log, 20));
             bail!(
                 "the app exited ({status}) before it was ready; full output: {}",
                 log.display()
@@ -2599,7 +2906,11 @@ async fn detach(options: &RunOptions, command: &[String]) -> Result<i32> {
         // Ready only when *our* launcher owns each route and its app answers.
         let ready = !names.is_empty()
             && names.iter().all(|n| {
-                s.owners.get(n).is_some_and(|o| o.pid == launcher)
+                // The app has started (its reservation, which also accepts
+                // connections, is gone) and answers.
+                s.owners
+                    .get(n)
+                    .is_some_and(|o| o.pid == launcher && o.child.is_some())
                     && s.routes
                         .iter()
                         .find(|r| &r.name == n)
@@ -2693,37 +3004,86 @@ async fn show_logs(name: &str, follow: bool, lines: Option<usize>) -> Result<i32
             path = log_path(&owner);
         }
     }
-    let text = fs::read_to_string(&path).with_context(|| {
-        format!("no log for {n}; logs exist for apps started with `porch run --detach`")
-    })?;
-    let all: Vec<&str> = text.lines().collect();
-    let start = lines.map_or(0, |k| all.len().saturating_sub(k));
-    for line in &all[start..] {
-        println!("{line}");
+    let mut file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("no log for {n}; logs exist for apps started with `porch run --detach`")
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let len = file.metadata()?.len();
+    let mut offset = match lines {
+        Some(k) => tail_start(&mut file, len, k)?,
+        None => 0,
+    };
+    let mut stdout = std::io::stdout().lock();
+    let mut pending = Vec::new();
+    let mut ends_with_newline = true;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut block = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut block)?;
+        if n == 0 {
+            break;
+        }
+        offset += n as u64;
+        ends_with_newline = block[n - 1] == b'\n';
+        pending.extend_from_slice(&block[..n]);
+        write_lossy(&mut stdout, &mut pending, false)?;
     }
     if !follow {
+        write_lossy(&mut stdout, &mut pending, true)?;
+        if !ends_with_newline {
+            writeln!(stdout)?;
+        }
         return Ok(0);
     }
-    let mut offset = text.len() as u64;
+    stdout.flush()?;
+    drop(stdout);
     loop {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let Ok(meta) = fs::metadata(&path) else {
             continue;
         };
         if meta.len() < offset {
-            offset = 0; // the app was restarted and its log recreated
+            // Restarted with a new log, or emptied after reaching its cap.
+            offset = 0;
+            pending.clear();
         }
         if meta.len() > offset {
-            use std::io::{Read, Seek, SeekFrom, Write};
             let mut f = fs::File::open(&path)?;
             f.seek(SeekFrom::Start(offset))?;
             let mut chunk = Vec::new();
             f.read_to_end(&mut chunk)?;
             offset += chunk.len() as u64;
-            std::io::stdout().write_all(&chunk)?;
-            std::io::stdout().flush()?;
+            pending.extend_from_slice(&chunk);
+            let mut stdout = std::io::stdout().lock();
+            write_lossy(&mut stdout, &mut pending, false)?;
+            stdout.flush()?;
         }
     }
+}
+/// The last `lines` lines of a log, lossily decoded, for error messages.
+fn log_tail(path: &std::path::Path, lines: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut bytes = Vec::new();
+    if tail_start(&mut file, len, lines)
+        .and_then(|start| file.seek(SeekFrom::Start(start)))
+        .and_then(|_| file.take(len).read_to_end(&mut bytes))
+        .is_err()
+    {
+        return String::new();
+    }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
 }
 async fn launch_extra(
     options: RunOptions,
@@ -2735,6 +3095,12 @@ async fn launch_extra(
         all.extend(extra.iter().cloned());
         return detach(&options, &all).await;
     }
+    // A background launcher (`--detach`) keeps its own log under the cap.
+    // The app doesn't need to know where that is.
+    let _log_cap = std::env::var_os("PORCH_DETACHED_LOG").map(|log| {
+        std::env::remove_var("PORCH_DETACHED_LOG");
+        cap_log_forever(PathBuf::from(log))
+    });
     // Subscribe before publishing route ownership, so a signal observed by a
     // supervising caller cannot fall into the registration-to-spawn window.
     let mut signals = TerminationSignals::new()?;
@@ -2744,13 +3110,19 @@ async fn launch_extra(
     if let Some(port) = options.app_port {
         std::env::set_var("PORCH_APP_PORT", port.to_string());
     }
-    let mut plans = crate::config::launch_plans(
-        &cwd,
-        explicit.then_some(command),
-        options.name.as_deref(),
-        options.script.as_deref(),
-        options.prefix.as_deref(),
-    )?;
+    // A background launcher gets the plans `porch run --detach` resolved.
+    let handed_over = std::env::var("PORCH_DETACHED_PLANS").ok();
+    std::env::remove_var("PORCH_DETACHED_PLANS");
+    let mut plans = match handed_over.and_then(|json| serde_json::from_str(&json).ok()) {
+        Some(plans) => plans,
+        None => crate::config::launch_plans(
+            &cwd,
+            explicit.then_some(command),
+            options.name.as_deref(),
+            options.script.as_deref(),
+            options.prefix.as_deref(),
+        )?,
+    };
     let bypass = std::env::var("PORCH")
         .ok()
         .or_else(|| std::env::var("PORTLESS").ok())
@@ -2923,7 +3295,7 @@ async fn launch_extra(
             // group while the child's pid still names it.
             let group=tree;let mut resources=prepared;
             let result=tokio::select!{s=crate::process::wait_exit(&mut child)=>s.map(child_status).map_err(anyhow::Error::from),failure=workspace_share_failure(&mut resources)=>{signal_group(pid,15);let _=tokio::time::timeout(Duration::from_secs(3),crate::process::wait_exit(&mut child)).await;failure.and_then(|_|Err(anyhow::anyhow!("workspace sharing tunnel stopped")))},_=r.changed()=>{let signal=(*r.borrow()).unwrap_or(15);signal_group(pid,signal);let _=tokio::time::timeout(Duration::from_secs(3),crate::process::wait_exit(&mut child)).await;Ok(128+signal)}};
-            drop(group);
+            group.terminate(Duration::from_secs(3)).await;
             let _ = child.wait().await;
             result
         });
@@ -2974,11 +3346,12 @@ async fn clean_discovery() -> Result<()> {
 }
 /// Whether `name` in the state directory is a file Porch creates.
 fn porch_state_file(name: &str) -> bool {
-    const FILES: [&str; 29] = [
+    const FILES: [&str; 31] = [
         "state.json",
         "state.lock",
         "proxy.json",
         "proxy.log",
+        "proxy.log.1",
         "proxy.pid",
         "proxy.identity",
         "proxy.ready",
@@ -2990,6 +3363,7 @@ fn porch_state_file(name: &str) -> bool {
         "proxy.hosts-sync-token",
         "proxy.hosts-capability",
         "startup.lock",
+        "startup.owner",
         "ca.pem",
         "ca-key.pem",
         "hosts-sync.token",
@@ -3007,7 +3381,7 @@ fn porch_state_file(name: &str) -> bool {
     ];
     // Pairing keys, credentials, peers and logs; per-run files; retired CAs;
     // and temporary files a crash left behind.
-    const PREFIXES: [&str; 8] = [
+    const PREFIXES: [&str; 9] = [
         "discovery",
         "dev-manifest-",
         "turbo-env-loader-",
@@ -3016,6 +3390,8 @@ fn porch_state_file(name: &str) -> bool {
         "compose-",
         "cloudflare-",
         "sharing-",
+        // Apps' CA bundles (Porch's CA plus their own NODE_EXTRA_CA_CERTS).
+        "ca-bundle-",
     ];
     FILES.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p)) || name.ends_with(".tmp")
 }
@@ -3038,7 +3414,9 @@ fn clean_state() -> Result<()> {
             for log in fs::read_dir(entry.path())? {
                 let log = log?;
                 let n = log.file_name().to_string_lossy().into_owned();
-                if log.file_type()?.is_file() && (n.ends_with(".log") || n.ends_with(".logref")) {
+                if log.file_type()?.is_file()
+                    && [".log", ".log.1", ".logref"].iter().any(|e| n.ends_with(e))
+                {
                     fs::remove_file(log.path())?;
                 } else {
                     kept.push(format!("logs/{n}"));
@@ -3135,16 +3513,72 @@ async fn startup_lock() -> Result<fs::File> {
     let f = o.open(state::dir().join("startup.lock"))?;
     state::inherit_owner(&state::dir().join("startup.lock"))?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut told = false;
     loop {
         match f.try_lock_exclusive() {
-            Ok(()) => return Ok(f),
+            Ok(()) => {
+                startup_phase(Some(Duration::from_secs(20)));
+                return Ok(f);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(e.into()),
         }
-        if tokio::time::Instant::now() >= deadline {
+        // The holder may be waiting for a password or for its port; wait
+        // with it for as long as it is alive and says so.
+        let holder = startup_holder();
+        if holder == Some(StartupHolder::Prompting) && !told {
+            told = true;
+            eprintln!("porch: waiting for another porch command that is asking for your password");
+        }
+        if tokio::time::Instant::now() >= deadline && holder.is_none() {
             bail!("another proxy startup did not finish")
         };
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StartupOwner {
+    identity: ProcessIdentity,
+    /// Unix seconds the holder expects to be done by; `None` while it waits
+    /// for an answer at a prompt.
+    until: Option<u64>,
+}
+#[derive(Debug, PartialEq)]
+enum StartupHolder {
+    Prompting,
+    Busy,
+}
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+/// Tell commands waiting for the startup lock how long this one, which holds
+/// it, still needs: `None` while it waits at a prompt (sudo, trust).
+fn startup_phase(expected: Option<Duration>) {
+    let Some(identity) = state::identity(std::process::id()) else {
+        return;
+    };
+    let owner = StartupOwner {
+        identity,
+        until: expected.map(|d| unix_now() + d.as_secs()),
+    };
+    if let Ok(bytes) = serde_json::to_vec(&owner) {
+        let _ = state::atomic_write("startup.owner", &bytes);
+    }
+}
+/// The live holder of the startup lock, if it said it is still working.
+fn startup_holder() -> Option<StartupHolder> {
+    let owner: StartupOwner =
+        serde_json::from_slice(&fs::read(state::dir().join("startup.owner")).ok()?).ok()?;
+    if !state::matches(&owner.identity) {
+        return None;
+    }
+    match owner.until {
+        None => Some(StartupHolder::Prompting),
+        Some(until) if unix_now() <= until => Some(StartupHolder::Busy),
+        Some(_) => None,
     }
 }
 
@@ -3186,7 +3620,7 @@ async fn elevate(args: &[String]) -> Result<i32> {
     {
         c.arg(format!("{k}={v}"));
     }
-    c.arg(std::env::current_exe()?).args(args);
+    c.arg(porch_exe()?).args(args);
     let status = c.status().await.context(
         "administrator privileges required; install sudo or run the command as administrator",
     )?;
@@ -3466,5 +3900,123 @@ mod option_walk_tests {
         assert_eq!(bare_separator(&args(&["run", "--", "x"])), None);
         assert_eq!(bare_separator(&args(&["web", "node", "--", "x"])), None);
         assert_eq!(bare_separator(&args(&["--script"])), None);
+    }
+}
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    fn scratch(contents: &[u8]) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "porch-log-{}-{}.log",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::write(&path, contents).unwrap();
+        path
+    }
+    fn tail(contents: &[u8], lines: usize) -> Vec<u8> {
+        use std::io::Read;
+        let path = scratch(contents);
+        let mut file = fs::File::open(&path).unwrap();
+        let start = tail_start(&mut file, contents.len() as u64, lines).unwrap();
+        let mut out = Vec::new();
+        fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
+        fs::remove_file(path).unwrap();
+        out.split_off(start as usize)
+    }
+    #[test]
+    fn tail_reads_only_the_last_lines() {
+        assert_eq!(tail(b"a\nb\nc\n", 2), b"b\nc\n");
+        assert_eq!(tail(b"a\nb\nc", 2), b"b\nc");
+        assert_eq!(tail(b"a\nb\nc\n", 5), b"a\nb\nc\n");
+        assert_eq!(tail(b"a\nb\nc\n", 0), b"");
+        assert_eq!(tail(b"", 3), b"");
+        assert_eq!(tail(b"\n\n", 1), b"\n");
+        // Across the 64 KiB blocks it reads backwards in.
+        let mut big = Vec::new();
+        for i in 0..20_000 {
+            big.extend_from_slice(format!("line {i}\n").as_bytes());
+        }
+        assert_eq!(tail(&big, 2), b"line 19998\nline 19999\n");
+        assert_eq!(tail(&big, 20_000), big);
+    }
+    #[test]
+    fn invalid_utf8_is_replaced_not_an_error() {
+        let mut out = Vec::new();
+        let mut pending = b"ok \xff\xfe and \xe2\x82".to_vec();
+        write_lossy(&mut out, &mut pending, false).unwrap();
+        // The euro sign's first two bytes wait for the third.
+        assert_eq!(pending, b"\xe2\x82");
+        pending.extend_from_slice(b"\xac!");
+        write_lossy(&mut out, &mut pending, true).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "ok \u{FFFD}\u{FFFD} and \u{20AC}!"
+        );
+        let mut out = Vec::new();
+        let mut pending = b"cut \xe2\x82".to_vec();
+        write_lossy(&mut out, &mut pending, true).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "cut \u{FFFD}");
+    }
+    #[test]
+    fn capped_logs_keep_the_previous_part_and_writers_keep_appending() {
+        use std::io::Write;
+        let path = scratch(b"");
+        let mut writer = open_log(&path).unwrap();
+        writer.write_all(&[b'x'; 100]).unwrap();
+        assert!(!cap_log(&path, 100).unwrap());
+        writer.write_all(b"y").unwrap();
+        assert!(cap_log(&path, 100).unwrap());
+        assert_eq!(fs::read(previous_log(&path)).unwrap().len(), 101);
+        writer.write_all(b"after\n").unwrap();
+        // Appending: no hole of NUL bytes where the old offset was.
+        assert_eq!(fs::read(&path).unwrap(), b"after\n");
+        fs::remove_file(previous_log(&path)).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+}
+#[cfg(test)]
+mod ca_tests {
+    use super::*;
+    #[test]
+    fn existing_node_extra_ca_certs_is_kept_alongside_porchs_ca() {
+        let dir = std::env::temp_dir().join(format!("porch-ca-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("ca.pem"), "PORCH CA\n").unwrap();
+        fs::write(dir.join("corp.pem"), "CORPORATE CA").unwrap();
+        let ours = dir.join("ca.pem");
+        assert_eq!(extra_ca_certs(&dir, None), ours);
+        assert_eq!(extra_ca_certs(&dir, Some("".as_ref())), ours);
+        assert_eq!(extra_ca_certs(&dir, Some(ours.as_os_str())), ours);
+        let corp = dir.join("corp.pem");
+        let bundle = extra_ca_certs(&dir, Some(corp.as_os_str()));
+        assert_ne!(bundle, ours);
+        assert_eq!(
+            fs::read_to_string(&bundle).unwrap(),
+            "CORPORATE CA\nPORCH CA\n"
+        );
+        // Unreadable: Porch's CA alone, as before.
+        let missing = dir.join("missing.pem");
+        assert_eq!(extra_ca_certs(&dir, Some(missing.as_os_str())), ours);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+#[cfg(test)]
+mod exe_tests {
+    use super::*;
+    #[test]
+    fn a_replaced_executable_resolves_to_the_updated_file() {
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(undeleted(exe.clone()), exe);
+        let mut deleted = exe.clone().into_os_string();
+        deleted.push(" (deleted)");
+        assert_eq!(undeleted(PathBuf::from(deleted)), exe);
+        // Nothing at the original path: keep what the OS reported.
+        let gone = PathBuf::from("/nonexistent/porch (deleted)");
+        assert_eq!(undeleted(gone.clone()), gone);
     }
 }

@@ -1076,3 +1076,105 @@ fn child_path_skips_bins_owned_by_another_user() {
     let dirs: Vec<PathBuf> = std::env::split_paths(&augmented_path(&f.0)).collect();
     assert!(!dirs.contains(&theirs), "{dirs:?}");
 }
+
+/// Naming a workspace's packages in a linked worktree asks Git about the
+/// worktree once per launch, not once per package.
+#[cfg(unix)]
+#[test]
+fn workspace_names_look_up_the_worktree_once() {
+    let f = Fixture::new();
+    let root = f.0.join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let git = |cwd: &Path, a: &[&str]| {
+        let o = std::process::Command::new("git")
+            .args(a)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    git(&root, &["init", "-b", "main"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let linked = f.0.join("linked");
+    git(
+        &root,
+        &["worktree", "add", "-b", "team/ui", linked.to_str().unwrap()],
+    );
+    let write = |path: &str, v: serde_json::Value| {
+        let p = linked.join(path);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, serde_json::to_vec(&v).unwrap()).unwrap();
+    };
+    write(
+        "package.json",
+        json!({"name":"mono","private":true,"workspaces":["apps/*"]}),
+    );
+    for app in ["web", "api", "docs"] {
+        write(
+            &format!("apps/{app}/package.json"),
+            json!({"name":app,"scripts":{"dev":"node server.js"}}),
+        );
+    }
+    // Every git call is logged, then runs the real git.
+    let real = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let bin = f.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let calls = f.0.join("git.log");
+    common::write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> \"{}\"\nexec \"{}\" \"$@\"\n",
+            calls.display(),
+            real.trim()
+        ),
+    );
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_porch"))
+        .arg("workspace")
+        .current_dir(&linked)
+        .env("PORCH_STATE_DIR", f.0.join("state"))
+        .env("PORCH_CLEAN_URLS", "0")
+        .env_remove("PORCH_PREFIX")
+        .env_remove("PORTLESS_PREFIX")
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        o.status.success(),
+        "{out}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    for app in ["web", "api", "docs"] {
+        assert!(out.contains(&format!("ui.{app}.mono")), "{out}");
+    }
+    let log = fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        log.lines()
+            .filter(|l| l.starts_with("worktree list"))
+            .count()
+            <= 1,
+        "{log}"
+    );
+}

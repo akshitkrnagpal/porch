@@ -143,10 +143,71 @@ fn listener_overlaps(addr: SocketAddr) -> io::Result<()> {
 pub struct Reservation {
     v4: TcpListener,
     _v6: Option<TcpListener>,
+    closer: Option<Closer>,
+}
+#[derive(Debug)]
+struct Closer {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Reservation {
     pub fn port(&self) -> io::Result<u16> {
         Ok(self.v4.local_addr()?.port())
+    }
+    /// Accept and close every connection while the port is held.
+    ///
+    /// A reservation listens (so the port stays exclusively ours), and the
+    /// app may start many seconds later, after a sharing tunnel is up. A
+    /// client that connects meanwhile, such as the proxy, would wait for a
+    /// response that never comes; closing the connection tells it at once
+    /// that the app isn't answering yet. (Binding without listening doesn't
+    /// do that: macOS drops the connection attempt instead of refusing it.)
+    /// Connections are reset, so none lingers to keep the app off the port.
+    pub fn close_connections(&mut self) -> io::Result<()> {
+        if self.closer.is_some() {
+            return Ok(());
+        }
+        let mut listeners = vec![self.v4.try_clone()?];
+        if let Some(v6) = &self._v6 {
+            listeners.push(v6.try_clone()?);
+        }
+        for l in &listeners {
+            l.set_nonblocking(true)?;
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("porch-reservation".into())
+            .spawn(move || {
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    for l in &listeners {
+                        while let Ok((connection, _)) = l.accept() {
+                            // Reset rather than close: a closed connection
+                            // would linger in TIME_WAIT on this port and
+                            // could stop the app from binding it.
+                            let _ = socket2::SockRef::from(&connection)
+                                .set_linger(Some(std::time::Duration::ZERO));
+                            drop(connection);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            })?;
+        self.closer = Some(Closer {
+            stop,
+            thread: Some(thread),
+        });
+        Ok(())
+    }
+}
+impl Drop for Closer {
+    fn drop(&mut self) {
+        // Joined, so its copies of the sockets are closed and the port is
+        // free once the reservation is dropped.
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 /// Whether `port` could be reserved right now, without accepting connections.
@@ -202,5 +263,35 @@ pub fn reserve(port: u16) -> io::Result<Reservation> {
         Err(e) if ipv6_unavailable(&e) => None,
         Err(e) => return Err(e),
     };
-    Ok(Reservation { v4, _v6: v6 })
+    Ok(Reservation {
+        v4,
+        _v6: v6,
+        closer: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn a_reservation_closes_connections_instead_of_leaving_them_waiting() {
+        let port = crate::test_support::free_port();
+        let mut reservation = reserve(port).unwrap();
+        reservation.close_connections().unwrap();
+        // A reset may already arrive while connecting; either way the client
+        // learns at once that nothing answers.
+        let read = std::net::TcpStream::connect(("127.0.0.1", port)).and_then(|mut client| {
+            let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            client.read(&mut [0u8; 16])
+        });
+        assert!(
+            !matches!(&read, Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
+            "the connection was left waiting: {read:?}"
+        );
+        drop(reservation);
+        // Released for real: the port can be bound again.
+        assert!(crate::test_support::bindable(&[port]));
+    }
 }

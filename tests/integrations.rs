@@ -1198,6 +1198,9 @@ fn clean_ends_pairing_and_removes_logs_and_leftovers() {
         "compose-ports.json",
         "update-check.json",
         "tip-https",
+        "proxy.log.1",
+        "startup.owner",
+        "ca-bundle-0123456789abcdef.pem",
     ] {
         fs::write(state.join(name), "{}").unwrap();
     }
@@ -1205,6 +1208,7 @@ fn clean_ends_pairing_and_removes_logs_and_leftovers() {
     fs::create_dir_all(state.join("logs")).unwrap();
     fs::write(state.join("logs/web.log"), "output").unwrap();
     fs::write(state.join("logs/api.logref"), "web\n").unwrap();
+    fs::write(state.join("logs/web.log.1"), "earlier run").unwrap();
     fs::write(state.join("notes.txt"), "mine").unwrap();
     // Discovery's login startup for this state directory.
     let plist = s.dir.join("dev.porch.discovery.plist");

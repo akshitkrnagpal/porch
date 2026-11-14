@@ -484,3 +484,60 @@ fn setup_avoids_a_busy_port_and_doctor_fix_moves_a_stopped_proxy() {
     assert!(out.contains("moved Porch to port"), "{out}");
     assert_ne!(s.settings()["port"], moved);
 }
+
+/// Sharing's own login item (`porch discovery autostart enable`, no sudo)
+/// doesn't make `porch setup --yes` install the system startup service, and
+/// keeping the default leaves that login item alone.
+#[test]
+fn setup_keeps_discovery_autostart_separate_from_the_startup_service() {
+    let s = Sandbox::new();
+    s.save_port(quiet_port(), serde_json::json!({}));
+    let bin = s.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // Anything that would install a system service fails loudly and leaves a trace.
+    for tool in ["sudo", "launchctl", "systemctl"] {
+        common::write_executable(
+            &bin.join(tool),
+            &format!(
+                "#!/bin/sh\necho {tool} \"$@\" >> \"{}\"\nexit 1\n",
+                s.root.join("tools.log").display()
+            ),
+        );
+    }
+    let autostart = s.root.join("dev.porch.discovery.plist");
+    std::fs::write(
+        &autostart,
+        format!(
+            "<plist><dict><key>Label</key><string>dev.porch.discovery</string><key>PORCH_STATE_DIR</key><string>{}</string></dict></plist>",
+            s.root.join("state").display()
+        ),
+    )
+    .unwrap();
+    let service = s.root.join("service.plist");
+    let o = s
+        .command(&["setup", "--yes"])
+        .env("PORCH_SERVICE_PLATFORM", "macos")
+        .env("PORCH_DISCOVERY_AUTOSTART_FILE", &autostart)
+        .env("PORCH_SERVICE_FILE", &service)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    let _ = s.run(&["proxy", "stop"]);
+    assert!(
+        o.status.success(),
+        "{out}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(out.contains("Start at login: off"), "{out}");
+    assert!(
+        !service.exists(),
+        "setup installed a service nobody asked for"
+    );
+    assert!(autostart.exists(), "setup removed sharing's login item");
+    let tools = std::fs::read_to_string(s.root.join("tools.log")).unwrap_or_default();
+    assert!(!tools.contains("sudo"), "setup ran sudo: {tools}");
+}

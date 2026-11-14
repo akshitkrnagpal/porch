@@ -175,12 +175,13 @@ pub async fn run(a: SetupArgs) -> Result<()> {
         choose_port(wanted, explicit.is_some(), ours, interactive)?
     };
 
-    // 3. Start at login (reuses the service integration).
+    // 3. Start at login (reuses the service integration). The default is
+    // whether the service is installed; sharing's own login item (`porch
+    // discovery autostart enable`, no sudo) is a separate choice.
     let service_installed = state::dir().join("service.json").exists();
-    let autostart_installed = crate::discovery::autostart::installed();
     let service = confirm(
         "Start Porch automatically at login? (installs a system service; asks for sudo)",
-        service_installed || autostart_installed,
+        service_installed,
         interactive,
     );
 
@@ -259,14 +260,16 @@ pub async fn run(a: SetupArgs) -> Result<()> {
         }
     }
 
-    // Start at login covers sharing too, or paired machines lose this one at reboot.
+    // Start at login covers sharing too, or paired machines lose this one at
+    // reboot. Sharing's login item is only removed when the user turns start
+    // at login off here, never because they kept the default.
     if service && sharing && !crate::discovery::autostart::installed() {
         if let Err(e) = crate::discovery::autostart::enable().await {
             println!(
                 "Sharing will not start at login ({e:#}); run `porch discovery autostart enable`"
             );
         }
-    } else if !service && crate::discovery::autostart::installed() {
+    } else if !service && service_installed && crate::discovery::autostart::installed() {
         if let Err(e) = crate::discovery::autostart::disable().await {
             println!(
                 "Sharing still starts at login ({e:#}); run `porch discovery autostart disable`"
