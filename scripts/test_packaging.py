@@ -285,6 +285,74 @@ class PackageTests(unittest.TestCase):
         self.assertIn(f"'{bin_dir};'", hint)
 
 
+@unittest.skipUnless(sys.platform == 'darwin', 'launchd login item')
+class LoginTests(unittest.TestCase):
+    """porch-login against a fake launchctl in an isolated HOME."""
+
+    def run_login(self, root, launchctl_script, *args):
+        bin_dir = root / 'bin'
+        bin_dir.mkdir(exist_ok=True)
+        fake = bin_dir / 'launchctl'
+        fake.write_text('#!/usr/bin/env python3\nimport json,os,sys\nlog=os.environ["FAKE_LOG"]\n'
+                        'open(log,"a").write(json.dumps(sys.argv[1:])+"\\n")\n'
+                        'calls=[json.loads(l) for l in open(log)]\n' + launchctl_script)
+        fake.chmod(0o755)
+        tray = root / 'porch-tray'
+        tray.write_text('')
+        env = dict(os.environ, HOME=str(root / 'home'), PATH=f'{bin_dir}:/usr/bin:/bin',
+                   FAKE_LOG=str(root / 'log'))
+        env.pop('PORCH_STATE_DIR', None)
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/porch-login'), *args,
+                                 '--binary', str(tray)], capture_output=True, text=True, env=env)
+        calls = [line for line in (root / 'log').read_text().splitlines()] if (root / 'log').exists() else []
+        return result, calls
+
+    def test_reenable_waits_for_bootout_and_retries_bootstrap(self):
+        # The old job lingers for two `print`s after bootout, and the first
+        # bootstrap fails as launchd still tears it down.
+        script = ('a=sys.argv[1:]\n'
+                  'kinds=[c[0] for c in calls]\n'
+                  'if a[0]=="print":\n'
+                  ' since=kinds[kinds.index("bootout"):]\n'
+                  ' sys.exit(0 if since.count("print")<=2 and "bootstrap" not in since else 1)\n'
+                  'if a[0]=="bootstrap" and kinds.count("bootstrap")==1:sys.exit(5)\n')
+        with tempfile.TemporaryDirectory(prefix='porch-login-') as temporary:
+            root = Path(temporary)
+            plist = root / 'home/Library/LaunchAgents/dev.porch.tray.plist'
+            plist.parent.mkdir(parents=True)
+            plist.write_bytes(plistlib.dumps({'Label': 'dev.porch.tray'}))
+            result, calls = self.run_login(root, script, 'enable')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(plist.exists())
+            kinds = [json_kind(c) for c in calls]
+            first_bootstrap = kinds.index('bootstrap')
+            # Waited for the old job to go before loading the new one.
+            self.assertGreaterEqual(kinds[:first_bootstrap].count('print'), 3, calls)
+            self.assertEqual(kinds.count('bootstrap'), 2, calls)
+
+    def test_failed_reenable_keeps_an_enabled_login_item(self):
+        script = 'a=sys.argv[1:]\nif a[0] in ("print","bootstrap"):sys.exit(5)\n'
+        with tempfile.TemporaryDirectory(prefix='porch-login-') as temporary:
+            root = Path(temporary)
+            plist = root / 'home/Library/LaunchAgents/dev.porch.tray.plist'
+            plist.parent.mkdir(parents=True)
+            plist.write_bytes(plistlib.dumps({'Label': 'dev.porch.tray'}))
+            result, _ = self.run_login(root, script, 'enable')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(plist.exists(), 'an enabled login item must stay enabled')
+            self.assertIn('next login', result.stderr)
+            # A first enable that can't load leaves nothing behind.
+            plist.unlink()
+            result, _ = self.run_login(root, script, 'enable')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(plist.exists())
+
+
+def json_kind(line):
+    import json
+    return json.loads(line)[0]
+
+
 class FormulaTests(unittest.TestCase):
     DIGESTS = {target: f'{index:x}' * 64 for index, target in enumerate(formula.TARGETS, 1)}
 
