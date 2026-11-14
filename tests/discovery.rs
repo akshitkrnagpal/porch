@@ -1269,3 +1269,65 @@ async fn opening_an_app_on_one_peer_never_waits_on_an_unreachable_other_peer() {
     reachable.abort();
     offline.abort();
 }
+
+/// Machines that enrolled each other with pair tokens (`porch peers add`)
+/// unpair as cleanly as code-paired ones: each side's credential is recorded
+/// against the machine that holds it, so `porch unpair` revokes it.
+#[tokio::test]
+async fn unpair_revokes_credentials_issued_through_pair_tokens() {
+    let root = std::env::temp_dir().join(format!("porch-token-unpair-{}", std::process::id()));
+    let a = root.join("node-a");
+    let b = root.join("node-b");
+    let _cleanup = Nodes(vec![a.clone(), b.clone()]);
+    let mut endpoints = Vec::new();
+    for node in [&a, &b] {
+        let port = free_port().to_string();
+        ok(
+            node,
+            &[
+                "discovery",
+                "enable",
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                &port,
+                "--no-advertise",
+            ],
+        )
+        .await;
+        endpoints.push(format!("https://127.0.0.1:{port}"));
+    }
+    let enroll = |from: PathBuf, to: PathBuf, endpoint: String| async move {
+        let pin = ok(&to, &["discovery", "fingerprint"]).await;
+        let token = ok(&to, &["discovery", "pair-token"]).await;
+        let added = command(
+            &from,
+            &["peers", "add", &endpoint, "--fingerprint", pin.trim()],
+            Some(&token),
+        )
+        .await;
+        assert!(
+            added.status.success(),
+            "{}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+    };
+    enroll(a.clone(), b.clone(), endpoints[1].clone()).await;
+    enroll(b.clone(), a.clone(), endpoints[0].clone()).await;
+    let clients = |dir: &Path| -> usize {
+        let auth: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("discovery-auth.json")).unwrap())
+                .unwrap();
+        auth["clients"].as_array().unwrap().len()
+    };
+    assert_eq!((clients(&a), clients(&b)), (1, 1));
+    let unpaired: Value =
+        serde_json::from_str(&ok(&a, &["unpair", "node-b", "--json"]).await).unwrap();
+    assert_eq!(unpaired["reached"], true, "{unpaired}");
+    assert_eq!(unpaired["access_revoked"], true, "{unpaired}");
+    // B's credential for A is gone from A, and A's for B from B, which also
+    // forgot A.
+    assert_eq!((clients(&a), clients(&b)), (0, 0));
+    let left: Snapshot = serde_json::from_str(&ok(&b, &["list", "--all", "--json"]).await).unwrap();
+    assert!(left.peers.is_empty(), "B still lists A after unpair");
+}

@@ -233,20 +233,34 @@ fn autostart_hint() {
     }
 }
 pub async fn unpair(machine: &str, json: bool) -> Result<()> {
-    let (peer, unreached) = super::pairing::unpair(machine).await?;
+    let super::pairing::Unpaired {
+        peer,
+        unreached,
+        access_unknown,
+    } = super::pairing::unpair(machine).await?;
+    let name = &peer.machine.name;
     if json {
-        let mut out = serde_json::json!({"version":PROTOCOL_VERSION,"machine":peer.machine,"reached":unreached.is_none()});
+        let mut out = serde_json::json!({"version":PROTOCOL_VERSION,"machine":peer.machine,"reached":unreached.is_none(),"access_revoked":!access_unknown});
         if let Some(reason) = &unreached {
             out["error"] = reason.as_str().into();
         }
         println!("{out}");
-        return Ok(());
+    } else {
+        println!("Unpaired {name}");
+        if let Some(reason) = &unreached {
+            eprintln!(
+                "{name} was unreachable ({reason}); run `porch unpair` there too.{}",
+                if access_unknown {
+                    ""
+                } else {
+                    " Its access to this machine is already revoked."
+                }
+            );
+        }
     }
-    println!("Unpaired {}", peer.machine.name);
-    if let Some(reason) = unreached {
+    if access_unknown {
         eprintln!(
-            "{} was unreachable ({reason}); run `porch unpair` there too. Its access to this machine is already revoked.",
-            peer.machine.name
+            "Porch can't tell which credential {name} uses to reach this machine (machines added with `porch peers add` by Porch 0.5.2 or earlier aren't recorded), so it may still have access. To be sure, run `porch discovery revoke`, which revokes every machine's access; then pair the ones you keep again."
         );
     }
     Ok(())

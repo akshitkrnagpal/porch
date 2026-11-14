@@ -32,6 +32,8 @@ const MAX_UPLOAD: usize = 16 * 1024 * 1024;
 const PAIR_LIFETIME: u64 = 600;
 /// Pairing attempts allowed per source address per minute (code and token).
 const PAIR_RATE_LIMIT: usize = 10;
+/// Source addresses the pairing rate limiter tracks at once.
+const MAX_ATTEMPT_SOURCES: usize = 4096;
 
 pub fn now() -> u64 {
     SystemTime::now()
@@ -136,9 +138,16 @@ pub(super) fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
+const FORMAT_MARKER: &[u8] = b"1\n";
 pub(super) fn lock(dir: &Path) -> Result<fs::File> {
-    // Preparing the directory through an atomic marker ensures private permissions.
-    write(dir, "discovery-format", b"1\n")?;
+    // Preparing the directory through an atomic marker ensures private
+    // permissions. Once the marker is in place that was done, so later locks
+    // skip the rewrite (and its fsyncs).
+    let prepared = fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+        && fs::read(dir.join("discovery-format")).is_ok_and(|v| v == FORMAT_MARKER);
+    if !prepared {
+        write(dir, "discovery-format", FORMAT_MARKER)?;
+    }
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
@@ -234,6 +243,7 @@ pub fn closed_message(state: PairState, reason: Option<&str>) -> String {
             "too many wrong pairing codes; the code was cancelled. Run porch pair again".into()
         }
         (PairState::Cancelled, Some("host_full")) => "this machine cannot store another paired machine; remove an unused one with porch unpair, then run porch pair again".into(),
+        (PairState::Cancelled, Some("already_paired")) => "the machine that entered the code claims the ID of a machine already paired here, with a different certificate. If that machine was reinstalled, run porch unpair for it, then run porch pair again".into(),
         (PairState::Cancelled, _) => "pairing cancelled; the code no longer works".into(),
         (PairState::Replaced, _) => {
             "another pairing code was started; this one no longer works".into()
@@ -260,6 +270,10 @@ fn os_hostname() -> Option<String> {
     None
 }
 fn machine(dir: &Path) -> Result<Machine> {
+    // The identity is written once, atomically; reading it needs no lock.
+    if let Some(value) = read(&dir.join("discovery-machine.json"))? {
+        return Ok(value);
+    }
     let _lock = lock(dir)?;
     if let Some(value) = read(&dir.join("discovery-machine.json"))? {
         return Ok(value);
@@ -270,9 +284,18 @@ fn machine(dir: &Path) -> Result<Machine> {
         .find_map(|v| std::env::var(v).ok().filter(|s| !s.trim().is_empty()))
         .or_else(os_hostname)
         .unwrap_or_else(|| "Porch machine".into());
+    let name: String = name
+        .chars()
+        .filter(|c| !c.is_control() && !super::client::is_format_char(*c))
+        .take(128)
+        .collect();
     let value = Machine {
         id: random()?,
-        name: name.chars().filter(|c| !c.is_control()).take(128).collect(),
+        name: if name.trim().is_empty() {
+            "Porch machine".into()
+        } else {
+            name
+        },
     };
     write(dir, "discovery-machine.json", &serde_json::to_vec(&value)?)?;
     Ok(value)
@@ -574,12 +597,14 @@ fn close_pairing_in(dir: &Path, id: &str) -> Result<PairingProgress> {
 }
 /// The open window's public salt and SPAKE2 password, if a code is showing.
 fn open_window(dir: &Path) -> Option<(String, String)> {
+    open_window_state(dir).map(|w| (w.salt, w.hash))
+}
+fn open_window_state(dir: &Path) -> Option<PairingWindow> {
     read::<Auth>(&dir.join("discovery-auth.json"))
         .ok()
         .flatten()
         .and_then(|a| a.pairing)
         .filter(|w| w.expires > now() && w.failures < PAIR_CODE_MAX_FAILURES && !w.salt.is_empty())
-        .map(|w| (w.salt, w.hash))
 }
 #[cfg(test)]
 fn pairing_open(dir: &Path) -> bool {
@@ -612,9 +637,27 @@ fn code_failed(dir: &Path, salt: &str) -> Result<()> {
     }
     write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)
 }
+/// The joiner proved the code but claims the identity of another paired
+/// machine: close the window so whoever shows the code learns why.
+fn code_conflict(dir: &Path, salt: &str) -> Result<()> {
+    let _lock = lock(dir)?;
+    let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    let Some(window) = auth.pairing.take_if(|w| equal(&w.salt, salt)) else {
+        return Ok(());
+    };
+    auth.pairing_result = Some(PairingResult::closed(
+        window.id,
+        window.expires,
+        PairState::Cancelled,
+        Some("already_paired"),
+    ));
+    write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)
+}
 /// The joiner proved the code for window `salt`: consume the window and enroll
-/// a new bearer labelled with the peer's machine ID.
-fn code_accepted(dir: &Path, salt: &str, peer: &Machine) -> Result<CodeOutcome> {
+/// a new bearer labelled with the peer's machine ID. `replaces` is set when it
+/// is a paired machine pairing again (the same certificate), whose previous
+/// credentials it replaces; otherwise credentials labelled with its ID stay.
+fn code_accepted(dir: &Path, salt: &str, peer: &Machine, replaces: bool) -> Result<CodeOutcome> {
     let _lock = lock(dir)?;
     let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
     let Some(window) = auth.pairing.as_ref().filter(|w| equal(&w.salt, salt)) else {
@@ -637,7 +680,7 @@ fn code_accepted(dir: &Path, salt: &str, peer: &Machine) -> Result<CodeOutcome> 
     let stale: Vec<String> = auth
         .labels
         .iter()
-        .filter(|(_, m)| **m == peer.id)
+        .filter(|(_, m)| replaces && **m == peer.id)
         .map(|(d, _)| d.clone())
         .collect();
     let mut clients = auth.clients.clone();
@@ -723,20 +766,48 @@ pub fn label_client(bearer: &str, machine_id: &str) -> Result<()> {
     write(&dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)
 }
 pub fn revoke_bearer(bearer: &str) -> Result<()> {
-    revoke_where(&state::dir(), |d, _| d == digest(bearer))
+    revoke_where(&state::dir(), |d, _| d == digest(bearer)).map(|_| ())
+}
+/// What revoking one machine's access did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Revoked {
+    /// Credentials issued to that machine, now revoked.
+    pub revoked: usize,
+    /// Credentials whose machine isn't recorded (enrolled with `porch peers
+    /// add` from Porch 0.5.2 or earlier, or left by an interrupted pairing).
+    /// Any of them could be that machine's.
+    pub unidentified: usize,
 }
 /// Revoke every credential this machine issued to `machine_id`.
-pub fn revoke_machine(machine_id: &str) -> Result<()> {
-    revoke_where(&state::dir(), |_, m| m == Some(machine_id))
+pub fn revoke_machine(machine_id: &str) -> Result<Revoked> {
+    revoke_machine_in(&state::dir(), machine_id)
 }
-fn revoke_where(dir: &Path, f: impl Fn(&str, Option<&str>) -> bool) -> Result<()> {
+fn revoke_machine_in(dir: &Path, machine_id: &str) -> Result<Revoked> {
+    let revoked = revoke_where(dir, |_, m| m == Some(machine_id))?;
+    let auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    let unidentified = auth
+        .clients
+        .iter()
+        .filter(|d| auth.labels.get(*d).is_none_or(|m| m == PENDING_LABEL))
+        .count();
+    Ok(Revoked {
+        revoked,
+        unidentified,
+    })
+}
+/// Label of a credential minted for a pairing that hasn't finished yet.
+pub const PENDING_LABEL: &str = "pending";
+/// Remove the credentials `f` selects; returns how many.
+fn revoke_where(dir: &Path, f: impl Fn(&str, Option<&str>) -> bool) -> Result<usize> {
     let _lock = lock(dir)?;
     let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
     let labels = auth.labels.clone();
+    let before = auth.clients.len();
     auth.clients
         .retain(|d| !f(d, labels.get(d).map(String::as_str)));
     auth.labels.retain(|d, m| !f(d, Some(m)));
-    write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)
+    write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
+    Ok(before - auth.clients.len())
 }
 pub fn create_pairing_token() -> Result<String> {
     config()?.context("discovery is disabled")?;
@@ -798,7 +869,9 @@ fn authorize(dir: &Path, token: &str) -> Result<bool> {
     }
     Ok(true)
 }
-fn enroll(dir: &Path, token: &str) -> Result<Option<String>> {
+/// Explicit enrollment with a pair token. The credential is labelled with the
+/// enrolling machine's ID when it sends one, so `porch unpair` can revoke it.
+fn enroll(dir: &Path, token: &str, machine: Option<&str>) -> Result<Option<String>> {
     if token.len() != 64 {
         return Ok(None);
     }
@@ -816,6 +889,9 @@ fn enroll(dir: &Path, token: &str) -> Result<Option<String>> {
     }
     let bearer = random()?;
     auth.clients.push(digest(&bearer));
+    if let Some(machine) = machine {
+        auth.labels.insert(digest(&bearer), machine.into());
+    }
     auth.invitation = None;
     write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
     Ok(Some(bearer))
@@ -985,6 +1061,35 @@ fn strip(headers: &mut header::HeaderMap) {
         headers.remove(name);
     }
 }
+/// Headers through which a client could claim another address, host, scheme
+/// or path to the app. A paired machine's request never carries them through.
+fn strip_forwarding(headers: &mut header::HeaderMap) {
+    let names: Vec<_> = headers
+        .keys()
+        .filter(|h| {
+            let h = h.as_str();
+            h.starts_with("x-forwarded-")
+                || h.starts_with("x-original-")
+                || matches!(
+                    h,
+                    "forwarded"
+                        | "x-real-ip"
+                        | "x-client-ip"
+                        | "true-client-ip"
+                        | "x-rewrite-url"
+                        | "x-host"
+                        | "x-proxyuser-ip"
+                        | "cf-connecting-ip"
+                        | "fastly-client-ip"
+                        | "x-cluster-client-ip"
+                )
+        })
+        .cloned()
+        .collect();
+    for name in names {
+        headers.remove(name);
+    }
+}
 #[derive(Clone)]
 struct ContextState {
     dir: PathBuf,
@@ -998,9 +1103,35 @@ struct ContextState {
     loopback_insecure: crate::upstream::LoopbackClient<Body>,
     tunnels: Arc<tokio::sync::Semaphore>,
     attempts: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
-    /// In-progress code-pairing key exchanges, by random session ID.
-    sessions: Arc<Mutex<HashMap<String, PairSession>>>,
+    /// In-progress code-pairing key exchanges.
+    sessions: Arc<Mutex<Sessions>>,
     catalog: Arc<tokio::sync::Mutex<Option<CatalogCopy>>>,
+}
+#[derive(Default)]
+struct Sessions {
+    /// By random session ID.
+    live: HashMap<String, PairSession>,
+    /// Key confirmations being checked right now. Each may become a wrong
+    /// guess, so together with the window's recorded failures they never
+    /// exceed the cap.
+    checking: u32,
+}
+impl Sessions {
+    fn expire(&mut self) {
+        self.live
+            .retain(|_, s| s.started.elapsed() < PAIR_SESSION_LIFETIME);
+    }
+    /// Drop the oldest exchange that hasn't proved the code yet, among those
+    /// `f` selects. Proved ones are kept: they hold the right code.
+    fn evict_oldest(&mut self, f: impl Fn(&PairSession) -> bool) -> bool {
+        let oldest = self
+            .live
+            .iter()
+            .filter(|(_, s)| !s.confirmed && f(s))
+            .min_by_key(|(_, s)| s.started)
+            .map(|(id, _)| id.clone());
+        oldest.is_some_and(|id| self.live.remove(&id).is_some())
+    }
 }
 type CatalogKey = (
     bool,
@@ -1017,15 +1148,29 @@ struct PairSession {
     key: super::pake::Key,
     confirmed: bool,
     started: Instant,
+    source: IpAddr,
 }
 /// A key exchange must finish within this time (the joiner may start its agent).
 const PAIR_SESSION_LIFETIME: Duration = Duration::from_secs(60);
 const MAX_PAIR_SESSIONS: usize = 16;
+/// Unproved exchanges one source address may hold; a new one replaces its oldest.
+const MAX_PAIR_SESSIONS_PER_SOURCE: usize = 2;
+/// Releases a counted key confirmation however its check ends.
+struct Checking<'a>(&'a Mutex<Sessions>);
+impl Drop for Checking<'_> {
+    fn drop(&mut self) {
+        let mut all = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        all.checking = all.checking.saturating_sub(1);
+    }
+}
 impl ContextState {
+    fn sessions(&self) -> std::sync::MutexGuard<'_, Sessions> {
+        self.sessions.lock().unwrap_or_else(|p| p.into_inner())
+    }
     fn take_session(&self, id: &str) -> Option<PairSession> {
-        let mut all = self.sessions.lock().ok()?;
-        all.retain(|_, s| s.started.elapsed() < PAIR_SESSION_LIFETIME);
-        all.remove(id)
+        let mut all = self.sessions();
+        all.expire();
+        all.live.remove(id)
     }
     fn sharing(&self) -> bool {
         read_cached::<ServerConfig>(&self.dir.join("discovery-config.json"))
@@ -1057,16 +1202,30 @@ impl ContextState {
     }
     /// Per-source pairing rate limit, independent of the per-window failure cap.
     fn allow_attempt(&self, source: IpAddr) -> bool {
-        let Ok(mut all) = self.attempts.lock() else {
-            return false;
-        };
-        let cutoff = Instant::now() - Duration::from_secs(60);
-        all.retain(|_, v| {
-            v.retain(|t| *t > cutoff);
-            !v.is_empty()
-        });
-        if all.len() > 4096 {
-            return false;
+        // A panic elsewhere must not lock everyone out until restart.
+        let mut all = self
+            .attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // `Instant` can be younger than a minute (Windows counts from boot),
+        // where subtracting would panic.
+        if let Some(cutoff) = Instant::now().checked_sub(Duration::from_secs(60)) {
+            all.retain(|_, v| {
+                v.retain(|t| *t > cutoff);
+                !v.is_empty()
+            });
+        }
+        // Too many sources to track: forget the one seen longest ago rather
+        // than refusing everyone. Each key exchange still allows one guess and
+        // the code's own cap still holds.
+        if all.len() >= MAX_ATTEMPT_SOURCES && !all.contains_key(&source) {
+            let oldest = all
+                .iter()
+                .min_by_key(|(_, v)| v.back().copied())
+                .map(|(ip, _)| *ip);
+            if let Some(ip) = oldest {
+                all.remove(&ip);
+            }
         }
         let entry = all.entry(source).or_default();
         if entry.len() >= PAIR_RATE_LIMIT {
@@ -1143,7 +1302,11 @@ fn session_expired() -> Response<Body> {
 }
 /// Step 1: answer the joiner's SPAKE2 message. Nothing here reveals the code
 /// or lets a caller test a guess; only a key confirmation (step 2) does.
-async fn pair_start(req: Request<Incoming>, context: &ContextState) -> Result<Response<Body>> {
+async fn pair_start(
+    req: Request<Incoming>,
+    context: &ContextState,
+    source: IpAddr,
+) -> Result<Response<Body>> {
     let Some(input) = small_body::<PairStart>(req, 1024).await else {
         return Ok(bad_pairing_request());
     };
@@ -1168,24 +1331,36 @@ async fn pair_start(req: Request<Incoming>, context: &ContextState) -> Result<Re
         return Ok(bad_pairing_request());
     };
     let session = random()?;
-    let Ok(mut all) = context.sessions.lock() else {
-        bail!("pairing session state poisoned")
-    };
-    all.retain(|_, s| s.started.elapsed() < PAIR_SESSION_LIFETIME);
-    if all.len() >= MAX_PAIR_SESSIONS {
+    let mut all = context.sessions();
+    all.expire();
+    // Abandoned exchanges must not fill the table: one source keeps only its
+    // newest few, and a full table drops the oldest unproved one.
+    while all
+        .live
+        .values()
+        .filter(|s| s.source == source && !s.confirmed)
+        .count()
+        >= MAX_PAIR_SESSIONS_PER_SOURCE
+    {
+        if !all.evict_oldest(|s| s.source == source) {
+            break;
+        }
+    }
+    if all.live.len() >= MAX_PAIR_SESSIONS && !all.evict_oldest(|_| true) {
         return Ok(pair_error(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
             "too many pairing attempts; wait a minute",
         ));
     }
-    all.insert(
+    all.live.insert(
         session.clone(),
         PairSession {
             salt,
             key,
             confirmed: false,
             started: Instant::now(),
+            source,
         },
     );
     Ok(json(&PairStarted { session, msg }))
@@ -1197,29 +1372,47 @@ async fn pair_confirm(req: Request<Incoming>, context: &ContextState) -> Result<
     let Some(input) = small_body::<PairConfirm>(req, 1024).await else {
         return Ok(bad_pairing_request());
     };
-    let Some(mut session) = context
-        .take_session(&input.session)
-        .filter(|s| !s.confirmed)
-    else {
-        return Ok(session_expired());
-    };
     let pin = super::client::normalize_pin(&fingerprint_in(&context.dir)?)?;
+    // Count the guess before testing it, atomically with reading the window's
+    // failures: concurrent confirmations can't test more codes than the cap,
+    // and none is tested once the code is closed.
+    let (mut session, checking) = {
+        let mut all = context.sessions();
+        all.expire();
+        let Some(session) = all.live.remove(&input.session).filter(|s| !s.confirmed) else {
+            return Ok(session_expired());
+        };
+        let Some(window) =
+            open_window_state(&context.dir).filter(|w| equal(&w.salt, &session.salt))
+        else {
+            return Ok(not_waiting());
+        };
+        if window.failures + all.checking >= PAIR_CODE_MAX_FAILURES {
+            return Ok(pair_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "too many pairing attempts; wait a minute",
+            ));
+        }
+        all.checking += 1;
+        (session, Checking(&context.sessions))
+    };
     if !session.key.check_joiner_confirm(&pin, &input.confirm) {
         code_failed(&context.dir, &session.salt)?;
+        drop(checking);
         return Ok(pair_error(
             StatusCode::UNAUTHORIZED,
             "wrong_code",
             "wrong pairing code",
         ));
     }
+    drop(checking);
     if open_window(&context.dir).is_none_or(|(salt, _)| !equal(&salt, &session.salt)) {
         return Ok(not_waiting());
     }
     let confirm = session.key.host_confirm(&pin);
     session.confirmed = true;
-    if let Ok(mut all) = context.sessions.lock() {
-        all.insert(input.session, session);
-    }
+    context.sessions().live.insert(input.session, session);
     Ok(json(&PairConfirmed { confirm }))
 }
 /// Step 3: both sides proved the code. Store the joiner, enroll its credential.
@@ -1232,6 +1425,7 @@ async fn pair_finish(req: Request<Incoming>, context: &ContextState) -> Result<R
     };
     let peer_ok = super::client::validate_machine(&input.machine).is_ok()
         && input.machine.id != context.machine.id
+        && input.machine.id != PENDING_LABEL
         && super::client::validate_endpoint(&input.endpoint).is_ok()
         && super::client::normalize_pin(&input.fingerprint).is_ok()
         && valid_secret(&input.token)
@@ -1245,7 +1439,24 @@ async fn pair_finish(req: Request<Incoming>, context: &ContextState) -> Result<R
     if !peer_ok {
         return Ok(bad_pairing_request());
     }
-    match code_accepted(&context.dir, &session.salt, &input.machine)? {
+    // Machine IDs are public. A paired machine is replaced only by itself
+    // (its pinned certificate), never by whoever claims its ID.
+    let paired = super::client::peers_in(&context.dir)?;
+    if let Some(conflict) =
+        super::client::identity_conflict(&paired, &input.machine.id, &input.fingerprint)
+    {
+        code_conflict(&context.dir, &session.salt)?;
+        return Ok(pair_error(
+            StatusCode::CONFLICT,
+            "already_paired",
+            &format!(
+                "a different machine is already paired here as {}; if this machine was reinstalled, run porch unpair for it on that machine, then pair again",
+                conflict.existing.name
+            ),
+        ));
+    }
+    let replaces = paired.iter().any(|p| p.machine.id == input.machine.id);
+    match code_accepted(&context.dir, &session.salt, &input.machine, replaces)? {
         CodeOutcome::Closed => Ok(not_waiting()),
         CodeOutcome::Full => Ok(host_full()),
         CodeOutcome::Accepted(token) => {
@@ -1260,8 +1471,15 @@ async fn pair_finish(req: Request<Incoming>, context: &ContextState) -> Result<R
                 last_seen: now(),
                 slug: String::new(),
             };
-            if super::client::upsert_peer_in(&context.dir, peer).is_err() {
+            if let Err(e) = super::client::upsert_peer_in(&context.dir, peer) {
                 reject_accepted(&context.dir, &token)?;
+                if e.is::<super::client::IdentityConflict>() {
+                    return Ok(pair_error(
+                        StatusCode::CONFLICT,
+                        "already_paired",
+                        "a different machine is already paired here with this machine's ID",
+                    ));
+                }
                 return Ok(host_full());
             }
             let mac = session.key.host_payload(&context.machine, &token);
@@ -1278,6 +1496,7 @@ async fn request(
     mut req: Request<Incoming>,
     context: Arc<ContextState>,
     source: IpAddr,
+    connection: &Connection,
 ) -> Result<Response<Body>> {
     if req.headers().contains_key(header::ORIGIN) {
         return Ok(response(
@@ -1319,7 +1538,7 @@ async fn request(
                     "this machine uses a newer, authenticated pairing protocol; update Porch on the joining machine",
                 ))
             }
-            "/v1/pair-code/start" => return pair_start(req, &context).await,
+            "/v1/pair-code/start" => return pair_start(req, &context, source).await,
             "/v1/pair-code/confirm" => return pair_confirm(req, &context).await,
             "/v1/pair-code/finish" => return pair_finish(req, &context).await,
             _ => {}
@@ -1339,7 +1558,20 @@ async fn request(
             Ok(v) => v,
             Err(_) => return Ok(response(StatusCode::BAD_REQUEST, "invalid pairing request")),
         };
-        return Ok(match enroll(&context.dir, &input.token) {
+        // Older clients send no machine; an invalid one is refused before the
+        // single-use token is spent.
+        let machine = match &input.machine {
+            Some(m)
+                if super::client::validate_machine(m).is_err()
+                    || m.id == context.machine.id
+                    || m.id == PENDING_LABEL =>
+            {
+                return Ok(response(StatusCode::BAD_REQUEST, "invalid pairing request"))
+            }
+            Some(m) => Some(m.id.as_str()),
+            None => None,
+        };
+        return Ok(match enroll(&context.dir, &input.token, machine) {
             Ok(Some(token)) => json(&PairResponse {
                 version: PROTOCOL_VERSION,
                 machine: context.machine.clone(),
@@ -1363,6 +1595,7 @@ async fn request(
             "pair this machine before requesting its catalog",
         ));
     }
+    connection.authenticated(source);
     if req.uri().path() == "/v1/catalog" && req.method() == Method::GET {
         return Ok(json(&context.peer_catalog(context.sharing()).await?));
     }
@@ -1487,14 +1720,14 @@ async fn request(
     for h in private {
         req.headers_mut().remove(h);
     }
+    // The paired machine cannot speak for the client address, host or scheme
+    // the app sees; those are set below from what this agent knows.
+    strip_forwarding(req.headers_mut());
     if let Some(v) = origin {
         req.headers_mut().insert(header::ORIGIN, v);
     }
     if let Some(v) = auth {
         req.headers_mut().insert(header::AUTHORIZATION, v);
-    }
-    if let Some(v) = original_host {
-        req.headers_mut().insert("x-forwarded-host", v);
     }
     let public = route_url(&settings, &route.name);
     let public = url::Url::parse(&public)?;
@@ -1503,12 +1736,28 @@ async fn request(
         None => public[url::Position::BeforeHost..url::Position::AfterPort].to_owned(),
     };
     req.headers_mut().insert(header::HOST, host.parse()?);
-    // The scheme the browser used on the paired machine, so apps build
-    // correct redirects and secure cookies.
-    req.headers_mut().insert(
-        "x-forwarded-proto",
-        original_proto.unwrap_or(header::HeaderValue::from_static("http")),
-    );
+    // The scheme and host the browser used on the paired machine, so apps
+    // build correct redirects and secure cookies, and the paired machine's
+    // address as the client.
+    let proto = original_proto.unwrap_or(header::HeaderValue::from_static("http"));
+    let forwarded_host = original_host
+        .filter(|v| {
+            v.to_str()
+                .is_ok_and(|h| h.parse::<hyper::http::uri::Authority>().is_ok())
+        })
+        .unwrap_or(host.parse()?);
+    let forwarded_port = forwarded_host
+        .to_str()
+        .ok()
+        .and_then(|h| h.parse::<hyper::http::uri::Authority>().ok())
+        .and_then(|a| a.port_u16())
+        .unwrap_or(if proto == "https" { 443 } else { 80 });
+    req.headers_mut()
+        .insert("x-forwarded-for", source.to_string().parse()?);
+    req.headers_mut().insert("x-forwarded-host", forwarded_host);
+    req.headers_mut().insert("x-forwarded-proto", proto);
+    req.headers_mut()
+        .insert("x-forwarded-port", forwarded_port.to_string().parse()?);
     if websocket {
         req.headers_mut().insert(
             header::UPGRADE,
@@ -1719,13 +1968,14 @@ pub async fn serve() -> Result<()> {
         client: upstream(&dir)?,
         loopback: crate::upstream::client(tls_roots(&dir)?),
         loopback_insecure: crate::upstream::client(crate::upstream::insecure_tls()?),
-        tunnels: Arc::new(tokio::sync::Semaphore::new(64)),
+        tunnels: Arc::new(tokio::sync::Semaphore::new(MAX_TUNNELS)),
         attempts: Arc::default(),
         sessions: Arc::default(),
         catalog: Arc::default(),
     });
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
-    let slots = Arc::new(tokio::sync::Semaphore::new(64));
+    raise_open_file_limit();
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     state::atomic_write("discovery.ready", std::process::id().to_string().as_bytes())?;
     connections(listener, acceptor, context, slots).await
 }
@@ -1743,39 +1993,276 @@ pub(super) fn http2_settings<E>(mut builder: hyper_util::server::conn::auto::Htt
         .keep_alive_interval(Some(Duration::from_secs(20)))
         .keep_alive_timeout(Duration::from_secs(10));
 }
+/// Connections plus the app connections and tunnels they relay need more
+/// descriptors than macOS's default soft limit of 256.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit read and write the struct passed by pointer.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 && limit.rlim_cur < 4096 {
+            limit.rlim_cur = limit.rlim_max.min(4096);
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    }
+}
+#[cfg(not(unix))]
+fn raise_open_file_limit() {}
+/// Connections the agent serves at once.
+const MAX_CONNECTIONS: usize = 256;
+/// Upgraded connections (WebSockets) relayed at once. They release their
+/// connection slot when they upgrade, so they don't crowd out catalog
+/// requests or pairing.
+const MAX_TUNNELS: usize = 128;
+/// How many connections sources get. A source that has authenticated
+/// (or is a paired machine's address) is trusted; any other device on the
+/// network shares a smaller pool, a few connections each, so it can't take
+/// the slots paired machines need.
+#[derive(Clone, Copy, Debug)]
+struct ConnectionLimits {
+    per_source: usize,
+    untrusted: usize,
+    per_untrusted_source: usize,
+    /// A connection that has never authenticated is closed after this long
+    /// without a request in progress...
+    idle: Duration,
+    /// ...and after this long in any case. Pairing needs less than a minute.
+    lifetime: Duration,
+}
+impl Default for ConnectionLimits {
+    fn default() -> Self {
+        Self {
+            per_source: 128,
+            untrusted: 64,
+            per_untrusted_source: 8,
+            idle: Duration::from_secs(15),
+            lifetime: Duration::from_secs(90),
+        }
+    }
+}
+/// How long an address stays trusted after its last authenticated request.
+const TRUSTED_SOURCE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_TRUSTED_SOURCES: usize = 1024;
+#[derive(Default)]
+struct Admission {
+    open: HashMap<IpAddr, usize>,
+    untrusted: usize,
+    trusted: HashMap<IpAddr, Instant>,
+}
+impl Admission {
+    fn is_trusted(&self, ip: IpAddr) -> bool {
+        self.trusted
+            .get(&ip)
+            .is_some_and(|t| t.elapsed() < TRUSTED_SOURCE_TTL)
+    }
+    fn trust(&mut self, ip: IpAddr) {
+        if self.trusted.len() >= MAX_TRUSTED_SOURCES && !self.trusted.contains_key(&ip) {
+            self.trusted.retain(|_, t| t.elapsed() < TRUSTED_SOURCE_TTL);
+            if self.trusted.len() >= MAX_TRUSTED_SOURCES {
+                let oldest = self
+                    .trusted
+                    .iter()
+                    .min_by_key(|(_, t)| **t)
+                    .map(|(ip, _)| *ip);
+                if let Some(oldest) = oldest {
+                    self.trusted.remove(&oldest);
+                }
+            }
+        }
+        self.trusted.insert(ip, Instant::now());
+    }
+}
+/// Admit a connection from `source`, or refuse it when its pool is full.
+fn admit(
+    admission: &Arc<Mutex<Admission>>,
+    source: IpAddr,
+    limits: &ConnectionLimits,
+) -> Option<Connection> {
+    let mut a = admission.lock().unwrap_or_else(|p| p.into_inner());
+    let trusted = a.is_trusted(source);
+    let open = a.open.get(&source).copied().unwrap_or_default();
+    let allowed = if trusted {
+        open < limits.per_source
+    } else {
+        open < limits.per_untrusted_source && a.untrusted < limits.untrusted
+    };
+    if !allowed {
+        return None;
+    }
+    *a.open.entry(source).or_default() += 1;
+    if !trusted {
+        a.untrusted += 1;
+    }
+    Some(Connection {
+        admission: admission.clone(),
+        source,
+        untrusted: std::sync::atomic::AtomicBool::new(!trusted),
+        authenticated: Default::default(),
+        active: Default::default(),
+        last_active: Mutex::new(Instant::now()),
+    })
+}
+/// One admitted connection and what it has done, for closing ones that never
+/// authenticate. Gives its place back when dropped.
+struct Connection {
+    admission: Arc<Mutex<Admission>>,
+    source: IpAddr,
+    /// Counted in the untrusted pool.
+    untrusted: std::sync::atomic::AtomicBool,
+    authenticated: std::sync::atomic::AtomicBool,
+    active: std::sync::atomic::AtomicUsize,
+    last_active: Mutex<Instant>,
+}
+impl Drop for Connection {
+    fn drop(&mut self) {
+        let mut a = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = a.open.get_mut(&self.source) {
+            *n -= 1;
+            if *n == 0 {
+                a.open.remove(&self.source);
+            }
+        }
+        if *self.untrusted.get_mut() {
+            a.untrusted -= 1;
+        }
+    }
+}
+impl Connection {
+    /// A request on this connection authenticated: its source is trusted from
+    /// now on, and the connection leaves the untrusted pool.
+    fn authenticated(&self, source: IpAddr) {
+        use std::sync::atomic::Ordering;
+        if !self.authenticated.swap(true, Ordering::Relaxed) {
+            let mut a = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+            a.trust(source);
+            if self.untrusted.swap(false, Ordering::Relaxed) {
+                a.untrusted -= 1;
+            }
+        }
+    }
+    fn touch(&self, delta: isize) {
+        use std::sync::atomic::Ordering;
+        if delta > 0 {
+            self.active.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.active.fetch_sub(1, Ordering::Relaxed);
+        }
+        *self.last_active.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+    }
+    /// Resolves once this connection should be closed for never authenticating.
+    async fn expired(&self, opened: Instant, limits: ConnectionLimits) {
+        use std::sync::atomic::Ordering;
+        let tick = limits.idle.min(Duration::from_secs(1)) / 2;
+        loop {
+            tokio::time::sleep(tick).await;
+            if self.authenticated.load(Ordering::Relaxed) {
+                return std::future::pending().await;
+            }
+            let idle = self.active.load(Ordering::Relaxed) == 0
+                && self
+                    .last_active
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .elapsed()
+                    >= limits.idle;
+            if idle || opened.elapsed() >= limits.lifetime {
+                return;
+            }
+        }
+    }
+}
+/// Ends a request's activity on the connection however the request ends.
+struct Active<'a>(&'a Connection);
+impl Drop for Active<'_> {
+    fn drop(&mut self) {
+        self.0.touch(-1);
+    }
+}
 async fn connections(
     listener: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
     context: Arc<ContextState>,
     slots: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
+    connections_limited(
+        listener,
+        acceptor,
+        context,
+        slots,
+        ConnectionLimits::default(),
+    )
+    .await
+}
+async fn connections_limited(
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    context: Arc<ContextState>,
+    slots: Arc<tokio::sync::Semaphore>,
+    limits: ConnectionLimits,
+) -> Result<()> {
+    let admission = Arc::new(Mutex::new(Admission::default()));
+    // Paired machines' addresses are trusted from the start, so they keep
+    // their headroom across agent restarts.
+    if let Ok(peers) = super::client::peers_in(&context.dir) {
+        let mut a = admission.lock().unwrap_or_else(|p| p.into_inner());
+        for ip in peers.iter().filter_map(|p| endpoint_ip(&p.endpoint)) {
+            a.trust(ip);
+        }
+    }
     loop {
-        let (stream, remote) = listener.accept().await?;
+        // A failed accept (out of file descriptors, a connection reset before
+        // it was accepted) must not stop the agent.
+        let (stream, remote) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Porch discovery: accepting a connection failed: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let _ = stream.set_nodelay(true);
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             drop(stream);
             continue;
         };
+        let Some(connection) = admit(&admission, remote.ip(), &limits) else {
+            drop(stream);
+            continue;
+        };
+        let connection = Arc::new(connection);
         let acceptor = acceptor.clone();
         let context = context.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let opened = Instant::now();
             let Ok(Ok(stream)) =
                 tokio::time::timeout(Duration::from_secs(5), acceptor.accept(stream)).await
             else {
                 return;
             };
-            let service = hyper::service::service_fn(move |req| {
-                let context = context.clone();
-                async move {
-                    Ok::<_, Infallible>(match request(req, context, remote.ip()).await {
-                        Ok(v) => v,
-                        Err(_) => {
-                            response(StatusCode::INTERNAL_SERVER_ERROR, "agent request failed")
-                        }
-                    })
-                }
-            });
+            let service = {
+                let connection = connection.clone();
+                hyper::service::service_fn(move |req| {
+                    let context = context.clone();
+                    let connection = connection.clone();
+                    async move {
+                        connection.touch(1);
+                        let _active = Active(&connection);
+                        Ok::<_, Infallible>(
+                            match request(req, context, remote.ip(), &connection).await {
+                                Ok(v) => v,
+                                Err(_) => response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "agent request failed",
+                                ),
+                            },
+                        )
+                    }
+                })
+            };
             let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
             builder
                 .http1()
@@ -1784,10 +2271,24 @@ async fn connections(
                 .max_headers(64)
                 .max_buf_size(32 * 1024);
             http2_settings(builder.http2());
-            let _ = builder
-                .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                .await;
+            let conn = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
+            tokio::pin!(conn);
+            tokio::select! {
+                _ = conn.as_mut() => {}
+                _ = connection.expired(opened, limits) => {
+                    // Never authenticated: let a request in progress finish, then close.
+                    conn.as_mut().graceful_shutdown();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
+                }
+            }
         });
+    }
+}
+fn endpoint_ip(endpoint: &str) -> Option<IpAddr> {
+    match url::Url::parse(endpoint).ok()?.host()? {
+        url::Host::Ipv4(ip) => Some(ip.into()),
+        url::Host::Ipv6(ip) => Some(ip.into()),
+        url::Host::Domain(_) => None,
     }
 }
 

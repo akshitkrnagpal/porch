@@ -3329,7 +3329,12 @@ async fn clean_discovery() -> Result<()> {
     use crate::discovery;
     let peers = discovery::client::peers().unwrap_or_default();
     for peer in peers {
-        match discovery::pairing::unpair(&peer.machine.id).await {
+        // Every credential is deleted with the state files below, so access
+        // ends even where unpair can't tell which credential is the machine's.
+        match discovery::pairing::unpair(&peer.machine.id)
+            .await
+            .map(|u| (u.peer, u.unreached))
+        {
             Ok((peer, None)) => println!("Unpaired {}", peer.machine.name),
             Ok((peer, Some(reason))) => eprintln!(
                 "Unpaired {}, which was unreachable ({reason}); it keeps listing this machine until you run `porch unpair` there, but can no longer connect.",

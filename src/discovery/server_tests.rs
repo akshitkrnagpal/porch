@@ -45,9 +45,9 @@ fn invitations_expire_and_are_consumed_and_bearers_can_be_revoked() {
         &serde_json::to_vec(&auth).unwrap(),
     )
     .unwrap();
-    assert!(enroll(&dir, "bad").unwrap().is_none());
-    let bearer = enroll(&dir, &token).unwrap().unwrap();
-    assert!(enroll(&dir, &token).unwrap().is_none());
+    assert!(enroll(&dir, "bad", None).unwrap().is_none());
+    let bearer = enroll(&dir, &token, None).unwrap().unwrap();
+    assert!(enroll(&dir, &token, None).unwrap().is_none());
     assert!(paired(&dir, &bearer).unwrap());
     assert!(!paired(&dir, &token).unwrap());
     let expired = Auth {
@@ -65,7 +65,7 @@ fn invitations_expire_and_are_consumed_and_bearers_can_be_revoked() {
     )
     .unwrap();
     assert!(!paired(&dir, &bearer).unwrap());
-    assert!(enroll(&dir, &token).unwrap().is_none());
+    assert!(enroll(&dir, &token, None).unwrap().is_none());
     let _ = fs::remove_dir_all(dir);
 }
 #[test]
@@ -394,6 +394,7 @@ async fn pair(f: &Fixture) -> String {
         None,
         serde_json::to_string(&PairRequest {
             token: invitation.clone(),
+            machine: None,
         })
         .unwrap(),
     )
@@ -407,7 +408,11 @@ async fn pair(f: &Fixture) -> String {
         "/v1/pair",
         None,
         None,
-        serde_json::to_string(&PairRequest { token: invitation }).unwrap(),
+        serde_json::to_string(&PairRequest {
+            token: invitation,
+            machine: None,
+        })
+        .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -562,7 +567,7 @@ fn try_code(dir: &Path, code: &str, peer: &Machine) -> Tried {
         code_failed(dir, &w.salt).unwrap();
         return Tried::Wrong;
     }
-    match code_accepted(dir, &w.salt, peer).unwrap() {
+    match code_accepted(dir, &w.salt, peer, true).unwrap() {
         CodeOutcome::Accepted(b) => Tried::Accepted(b),
         CodeOutcome::Closed => Tried::Closed,
         CodeOutcome::Full => Tried::Full,
@@ -748,7 +753,7 @@ fn a_proof_for_an_old_window_does_not_open_a_new_one() {
     );
     open_pairing_in(&dir, PAIR_CODE_LIFETIME).unwrap();
     assert!(matches!(
-        code_accepted(&dir, &old.salt, &joiner("laptop")).unwrap(),
+        code_accepted(&dir, &old.salt, &joiner("laptop"), true).unwrap(),
         CodeOutcome::Closed
     ));
     code_failed(&dir, &old.salt).unwrap();
@@ -1354,4 +1359,629 @@ async fn relay_limits_answer_with_clear_statuses() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn token_enrollment_records_the_machine_so_unpair_can_revoke_it() {
+    let dir = temp();
+    let invite = |dir: &Path| {
+        let token = random().unwrap();
+        let mut auth: Auth = read(&dir.join("discovery-auth.json"))
+            .unwrap()
+            .unwrap_or_default();
+        auth.invitation = Some(Invitation {
+            hash: digest(&token),
+            expires: now() + 60,
+        });
+        write(
+            dir,
+            "discovery-auth.json",
+            &serde_json::to_vec(&auth).unwrap(),
+        )
+        .unwrap();
+        token
+    };
+    let laptop = enroll(&dir, &invite(&dir), Some("laptop-id"))
+        .unwrap()
+        .unwrap();
+    let mini = enroll(&dir, &invite(&dir), Some("mini-id"))
+        .unwrap()
+        .unwrap();
+    let revoked = revoke_machine_in(&dir, "laptop-id").unwrap();
+    assert_eq!(
+        revoked,
+        Revoked {
+            revoked: 1,
+            unidentified: 0
+        }
+    );
+    assert!(!paired(&dir, &laptop).unwrap());
+    assert!(paired(&dir, &mini).unwrap());
+    // An older client sent no machine: unpair can't tell whose it is and says so.
+    let legacy = enroll(&dir, &invite(&dir), None).unwrap().unwrap();
+    let pending = mint_client_in(&dir, PENDING_LABEL).unwrap();
+    assert_eq!(
+        revoke_machine_in(&dir, "laptop-id").unwrap(),
+        Revoked {
+            revoked: 0,
+            unidentified: 2
+        }
+    );
+    assert!(paired(&dir, &legacy).unwrap() && paired(&dir, &pending).unwrap());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn token_enrollment_over_tls_labels_and_validates_the_machine() {
+    let f = fixture("host").await;
+    let enroll_as = |machine: Option<Machine>| {
+        let token = random().unwrap();
+        let mut auth: Auth = read(&f.dir.join("discovery-auth.json"))
+            .unwrap()
+            .unwrap_or_default();
+        auth.invitation = Some(Invitation {
+            hash: digest(&token),
+            expires: now() + 60,
+        });
+        write(
+            &f.dir,
+            "discovery-auth.json",
+            &serde_json::to_vec(&auth).unwrap(),
+        )
+        .unwrap();
+        serde_json::to_string(&PairRequest { token, machine }).unwrap()
+    };
+    for bad in [
+        f.machine.clone(),
+        joiner("-x"),
+        Machine {
+            id: "ok-id".into(),
+            name: "evil\u{202E}".into(),
+        },
+    ] {
+        let body = enroll_as(Some(bad));
+        let (status, _) = call(&f, Method::POST, "/v1/pair", None, None, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(no_clients(&f), "invalid machine spent the token");
+    }
+    let body = enroll_as(Some(joiner("laptop")));
+    let (status, body) = call(&f, Method::POST, "/v1/pair", None, None, body).await;
+    assert_eq!(status, StatusCode::OK);
+    let bearer = serde_json::from_slice::<PairResponse>(&body).unwrap().token;
+    let auth: Auth = read(&f.dir.join("discovery-auth.json")).unwrap().unwrap();
+    assert_eq!(auth.labels.get(&digest(&bearer)).unwrap(), "laptop-id");
+    // A 0.5.x client's request (no machine) still enrolls, unlabelled.
+    let body = enroll_as(None);
+    assert!(!body.contains("machine"));
+    let (status, _) = call(&f, Method::POST, "/v1/pair", None, None, body).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+fn mint_client_in(dir: &Path, label: &str) -> Result<String> {
+    let mut auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    let bearer = random()?;
+    auth.clients.push(digest(&bearer));
+    auth.labels.insert(digest(&bearer), label.into());
+    write(dir, "discovery-auth.json", &serde_json::to_vec(&auth)?)?;
+    Ok(bearer)
+}
+
+fn context_for(f: &Fixture) -> Arc<ContextState> {
+    Arc::new(ContextState {
+        dir: f.dir.clone(),
+        machine: f.machine.clone(),
+        share_apps: true,
+        client: upstream(&f.dir).unwrap(),
+        loopback: crate::upstream::client(tls_roots(&f.dir).unwrap()),
+        loopback_insecure: crate::upstream::client(crate::upstream::insecure_tls().unwrap()),
+        tunnels: Arc::new(tokio::sync::Semaphore::new(MAX_TUNNELS)),
+        attempts: Arc::default(),
+        sessions: Arc::default(),
+        catalog: Arc::default(),
+    })
+}
+fn acceptor_for(f: &Fixture) -> tokio_rustls::TlsAcceptor {
+    let bytes = fs::read(f.dir.join("discovery-key.pem")).unwrap();
+    let key = crate::pem::private_key(&mut bytes.as_slice())
+        .unwrap()
+        .unwrap();
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![f.cert.clone()], key)
+    .unwrap();
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tokio_rustls::TlsAcceptor::from(Arc::new(tls))
+}
+/// A second agent on the fixture's state, with its own limits and context.
+async fn serve_with(
+    f: &Fixture,
+    context: Arc<ContextState>,
+    slots: usize,
+    limits: ConnectionLimits,
+) -> (SocketAddr, tokio::task::JoinHandle<Result<()>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(connections_limited(
+        listener,
+        acceptor_for(f),
+        context,
+        Arc::new(tokio::sync::Semaphore::new(slots)),
+        limits,
+    ));
+    (addr, task)
+}
+async fn tls_to(
+    f: &Fixture,
+    addr: SocketAddr,
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(f.cert.clone()).unwrap();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio_rustls::TlsConnector::from(Arc::new(config)).connect(
+            rustls::pki_types::ServerName::IpAddress(addr.ip().into()),
+            tcp,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+}
+async fn get_on(
+    f: &Fixture,
+    addr: SocketAddr,
+    path: &str,
+    token: Option<&str>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Bytes) {
+    let stream = tls_to(f, addr).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut request = Request::builder()
+        .uri(path)
+        .header("host", addr.to_string());
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = sender
+        .send_request(request.body(http_body_util::Empty::<Bytes>::new()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    (
+        status,
+        response.into_body().collect().await.unwrap().to_bytes(),
+    )
+}
+async fn closed_by_server(
+    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 64];
+    matches!(
+        tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unauthenticated_devices_cannot_take_every_connection() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let f = fixture("host").await;
+    let bearer = pair(&f).await;
+    let limits = ConnectionLimits {
+        per_source: 16,
+        untrusted: 3,
+        per_untrusted_source: 2,
+        idle: Duration::from_millis(300),
+        lifetime: Duration::from_secs(30),
+    };
+    let (addr, task) = serve_with(&f, context_for(&f), 4, limits).await;
+    // An unknown source gets a few connections, not every slot.
+    let mut idle = vec![
+        tls_to(&f, addr).await.unwrap(),
+        tls_to(&f, addr).await.unwrap(),
+    ];
+    assert!(
+        tls_to(&f, addr).await.is_err(),
+        "third untrusted connection"
+    );
+    // Connections that never authenticate are closed once idle.
+    for stream in &mut idle {
+        assert!(closed_by_server(stream).await, "idle connection kept open");
+    }
+    drop(idle);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // An authenticated request trusts its source from then on.
+    let (status, _) = get_on(&f, addr, "/v1/catalog", Some(&bearer), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let held: Vec<_> = futures_util::future::join_all((0..3).map(|_| tls_to(&f, addr))).await;
+    assert!(
+        held.iter().all(|s| s.is_ok()),
+        "a trusted source has headroom"
+    );
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // WebSockets give their connection slot back when they upgrade, so more
+    // of them than there are slots leave room for catalog requests.
+    let id = route_id(&f.machine, "web");
+    let mut sockets = Vec::new();
+    for i in 0..6 {
+        let mut request = format!("wss://{addr}/v1/apps/{id}/proxy/ws")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+        let stream = tls_to(&f, addr).await.unwrap();
+        let (mut socket, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .unwrap_or_else(|e| panic!("websocket {i}: {e}"));
+        socket.send(Message::Text("hi".into())).await.unwrap();
+        assert!(socket.next().await.unwrap().is_ok());
+        sockets.push(socket);
+    }
+    let (status, _) = get_on(&f, addr, "/v1/catalog", Some(&bearer), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_cannot_take_over_a_paired_machines_identity() {
+    let f = fixture("host").await;
+    let pin = host_pin(&f);
+    // laptop-id is paired with certificate 11…, and holds a credential here.
+    let original = Peer {
+        machine: joiner("laptop"),
+        endpoint: "https://127.0.0.1:7464/".into(),
+        fingerprint: "11".repeat(32),
+        token: "d".repeat(64),
+        sources: vec![Source::Explicit],
+        last_seen: 0,
+        slug: String::new(),
+    };
+    super::super::client::upsert_peer_in(&f.dir, original.clone()).unwrap();
+    let laptop_bearer = mint_client_in(&f.dir, "laptop-id").unwrap();
+    // Someone who knows the code claims laptop-id with another certificate.
+    let opened = open_pairing_in(&f.dir, PAIR_CODE_LIFETIME).unwrap();
+    let (_, x) = start(&f, &opened.code).await;
+    let x = x.unwrap();
+    assert_eq!(confirm(&f, &x, &pin).await.0, StatusCode::OK);
+    let (code, body) = finish(&f, &x, None).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(error_code(&body), "already_paired");
+    assert_eq!(progress(&f.dir, &opened.id), "cancelled:already_paired");
+    let stored = super::super::client::peers_in(&f.dir).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].fingerprint, original.fingerprint);
+    assert_eq!(stored[0].endpoint, original.endpoint);
+    assert!(
+        paired(&f.dir, &laptop_bearer).unwrap(),
+        "laptop lost access"
+    );
+    // The real laptop (same certificate) pairs again and replaces its credential.
+    let mut auth: Auth = read(&f.dir.join("discovery-auth.json")).unwrap().unwrap();
+    auth.pairing_result = None;
+    write(
+        &f.dir,
+        "discovery-auth.json",
+        &serde_json::to_vec(&auth).unwrap(),
+    )
+    .unwrap();
+    let mut same = original.clone();
+    same.fingerprint = "ab".repeat(32);
+    super::super::client::remove_peer_in(&f.dir, "laptop-id").unwrap();
+    super::super::client::upsert_peer_in(&f.dir, same).unwrap();
+    let opened = open_pairing_in(&f.dir, PAIR_CODE_LIFETIME).unwrap();
+    let (_, x) = start(&f, &opened.code).await;
+    let x = x.unwrap();
+    assert_eq!(confirm(&f, &x, &pin).await.0, StatusCode::OK);
+    let (code, _) = finish(&f, &x, None).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(
+        !paired(&f.dir, &laptop_bearer).unwrap(),
+        "old credential replaced"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_confirmations_test_no_more_than_five_codes() {
+    use super::super::pake;
+    let f = fixture("host").await;
+    let context = context_for(&f);
+    // Every connection here comes from 127.0.0.1; let them all in.
+    let limits = ConnectionLimits {
+        per_untrusted_source: 64,
+        ..ConnectionLimits::default()
+    };
+    let (addr, task) = serve_with(&f, context.clone(), 64, limits).await;
+    let opened = open_pairing_in(&f.dir, PAIR_CODE_LIFETIME).unwrap();
+    let w = window(&f.dir);
+    let pin = host_pin(&f);
+    // Sixteen exchanges, as if from sixteen addresses, all with wrong codes.
+    let mut confirms = Vec::new();
+    for i in 0..MAX_PAIR_SESSIONS {
+        let wrong = format!(
+            "{:06}",
+            (opened.code.parse::<u32>().unwrap() + 1 + i as u32) % 1_000_000
+        );
+        let (state, msg) = pake::joiner_start(&pake::password(&w.salt, &wrong));
+        let (host_msg, key) = pake::host_respond(&w.hash, &msg).unwrap();
+        let joiner_key = pake::joiner_finish(state, &host_msg).unwrap();
+        let id = random().unwrap();
+        context.sessions().live.insert(
+            id.clone(),
+            PairSession {
+                salt: w.salt.clone(),
+                key,
+                confirmed: false,
+                started: Instant::now(),
+                source: IpAddr::from([10, 0, 0, i as u8]),
+            },
+        );
+        confirms.push(
+            serde_json::to_string(&PairConfirm {
+                session: id,
+                confirm: joiner_key.joiner_confirm(&pin),
+            })
+            .unwrap(),
+        );
+    }
+    let post = |body: String| {
+        let f = &f;
+        async move {
+            let stream = tls_to(f, addr).await.unwrap();
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .unwrap();
+            tokio::spawn(connection);
+            sender
+                .send_request(
+                    Request::post("/v1/pair-code/confirm")
+                        .header("host", addr.to_string())
+                        .body(Full::new(Bytes::from(body)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let statuses = futures_util::future::join_all(confirms.into_iter().map(post)).await;
+    let tested = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::UNAUTHORIZED)
+        .count();
+    assert_eq!(tested, PAIR_CODE_MAX_FAILURES as usize, "{statuses:?}");
+    assert_eq!(progress(&f.dir, &opened.id), "cancelled:too_many_failures");
+    assert_eq!(context.sessions().checking, 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn abandoned_exchanges_cannot_fill_the_session_table() {
+    use super::super::pake;
+    let f = fixture("host").await;
+    let context = context_for(&f);
+    let (addr, task) = serve_with(&f, context.clone(), 64, ConnectionLimits::default()).await;
+    let opened = open_pairing_in(&f.dir, PAIR_CODE_LIFETIME).unwrap();
+    let w = window(&f.dir);
+    let begin = || async {
+        let (_, msg) = pake::joiner_start(&pake::password(&w.salt, &opened.code));
+        let stream = tls_to(&f, addr).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::post("/v1/pair-code/start")
+                    .header("host", addr.to_string())
+                    .body(Full::new(Bytes::from(
+                        serde_json::to_string(&PairStart {
+                            pairing: PAIRING_VERSION,
+                            salt: w.salt.clone(),
+                            msg,
+                        })
+                        .unwrap(),
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<PairStarted>(&body)
+            .unwrap()
+            .session
+    };
+    // One address keeps only its newest exchanges.
+    let first = begin().await;
+    let second = begin().await;
+    let third = begin().await;
+    {
+        let all = context.sessions();
+        assert!(!all.live.contains_key(&first));
+        assert!(all.live.contains_key(&second) && all.live.contains_key(&third));
+    }
+    // A table full of other addresses' abandoned exchanges gives way to the oldest.
+    let (_, key) = pake::host_respond(&w.hash, &pake::joiner_start("x").1).unwrap();
+    let mut key = Some(key);
+    {
+        let mut all = context.sessions();
+        all.live.clear();
+        for i in 0..MAX_PAIR_SESSIONS {
+            let key = match key.take() {
+                Some(k) => k,
+                None => {
+                    pake::host_respond(&w.hash, &pake::joiner_start("x").1)
+                        .unwrap()
+                        .1
+                }
+            };
+            all.live.insert(
+                format!("old{i}"),
+                PairSession {
+                    salt: w.salt.clone(),
+                    key,
+                    confirmed: false,
+                    started: Instant::now() - Duration::from_secs(1)
+                        + Duration::from_millis(i as u64),
+                    source: IpAddr::from([10, 0, 1, i as u8]),
+                },
+            );
+        }
+    }
+    let fresh = begin().await;
+    let all = context.sessions();
+    assert!(all.live.contains_key(&fresh));
+    assert!(!all.live.contains_key("old0"));
+    assert_eq!(all.live.len(), MAX_PAIR_SESSIONS);
+    drop(all);
+    task.abort();
+}
+
+#[tokio::test]
+async fn the_rate_limiter_survives_many_sources_and_a_poisoned_lock() {
+    let f = fixture("host").await;
+    let context = context_for(&f);
+    {
+        let mut all = context.attempts.lock().unwrap();
+        for i in 0..MAX_ATTEMPT_SOURCES as u32 {
+            all.insert(
+                IpAddr::from((0x0a00_0000 + i).to_be_bytes()),
+                VecDeque::from([Instant::now()]),
+            );
+        }
+    }
+    // Every slot taken by other addresses doesn't lock out a new one.
+    assert!(context.allow_attempt(IpAddr::from([192, 168, 1, 20])));
+    assert!(context.attempts.lock().unwrap().len() <= MAX_ATTEMPT_SOURCES);
+    // Nor does a panic while the limiter was held.
+    let attempts = context.attempts.clone();
+    let _ = std::thread::spawn(move || {
+        let _held = attempts.lock().unwrap();
+        panic!("poison the limiter");
+    })
+    .join();
+    assert!(context.attempts.is_poisoned());
+    assert!(context.allow_attempt(IpAddr::from([192, 168, 1, 21])));
+}
+
+#[tokio::test]
+async fn relayed_requests_carry_only_forwarding_headers_the_agent_set() {
+    let app = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_addr = app.local_addr().unwrap();
+    let router = axum::Router::new().fallback(|headers: axum::http::HeaderMap| async move {
+        let mut seen: Vec<String> = headers
+            .iter()
+            .filter(|(k, _)| k.as_str() != "host" && k.as_str() != "user-agent")
+            .map(|(k, v)| format!("{k}={}", v.to_str().unwrap()))
+            .collect();
+        seen.sort();
+        seen.join("\n")
+    });
+    let app_task = tokio::spawn(async move { axum::serve(app, router).await });
+    let f = fixture("host").await;
+    let data = State {
+        routes: vec![Route {
+            name: "echo".into(),
+            target: format!("http://{app_addr}"),
+            pid: None,
+        }],
+        ..Default::default()
+    };
+    write(&f.dir, "state.json", &serde_json::to_vec(&data).unwrap()).unwrap();
+    let bearer = pair(&f).await;
+    let path = format!("/v1/apps/{}/proxy/", route_id(&f.machine, "echo"));
+    let spoofed = [
+        ("x-forwarded-for", "203.0.113.9"),
+        ("x-forwarded-host", "admin.example"),
+        ("x-forwarded-port", "8443"),
+        ("x-forwarded-prefix", "/admin"),
+        ("forwarded", "for=203.0.113.9;proto=https"),
+        ("x-real-ip", "203.0.113.9"),
+        ("x-client-ip", "203.0.113.9"),
+        ("true-client-ip", "203.0.113.9"),
+        ("x-original-url", "/admin"),
+        ("x-rewrite-url", "/admin"),
+        ("x-custom", "kept"),
+    ];
+    let (status, body) = get_on(&f, f.addr, &path, Some(&bearer), &spoofed).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(
+        seen,
+        [
+            "x-custom=kept",
+            "x-forwarded-for=127.0.0.1",
+            "x-forwarded-host=echo.localhost:7462",
+            "x-forwarded-port=7462",
+            "x-forwarded-proto=http",
+        ]
+        .join("\n")
+    );
+    // What the paired machine's own proxy saw comes through its internal headers.
+    let (_, body) = get_on(
+        &f,
+        f.addr,
+        &path,
+        Some(&bearer),
+        &[
+            ("x-porch-app-host", "echo.mini.localhost"),
+            ("x-porch-app-proto", "https"),
+            ("x-forwarded-host", "admin.example"),
+        ],
+    )
+    .await;
+    let seen = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        seen.contains("x-forwarded-host=echo.mini.localhost\n"),
+        "{seen}"
+    );
+    assert!(seen.contains("x-forwarded-port=443\n"), "{seen}");
+    assert!(seen.contains("x-forwarded-proto=https"), "{seen}");
+    app_task.abort();
+}
+
+#[cfg(unix)]
+#[test]
+fn locking_writes_the_format_marker_only_once() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = temp();
+    drop(lock(&dir).unwrap());
+    let marker = dir.join("discovery-format");
+    let before = fs::metadata(&marker).unwrap().ino();
+    let id = machine(&dir).unwrap();
+    drop(lock(&dir).unwrap());
+    assert_eq!(
+        fs::metadata(&marker).unwrap().ino(),
+        before,
+        "marker rewritten"
+    );
+    assert_eq!(machine(&dir).unwrap(), id);
+    fs::write(&marker, b"0\n").unwrap();
+    drop(lock(&dir).unwrap());
+    assert_eq!(fs::read(&marker).unwrap(), FORMAT_MARKER);
+    let _ = fs::remove_dir_all(dir);
 }
