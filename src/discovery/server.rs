@@ -67,6 +67,46 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
         Err(e) => Err(e.into()),
     }
 }
+type CachedFile = (
+    super::client::FileVersion,
+    Arc<dyn std::any::Any + Send + Sync>,
+);
+/// [`read`] for state files consulted on every request (credentials, sharing,
+/// routes): parsed again only when the file changes. Every write replaces the
+/// file, so a revocation or a change of sharing applies to the next request.
+fn read_cached<T>(path: &Path) -> Result<Option<Arc<T>>>
+where
+    T: serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    static CACHE: Mutex<Option<HashMap<PathBuf, CachedFile>>> = Mutex::new(None);
+    let Some(version) = super::client::file_version(path) else {
+        return Ok(read::<T>(path)?.map(Arc::new));
+    };
+    if let Some((v, value)) = CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|c| c.get(path))
+    {
+        if *v == version {
+            if let Ok(value) = value.clone().downcast::<T>() {
+                return Ok(Some(value));
+            }
+        }
+    }
+    // Keyed by the version seen before reading: a write in between makes the
+    // next request read again.
+    let Some(value) = read::<T>(path)?.map(Arc::new) else {
+        return Ok(None);
+    };
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if cache.len() > 64 {
+        cache.clear();
+    }
+    cache.insert(path.to_owned(), (version, value.clone()));
+    Ok(Some(value))
+}
 /// Private atomic files do not reuse proxy lifecycle state or modify trust stores.
 pub(super) fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     if fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -736,7 +776,7 @@ fn authorize(dir: &Path, token: &str) -> Result<bool> {
         return Ok(false);
     }
     let hash = digest(token);
-    let auth: Auth = read(&dir.join("discovery-auth.json"))?.unwrap_or_default();
+    let auth = read_cached::<Auth>(&dir.join("discovery-auth.json"))?.unwrap_or_default();
     if !auth.clients.iter().any(|v| equal(v, &hash)) {
         return Ok(false);
     }
@@ -960,7 +1000,18 @@ struct ContextState {
     attempts: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
     /// In-progress code-pairing key exchanges, by random session ID.
     sessions: Arc<Mutex<HashMap<String, PairSession>>>,
+    catalog: Arc<tokio::sync::Mutex<Option<CatalogCopy>>>,
 }
+type CatalogKey = (
+    bool,
+    Option<super::client::FileVersion>,
+    Option<super::client::FileVersion>,
+);
+type CatalogCopy = (Instant, CatalogKey, Catalog);
+const CATALOG_REUSE: Duration = Duration::from_secs(1);
+/// How long an app may take to start its response after the last upload
+/// data arrived. Long-polls and slow renders fit; a hung app still ends.
+const RESPONSE_IDLE: Duration = Duration::from_secs(300);
 struct PairSession {
     salt: String,
     key: super::pake::Key,
@@ -977,10 +1028,32 @@ impl ContextState {
         all.remove(id)
     }
     fn sharing(&self) -> bool {
-        read::<ServerConfig>(&self.dir.join("discovery-config.json"))
+        read_cached::<ServerConfig>(&self.dir.join("discovery-config.json"))
             .ok()
             .flatten()
             .map_or(self.share_apps, |c| c.share_apps)
+    }
+    /// The catalog for paired machines. Building it runs `ps` and probes
+    /// every app, so a copy is reused for a second while sharing and the
+    /// route and proxy files are unchanged, and concurrent requests share one
+    /// build. It never decides access: each relayed request is checked itself.
+    async fn peer_catalog(&self, share: bool) -> Result<Catalog> {
+        let key = (
+            share,
+            super::client::file_version(&self.dir.join("state.json")),
+            super::client::file_version(&self.dir.join("proxy.json")),
+        );
+        let mut cached = self.catalog.lock().await;
+        if let Some((at, k, catalog)) = cached.as_ref() {
+            if *k == key && at.elapsed() < CATALOG_REUSE {
+                return Ok(catalog.clone());
+            }
+        }
+        let (dir, machine) = (self.dir.clone(), self.machine.clone());
+        let catalog =
+            tokio::task::spawn_blocking(move || catalog(&dir, machine, share, true)).await??;
+        *cached = Some((Instant::now(), key, catalog.clone()));
+        Ok(catalog)
     }
     /// Per-source pairing rate limit, independent of the per-window failure cap.
     fn allow_attempt(&self, source: IpAddr) -> bool {
@@ -1291,12 +1364,7 @@ async fn request(
         ));
     }
     if req.uri().path() == "/v1/catalog" && req.method() == Method::GET {
-        return Ok(json(&catalog(
-            &context.dir,
-            context.machine.clone(),
-            context.sharing(),
-            true,
-        )?));
+        return Ok(json(&context.peer_catalog(context.sharing()).await?));
     }
     if req.uri().path() == "/v1/unpair" && req.method() == Method::POST {
         // The caller forgets us; forget it too and revoke its credential.
@@ -1329,7 +1397,7 @@ async fn request(
     if app_id.len() != 64 {
         return Ok(response(StatusCode::NOT_FOUND, "unknown app"));
     }
-    let data: State = read(&context.dir.join("state.json"))?.unwrap_or_default();
+    let data = read_cached::<State>(&context.dir.join("state.json"))?.unwrap_or_default();
     let Some(route) = data.routes.iter().find(|r| {
         route_id(&context.machine, &r.name) == app_id
             && !data.private.contains(&r.name)
@@ -1340,8 +1408,15 @@ async fn request(
             "app is no longer registered",
         ));
     };
-    let settings: ProxySettings = read(&context.dir.join("proxy.json"))?.unwrap_or_default();
-    let mut target = route_target(route)?;
+    let settings =
+        read_cached::<ProxySettings>(&context.dir.join("proxy.json"))?.unwrap_or_default();
+    // The catalog never offers such a route; refuse it as sharing would.
+    let Ok(mut target) = route_target(route) else {
+        return Ok(response(
+            StatusCode::FORBIDDEN,
+            "Only apps on this machine can be shared; this route points elsewhere",
+        ));
+    };
     let base = target.path().trim_end_matches('/');
     let app_path = if app_path.is_empty() { "/" } else { app_path };
     let path = format!("{base}{app_path}");
@@ -1446,27 +1521,54 @@ async fn request(
     }
     *req.uri_mut() = uri;
     *req.version_mut() = Version::HTTP_11;
+    let declared = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n > MAX_UPLOAD as u64) {
+        return Ok(too_large());
+    }
     let (parts, body) = req.into_parts();
+    let (body, last) = super::client::Watched::new(body);
+    let over_limit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = over_limit.clone();
     let req = Request::from_parts(
         parts,
         Limited::new(body, MAX_UPLOAD)
-            .map_err(|e| -> BoxError { e })
+            .map_err(move |e| -> BoxError {
+                if e.is::<http_body_util::LengthLimitError>() {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                e
+            })
             .boxed_unsync(),
     );
-    let mut upstream = match tokio::time::timeout(Duration::from_secs(15), async {
+    // Connecting to the app is bounded by the clients' connect timeouts; the
+    // response may then take as long as it needs, counted from the end of
+    // the upload.
+    let sent = async {
         match &upstream_spec {
             Some(up) if up.insecure => context.loopback_insecure.request(req).await,
             Some(_) => context.loopback.request(req).await,
             None => context.client.request(req).await,
         }
-    })
-    .await
-    {
-        Ok(Ok(v)) => v,
-        _ => {
+    };
+    let mut upstream = match super::client::within_idle(sent, &last, RESPONSE_IDLE).await {
+        Some(Ok(v)) => v,
+        Some(Err(_)) if over_limit.load(std::sync::atomic::Ordering::Relaxed) => {
+            return Ok(too_large())
+        }
+        Some(Err(_)) => {
             return Ok(response(
                 StatusCode::BAD_GATEWAY,
                 "registered app is unavailable",
+            ))
+        }
+        None => {
+            return Ok(response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "registered app did not answer in time",
             ))
         }
     };
@@ -1508,6 +1610,15 @@ async fn request(
         }
     }
     Ok(upstream.map(|body| body.map_err(|e| -> BoxError { Box::new(e) }).boxed_unsync()))
+}
+fn too_large() -> Response<Body> {
+    response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!(
+            "Uploads to an app on a paired machine are limited to {} MB",
+            MAX_UPLOAD / (1024 * 1024)
+        ),
+    )
 }
 fn upstream(dir: &Path) -> Result<Upstream> {
     let tls = tls_roots(dir)?;
@@ -1611,11 +1722,26 @@ pub async fn serve() -> Result<()> {
         tunnels: Arc::new(tokio::sync::Semaphore::new(64)),
         attempts: Arc::default(),
         sessions: Arc::default(),
+        catalog: Arc::default(),
     });
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
     let slots = Arc::new(tokio::sync::Semaphore::new(64));
     state::atomic_write("discovery.ready", std::process::id().to_string().as_bytes())?;
     connections(listener, acceptor, context, slots).await
+}
+/// HTTP/2 for paired machines' relays. Upload data counts against the
+/// connection's window until the app reads it, so the connection window is
+/// far above the per-request one: an app that leaves one upload unread must
+/// not stall every other request from that machine.
+pub(super) fn http2_settings<E>(mut builder: hyper_util::server::conn::auto::Http2Builder<'_, E>) {
+    builder
+        .timer(TokioTimer::new())
+        .initial_stream_window_size(super::client::STREAM_WINDOW)
+        .initial_connection_window_size(super::client::CONNECTION_WINDOW)
+        .max_concurrent_streams(256)
+        .max_header_list_size(32 * 1024)
+        .keep_alive_interval(Some(Duration::from_secs(20)))
+        .keep_alive_timeout(Duration::from_secs(10));
 }
 async fn connections(
     listener: tokio::net::TcpListener,
@@ -1657,13 +1783,7 @@ async fn connections(
                 .header_read_timeout(Duration::from_secs(10))
                 .max_headers(64)
                 .max_buf_size(32 * 1024);
-            builder
-                .http2()
-                .timer(TokioTimer::new())
-                .max_concurrent_streams(256)
-                .max_header_list_size(32 * 1024)
-                .keep_alive_interval(Some(Duration::from_secs(20)))
-                .keep_alive_timeout(Duration::from_secs(10));
+            http2_settings(builder.http2());
             let _ = builder
                 .serve_connection_with_upgrades(TokioIo::new(stream), service)
                 .await;

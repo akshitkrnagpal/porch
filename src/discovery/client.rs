@@ -38,18 +38,142 @@ const MAX_CANDIDATES: usize = 256;
 const CANDIDATE_TTL: u64 = 90;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
-type PinnedClient =
-    Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>;
+type Tls = hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
+type TlsStream = hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>;
+type PinnedClient = Client<Dialer, Body>;
 /// Connections to one paired agent. Requests share a single HTTP/2 connection
 /// when the agent offers it, so a page's hundreds of module requests neither
 /// open a TLS connection each nor run into the agent's connection limit.
-/// WebSocket upgrades need HTTP/1.1 and use their own connections.
+/// WebSocket upgrades need HTTP/1.1 and use their own connections, as do all
+/// requests to agents from before HTTP/2.
 #[derive(Clone)]
 pub(super) struct RelayClient {
-    requests: PinnedClient,
+    h2: PinnedClient,
+    h1: PinnedClient,
     upgrades: PinnedClient,
+    /// Learns which protocol the agent speaks, once, before the first request.
+    probe: Dialer,
+    probing: Arc<tokio::sync::Mutex<()>>,
+    link: Arc<std::sync::Mutex<Link>>,
 }
-
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Protocol {
+    H2,
+    H1,
+}
+/// An agent that answered over HTTP/1.1 is asked again after this long, in
+/// case it was updated.
+const H1_RECHECK: Duration = Duration::from_secs(300);
+/// After a failed dial, further dials fail at once for this long, so a burst
+/// against an unreachable machine does not wait out a timeout per request.
+const DIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// TCP connect plus TLS handshake.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+#[derive(Default)]
+struct Link {
+    protocol: Option<(Protocol, std::time::Instant)>,
+    /// The connection the protocol check opened, kept for the request that
+    /// asked: it becomes that request's (and the page's) connection.
+    parked: Option<(String, Protocol, std::time::Instant, TlsStream)>,
+    /// The last failed dial: when, to which address, and why.
+    failed: Option<(std::time::Instant, String, String)>,
+}
+impl Link {
+    fn protocol(&self) -> Option<Protocol> {
+        match self.protocol {
+            Some((Protocol::H1, at)) if at.elapsed() >= H1_RECHECK => None,
+            Some((p, _)) => Some(p),
+            None => None,
+        }
+    }
+}
+fn lock_link(link: &std::sync::Mutex<Link>) -> std::sync::MutexGuard<'_, Link> {
+    link.lock().unwrap_or_else(|e| e.into_inner())
+}
+/// The connector behind every relay client. HTTP/2 clients dial one
+/// connection at a time (hyper-util's lock for `http2_only`), which only works
+/// once the agent is known to speak HTTP/2; `RelayClient::client` learns that
+/// with one dial whose connection the first request then uses.
+#[derive(Clone)]
+pub(super) struct Dialer {
+    tls: Tls,
+    /// The protocol this dialer's client speaks; `None` for the probe.
+    speaks: Option<Protocol>,
+    link: Arc<std::sync::Mutex<Link>>,
+}
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+impl tower_service::Service<hyper::Uri> for Dialer {
+    type Response = TlsStream;
+    type Error = BoxError;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<TlsStream, BoxError>> + Send>>;
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), BoxError>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn call(&mut self, uri: hyper::Uri) -> Self::Future {
+        use hyper_util::client::legacy::connect::Connection;
+        let authority = uri.authority().map(|a| a.to_string()).unwrap_or_default();
+        {
+            let mut link = lock_link(&self.link);
+            if let Some((a, p, at, _)) = &link.parked {
+                let fresh = at.elapsed() < Duration::from_secs(10);
+                if fresh && *a == authority && Some(*p) == self.speaks {
+                    let (.., stream) = link.parked.take().expect("checked above");
+                    return Box::pin(async move { Ok(stream) });
+                }
+                if !fresh {
+                    link.parked = None;
+                }
+            }
+            if let Some((at, to, error)) = &link.failed {
+                // Per address: a refresh still tries a machine's other ones.
+                if at.elapsed() < DIAL_BACKOFF && *to == authority {
+                    let error = error.clone();
+                    return Box::pin(async move { Err(error.into()) });
+                }
+            }
+        }
+        let (mut tls, speaks, link) = (self.tls.clone(), self.speaks, self.link.clone());
+        Box::pin(async move {
+            let dialed = match tokio::time::timeout(DIAL_TIMEOUT, tls.call(uri)).await {
+                Ok(Ok(stream)) => Ok(stream),
+                Ok(Err(e)) => Err(format!("{e}")),
+                Err(_) => Err("connection timed out".to_owned()),
+            };
+            let mut link = lock_link(&link);
+            let stream = match dialed {
+                Ok(stream) => stream,
+                Err(e) => {
+                    link.failed = Some((std::time::Instant::now(), authority, e.clone()));
+                    return Err(e.into());
+                }
+            };
+            if link
+                .failed
+                .as_ref()
+                .is_some_and(|(_, to, _)| *to == authority)
+            {
+                link.failed = None;
+            }
+            let got = if stream.connected().is_negotiated_h2() {
+                Protocol::H2
+            } else {
+                Protocol::H1
+            };
+            // Only dials that offered both protocols learn which one it speaks.
+            if speaks != Some(Protocol::H1) {
+                link.protocol = Some((got, std::time::Instant::now()));
+            }
+            if speaks == Some(Protocol::H2) && got != Protocol::H2 {
+                return Err("the paired machine's agent no longer offers HTTP/2".into());
+            }
+            Ok(stream)
+        })
+    }
+}
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -329,14 +453,61 @@ fn assign_slugs(peers: &mut [Peer]) {
 pub fn peers() -> Result<Vec<Peer>> {
     peers_in(&crate::state::dir())
 }
+/// What identifies one version of a file: every write replaces the file
+/// (a new inode), so a changed pairing never matches an older one.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct FileVersion {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64),
+}
+pub(super) fn file_version(path: &std::path::Path) -> Option<FileVersion> {
+    let m = fs::metadata(path).ok()?;
+    Some(FileVersion {
+        len: m.len(),
+        modified: m.modified().ok(),
+        #[cfg(unix)]
+        inode: {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino())
+        },
+    })
+}
+type PeersCache = (std::path::PathBuf, Option<FileVersion>, Arc<Vec<Peer>>);
+/// Paired machines, read again only when the peers file changes. The proxy
+/// asks for every request without a local route, and the gateway for every
+/// relayed one; pairing, unpairing and re-pairing show up on the next request.
+pub(super) fn shared_peers() -> Result<Arc<Vec<Peer>>> {
+    shared_peers_in(crate::state::dir())
+}
+pub(super) fn shared_peers_in(dir: std::path::PathBuf) -> Result<Arc<Vec<Peer>>> {
+    static CACHE: std::sync::Mutex<Option<PeersCache>> = std::sync::Mutex::new(None);
+    let version = file_version(&dir.join(PEERS_FILE));
+    if let Some((d, v, peers)) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *d == dir && *v == version {
+            return Ok(peers.clone());
+        }
+    }
+    let peers = Arc::new(peers_in(&dir)?);
+    // Store under the version read before the file: a write in between makes
+    // the next call read again rather than keep a stale copy.
+    *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((dir, version, peers.clone()));
+    Ok(peers)
+}
+/// The canonical spelling of a validated endpoint (`https://IP:PORT/`), which
+/// request URLs are built from.
+fn normalize_endpoint(endpoint: &str) -> Result<String> {
+    Ok(validate_endpoint(endpoint)?.to_string())
+}
 pub(super) fn peers_in(dir: &std::path::Path) -> Result<Vec<Peer>> {
     let mut peers: Vec<Peer> = read_json_in(dir, PEERS_FILE)?;
     assign_slugs(&mut peers);
     if peers.len() > MAX_PEERS {
         bail!("too many enrolled peers");
     }
-    for p in &peers {
-        validate_endpoint(&p.endpoint)?;
+    for p in &mut peers {
+        p.endpoint = normalize_endpoint(&p.endpoint)?;
         normalize_pin(&p.fingerprint)?;
         validate_machine(&p.machine)?;
         if p.token.len() < 32
@@ -380,6 +551,7 @@ fn update_peers_in(
 }
 /// Insert or replace a peer by machine ID, keeping an existing slug.
 pub(super) fn upsert_peer_in(dir: &std::path::Path, mut peer: Peer) -> Result<Peer> {
+    peer.endpoint = normalize_endpoint(&peer.endpoint)?;
     let mut stored = None;
     update_peers_in(dir, |all| {
         if let Some(old) = all.iter_mut().find(|p| p.machine.id == peer.machine.id) {
@@ -508,8 +680,7 @@ pub(super) async fn relay_catalog(peer: &Peer, client: &RelayClient) -> Result<C
         .body(Body::empty())?;
     let fetch = async {
         let response = client
-            .requests
-            .request(request)
+            .send(request)
             .await
             .context("peer is unreachable or its pinned certificate does not match")?;
         if !response.status().is_success() {
@@ -1032,9 +1203,13 @@ pub(super) struct RelayContext {
     /// Browser-visible origin; the request Host must match its authority.
     pub(super) relay_url: Url,
     pub(super) local_app: Url,
+    /// Another app on the same paired machine whose page may call this one:
+    /// its browser-visible origin and its origin on that machine.
+    pub(super) sibling: Option<(String, String)>,
 }
 pub(super) fn relay_client(pin: &str) -> Result<RelayClient> {
-    let connector = |h2: bool| -> Result<_> {
+    let link = Arc::new(std::sync::Mutex::new(Link::default()));
+    let dialer = |speaks: Option<Protocol>| -> Result<Dialer> {
         // Small TLS records (response heads, short modules) must not wait on
         // Nagle's algorithm for the previous segment's ACK.
         let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
@@ -1046,27 +1221,92 @@ pub(super) fn relay_client(pin: &str) -> Result<RelayClient> {
             .with_tls_config(tls_config(pin)?)
             .https_only();
         // Offering both lets agents from before HTTP/2 answer over HTTP/1.1.
-        Ok(if h2 {
-            builder.enable_all_versions().wrap_connector(http)
-        } else {
+        let tls = if speaks == Some(Protocol::H1) {
             builder.enable_http1().wrap_connector(http)
+        } else {
+            builder.enable_all_versions().wrap_connector(http)
+        };
+        Ok(Dialer {
+            tls,
+            speaks,
+            link: link.clone(),
         })
     };
-    let requests = Client::builder(TokioExecutor::new())
+    let h2 = Client::builder(TokioExecutor::new())
         .timer(TokioTimer::new())
         .pool_timer(TokioTimer::new())
+        // One connection, dialed once however many requests start together.
+        .http2_only(true)
         // A link that dies silently (sleep, a network change) fails every
         // request on the shared connection; pings notice within seconds.
         .http2_keep_alive_interval(Duration::from_secs(10))
         .http2_keep_alive_timeout(Duration::from_secs(5))
         .http2_keep_alive_while_idle(true)
-        // Keep the warm connection between page loads. (hyper's fixed HTTP/2
-        // windows already exceed a typical link's bandwidth-delay product; an
-        // adaptive window would start at 64 KiB and throttle a cold page load.)
+        // Response data counts against the connection's window until the
+        // browser reads it. A connection window far above the per-response one
+        // keeps a few unread responses (a paused video or download) from
+        // stalling every other request to that machine. Fixed windows: an
+        // adaptive one would start at 64 KiB and throttle a cold page load.
+        .http2_initial_stream_window_size(STREAM_WINDOW)
+        .http2_initial_connection_window_size(CONNECTION_WINDOW)
+        // Keep the warm connection between page loads.
         .pool_idle_timeout(Duration::from_secs(300))
-        .build(connector(true)?);
-    let upgrades = Client::builder(TokioExecutor::new()).build(connector(false)?);
-    Ok(RelayClient { requests, upgrades })
+        .build(dialer(Some(Protocol::H2))?);
+    let h1 = Client::builder(TokioExecutor::new())
+        .timer(TokioTimer::new())
+        .pool_timer(TokioTimer::new())
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build(dialer(Some(Protocol::H1))?);
+    // A connection left over from a refused upgrade would otherwise hold one of
+    // the agent's connection slots until the next WebSocket.
+    let upgrades = Client::builder(TokioExecutor::new())
+        .timer(TokioTimer::new())
+        .pool_timer(TokioTimer::new())
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build(dialer(Some(Protocol::H1))?);
+    Ok(RelayClient {
+        h2,
+        h1,
+        upgrades,
+        probe: dialer(None)?,
+        probing: Arc::default(),
+        link,
+    })
+}
+/// Per-response and per-connection HTTP/2 receive windows (both directions).
+pub(super) const STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+pub(super) const CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
+impl RelayClient {
+    /// The client for ordinary requests to `uri`: HTTP/2 once the agent is
+    /// known to speak it. The first request (or burst) asks with one dial.
+    async fn client(&self, uri: &hyper::Uri) -> Result<&PinnedClient> {
+        let known = |link: &Link| match link.protocol() {
+            Some(Protocol::H2) => Some(&self.h2),
+            Some(Protocol::H1) => Some(&self.h1),
+            None => None,
+        };
+        if let Some(client) = known(&lock_link(&self.link)) {
+            return Ok(client);
+        }
+        let _probing = self.probing.lock().await;
+        if let Some(client) = known(&lock_link(&self.link)) {
+            return Ok(client);
+        }
+        let mut probe = self.probe.clone();
+        let stream = tower_service::Service::call(&mut probe, uri.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut link = lock_link(&self.link);
+        let protocol = link.protocol().unwrap_or(Protocol::H1);
+        let authority = uri.authority().map(|a| a.to_string()).unwrap_or_default();
+        link.parked = Some((authority, protocol, std::time::Instant::now(), stream));
+        Ok(known(&link).unwrap_or(&self.h1))
+    }
+    /// Send an ordinary (non-upgrade) request to the agent.
+    pub(super) async fn send(&self, req: Request<Body>) -> Result<Response<Incoming>> {
+        let client = self.client(req.uri()).await?;
+        Ok(client.request(req).await?)
+    }
 }
 fn plain_error(status: StatusCode, message: &str) -> Response<Body> {
     let mut r = Response::new(Body::from(message.to_owned()));
@@ -1173,6 +1413,93 @@ fn rewrite_location(value: &str, local_app: &Url, relay_url: &Url) -> Result<Str
     }
     Ok(value.into())
 }
+/// How long a response may take to start after the last request data was
+/// sent. Long-polls and slow renders fit; a dead link is noticed sooner by the
+/// HTTP/2 keep-alive pings. The agent's own limit is a little shorter, so its
+/// message reaches the browser.
+const RESPONSE_IDLE: Duration = Duration::from_secs(315);
+/// A request body that records when it last produced data, so a timeout can
+/// count from the end of an upload rather than from the start of the request.
+pub(super) struct Watched<B> {
+    inner: B,
+    last: Arc<std::sync::Mutex<tokio::time::Instant>>,
+}
+impl<B> Watched<B> {
+    pub(super) fn new(inner: B) -> (Self, Arc<std::sync::Mutex<tokio::time::Instant>>) {
+        let last = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+        (
+            Watched {
+                inner,
+                last: last.clone(),
+            },
+            last,
+        )
+    }
+}
+impl<B: hyper::body::Body + Unpin> hyper::body::Body for Watched<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<B::Data>, B::Error>>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if polled.is_ready() {
+            *self.last.lock().unwrap_or_else(|e| e.into_inner()) = tokio::time::Instant::now();
+        }
+        polled
+    }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+/// Wait for `response` unless `idle` passes with no request data sent.
+pub(super) async fn within_idle<T>(
+    response: impl std::future::Future<Output = T>,
+    last: &std::sync::Mutex<tokio::time::Instant>,
+    idle: Duration,
+) -> Option<T> {
+    tokio::pin!(response);
+    loop {
+        let deadline = *last.lock().unwrap_or_else(|e| e.into_inner()) + idle;
+        if deadline <= tokio::time::Instant::now() {
+            return None;
+        }
+        tokio::select! {
+            v = &mut response => return Some(v),
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    }
+}
+/// A `Location` value as text. Bytes beyond ASCII are percent-encoded, as the
+/// browser would, so the redirect checks always run.
+fn location_text(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for b in bytes {
+        if b.is_ascii() {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+/// `Set-Cookie` without its `Domain` attribute, on raw bytes so UTF-8 values
+/// pass through unchanged.
+fn host_only_cookie(cookie: &header::HeaderValue) -> Option<header::HeaderValue> {
+    let kept: Vec<&[u8]> = cookie
+        .as_bytes()
+        .split(|b| *b == b';')
+        .filter(|part| {
+            let part = part.trim_ascii_start();
+            !(part.len() >= 7 && part[..7].eq_ignore_ascii_case(b"domain="))
+        })
+        .collect();
+    header::HeaderValue::from_bytes(&kept.join(&b';')).ok()
+}
 pub(super) async fn relay_request(
     mut req: Request<Incoming>,
     context: RelayContext,
@@ -1192,12 +1519,15 @@ pub(super) async fn relay_request(
             "Use this relay's exact app.localhost URL",
         ));
     }
-    if let Some(origin) = req
-        .headers()
-        .get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-    {
-        if origin != format!("{}://{expected}", context.relay_url.scheme()) {
+    // A browser origin is this app itself or, when the caller vouches for it,
+    // another app on the same paired machine. Anything else is refused.
+    let mut app_origin = context.local_app.origin().ascii_serialization();
+    if let Some(origin) = req.headers().get(header::ORIGIN) {
+        let origin = origin.to_str().unwrap_or_default();
+        if origin == format!("{}://{expected}", context.relay_url.scheme()) {
+        } else if let Some((_, theirs)) = context.sibling.as_ref().filter(|(o, _)| o == origin) {
+            app_origin = theirs.clone();
+        } else {
             return Ok(plain_error(
                 StatusCode::FORBIDDEN,
                 "Cross-origin browser access to a Porch relay is rejected",
@@ -1210,20 +1540,19 @@ pub(super) async fn relay_request(
         .cloned()
         .filter(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
     let downstream = upgrade.as_ref().map(|_| hyper::upgrade::on(&mut req));
-    let client = if upgrade.is_some() {
-        &context.client.upgrades
-    } else {
-        &context.client.requests
-    };
     let suffix = req
         .uri()
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or("/");
-    let uri = format!(
-        "{}v1/apps/{}/proxy{}",
-        context.peer.endpoint, context.app_id, suffix
-    );
+    // From the parsed endpoint, which always ends in `/`.
+    let Ok(base) = validate_endpoint(&context.peer.endpoint) else {
+        return Ok(plain_error(
+            StatusCode::BAD_GATEWAY,
+            "The paired machine's stored address is invalid; pair again",
+        ));
+    };
+    let uri = format!("{base}v1/apps/{}/proxy{suffix}", context.app_id);
     let Ok(uri) = uri.parse::<hyper::Uri>() else {
         return Ok(plain_error(
             StatusCode::BAD_REQUEST,
@@ -1254,7 +1583,7 @@ pub(super) async fn relay_request(
         req.headers_mut().insert("x-porch-app-authorization", v);
     }
     if browser_origin.is_some() {
-        if let Ok(v) = context.local_app.origin().ascii_serialization().parse() {
+        if let Ok(v) = app_origin.parse() {
             req.headers_mut().insert("x-porch-app-origin", v);
         }
     }
@@ -1278,22 +1607,38 @@ pub(super) async fn relay_request(
             .parse()
             .expect("literal authority"),
     );
-    if let Some(upgrade) = upgrade {
-        req.headers_mut().insert(header::UPGRADE, upgrade);
+    if let Some(upgrade) = &upgrade {
+        req.headers_mut().insert(header::UPGRADE, upgrade.clone());
         req.headers_mut().insert(
             header::CONNECTION,
             header::HeaderValue::from_static("upgrade"),
         );
     }
     *req.uri_mut() = uri;
-    let result =
-        tokio::time::timeout(Duration::from_secs(30), client.request(req.map(Body::new))).await;
-    let mut response = match result {
-        Ok(Ok(r)) => r,
-        _ => {
+    let (req, last) = {
+        let (parts, body) = req.into_parts();
+        let (body, last) = Watched::new(body);
+        (Request::from_parts(parts, Body::new(body)), last)
+    };
+    let sent = async {
+        if upgrade.is_some() {
+            Ok(context.client.upgrades.request(req).await?)
+        } else {
+            context.client.send(req).await
+        }
+    };
+    let mut response = match within_idle(sent, &last, RESPONSE_IDLE).await {
+        Some(Ok(r)) => r,
+        Some(Err(_)) => {
             return Ok(plain_error(
                 StatusCode::BAD_GATEWAY,
                 "Remote Porch app is unavailable or its certificate changed",
+            ))
+        }
+        None => {
+            return Ok(plain_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "The remote app did not answer in time",
             ))
         }
     };
@@ -1316,18 +1661,19 @@ pub(super) async fn relay_request(
     } else {
         strip_hop_headers(response.headers_mut());
     }
-    if let Some(location) = response
-        .headers()
-        .get(header::LOCATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        let translated = match rewrite_location(location, &context.local_app, &context.relay_url) {
+    if let Some(location) = response.headers().get(header::LOCATION) {
+        let location = location_text(location.as_bytes());
+        let translated = match rewrite_location(&location, &context.local_app, &context.relay_url) {
             Ok(v) => v,
             Err(e) => return Ok(plain_error(StatusCode::BAD_GATEWAY, &e.to_string())),
         };
-        if let Ok(value) = translated.parse() {
-            response.headers_mut().insert(header::LOCATION, value);
-        }
+        let Ok(value) = header::HeaderValue::from_str(&translated) else {
+            return Ok(plain_error(
+                StatusCode::BAD_GATEWAY,
+                "remote app sent an invalid redirect",
+            ));
+        };
+        response.headers_mut().insert(header::LOCATION, value);
     }
     // Host-only cookies stay on this app's unique .localhost hostname; ports alone
     // do not isolate cookies. Keep Secure/HttpOnly/SameSite attributes unchanged.
@@ -1335,25 +1681,11 @@ pub(super) async fn relay_request(
         .headers()
         .get_all(header::SET_COOKIE)
         .iter()
-        .cloned()
+        .filter_map(host_only_cookie)
         .collect();
     response.headers_mut().remove(header::SET_COOKIE);
     for cookie in cookies {
-        if let Ok(value) = cookie.to_str() {
-            let value = value
-                .split(';')
-                .filter(|part| {
-                    !part
-                        .trim_start()
-                        .to_ascii_lowercase()
-                        .starts_with("domain=")
-                })
-                .collect::<Vec<_>>()
-                .join(";");
-            if let Ok(value) = value.parse() {
-                response.headers_mut().append(header::SET_COOKIE, value);
-            }
-        }
+        response.headers_mut().append(header::SET_COOKIE, cookie);
     }
     // Agent bearer credentials must never appear in browser-visible metadata.
     response.headers_mut().remove(header::AUTHORIZATION);
@@ -1400,6 +1732,7 @@ pub async fn relay(peer_id: &str, app_id: &str, bind_port: u16) -> Result<()> {
         client,
         relay_url: relay_url.clone(),
         local_app: Url::parse(&app.local_url)?,
+        sibling: None,
     };
     println!(
         "{}",
@@ -1408,7 +1741,16 @@ pub async fn relay(peer_id: &str, app_id: &str, bind_port: u16) -> Result<()> {
     std::io::stdout().flush()?;
     let permits = Arc::new(tokio::sync::Semaphore::new(128));
     loop {
-        let (stream, peer) = listener.accept().await?;
+        // A transient failure (out of file descriptors, an aborted
+        // handshake) must not end the relay: wait briefly and keep serving.
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Porch relay: accepting a connection failed: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         if !peer.ip().is_loopback() {
             continue;
         }

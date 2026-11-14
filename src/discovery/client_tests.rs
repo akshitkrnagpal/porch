@@ -302,7 +302,8 @@ async fn relay_fixture() -> (
     .unwrap();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let peer = fixture_peer(format!("https://{}/", upstream.local_addr().unwrap()), pin);
+    // Stored without the trailing slash: requests are built from the parsed URL.
+    let peer = fixture_peer(format!("https://{}", upstream.local_addr().unwrap()), pin);
     let backend = tokio::spawn(async move {
         loop {
             let (stream, _) = upstream.accept().await.unwrap();
@@ -352,6 +353,24 @@ async fn relay_fixture() -> (
                         response
                             .headers_mut()
                             .insert("sec-websocket-accept", accept.parse().unwrap());
+                    } else if req.uri().path().ends_with("/utf8") {
+                        // Bytes beyond ASCII, as apps send UTF-8 in these headers.
+                        *response.status_mut() = StatusCode::FOUND;
+                        let location: &[u8] = match req.uri().query() {
+                            Some("loopback") => b"http://127.0.0.1:9999/caf\xc3\xa9",
+                            _ => b"http://web.localhost:7462/caf\xc3\xa9?q=\xe2\x9c\x93",
+                        };
+                        response.headers_mut().insert(
+                            header::LOCATION,
+                            header::HeaderValue::from_bytes(location).unwrap(),
+                        );
+                        response.headers_mut().insert(
+                            header::SET_COOKIE,
+                            header::HeaderValue::from_bytes(
+                                b"name=J\xc3\xbcrgen; domain=web.localhost; Path=/",
+                            )
+                            .unwrap(),
+                        );
                     } else if req.uri().path().ends_with("/redirect")
                         || req.uri().path().ends_with("/protocol-relative")
                         || req.uri().path().ends_with("/foreign")
@@ -399,6 +418,10 @@ async fn relay_fixture() -> (
         app_id: "web".into(),
         relay_url: relay_url.clone(),
         local_app: Url::parse(&fixture_catalog().apps[0].local_url).unwrap(),
+        sibling: Some((
+            format!("http://api-machine-b.localhost:{}", address.port()),
+            "http://api.localhost:7462".into(),
+        )),
     };
     let relay = tokio::spawn(async move {
         loop {
@@ -834,5 +857,388 @@ async fn refreshing_a_peer_refuses_unknown_and_local_machine_ids() {
     }
     assert_eq!(hits.load(Ordering::Relaxed), 0);
     task.abort();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A paired agent as the real one runs it: TLS offering h2 and http/1.1, the
+/// auto (HTTP/1.1 + HTTP/2) server, and at most `slots` connections at once
+/// (the rest are dropped, as the agent drops connections over its limit).
+/// `/big` streams `big` bytes; anything else answers "ok". Counts connections.
+async fn agent_fixture(
+    slots: usize,
+    big: usize,
+    alpn: Vec<Vec<u8>>,
+) -> (Peer, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let cert = rcgen::generate_simple_self_signed(vec!["porch-peer.local".into()]).unwrap();
+    let pin = hex_pin(&Sha256::digest(cert.cert.der()).into());
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        cert.key_pair.serialize_der(),
+    ));
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert.cert.der().clone()], key)
+    .unwrap();
+    config.alpn_protocols = alpn;
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = fixture_peer(format!("https://{}/", listener.local_addr().unwrap()), pin);
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counter = connections.clone();
+    let slots = Arc::new(tokio::sync::Semaphore::new(slots));
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+            let Ok(permit) = slots.clone().try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let Ok(stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let service =
+                    hyper::service::service_fn(move |req: Request<Incoming>| async move {
+                        if req.uri().path().ends_with("/big") {
+                            let chunk = bytes::Bytes::from(vec![b'x'; 64 * 1024]);
+                            let chunks = big.div_ceil(chunk.len());
+                            let body = stream::iter(
+                                (0..chunks).map(move |_| Ok::<_, Infallible>(chunk.clone())),
+                            );
+                            return Ok::<_, Infallible>(Response::new(Body::from_stream(body)));
+                        }
+                        if req.uri().path().ends_with("/upload") {
+                            use http_body_util::BodyExt;
+                            let n = req.into_body().collect().await.map(|b| b.to_bytes().len());
+                            return Ok(Response::new(Body::from(format!("{}", n.unwrap_or(0)))));
+                        }
+                        if req.uri().path().ends_with("/ignore-upload") {
+                            // Answers without reading the body, holding it open.
+                            let body = req.into_body();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                drop(body);
+                            });
+                            return Ok(Response::new(Body::from("ignored")));
+                        }
+                        Ok(Response::new(Body::from("ok")))
+                    });
+                let mut builder =
+                    hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                super::super::server::http2_settings(builder.http2());
+                let _ = builder
+                    .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (peer, connections, task)
+}
+fn proxy_uri(peer: &Peer, path: &str) -> hyper::Uri {
+    format!("{}v1/apps/web/proxy{path}", peer.endpoint)
+        .parse()
+        .unwrap()
+}
+fn get(peer: &Peer, path: &str) -> Request<Body> {
+    Request::get(proxy_uri(peer, path))
+        .header(header::AUTHORIZATION, format!("Bearer {}", peer.token))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// A page's burst on a cold connection (a restarted peer, a woken laptop, an
+/// idle timeout) waits for one connection instead of dialing one per request:
+/// the agent's connection limit would drop the extra dials as 502s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cold_burst_shares_one_agent_connection() {
+    let (peer, connections, task) =
+        agent_fixture(8, 0, vec![b"h2".to_vec(), b"http/1.1".to_vec()]).await;
+    let client = relay_client(&peer.fingerprint).unwrap();
+    let burst = (0..100).map(|i| {
+        let client = client.clone();
+        let request = get(&peer, &format!("/m{i}.js"));
+        async move { client.send(request).await.map(|r| r.status()) }
+    });
+    let results = futures_util::future::join_all(burst).await;
+    let failed = results
+        .iter()
+        .filter(|r| !matches!(r, Ok(s) if *s == StatusCode::OK))
+        .count();
+    assert_eq!(failed, 0, "{failed} of 100 requests failed");
+    let opened = connections.load(Ordering::SeqCst);
+    assert_eq!(opened, 1, "{opened} connections for one burst");
+    task.abort();
+}
+
+/// Responses the browser stopped reading (a paused video or download) must not
+/// stall every other request to that machine on the shared connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_responses_do_not_block_the_shared_connection() {
+    let (peer, connections, task) = agent_fixture(
+        8,
+        8 * 1024 * 1024,
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+    )
+    .await;
+    let client = relay_client(&peer.fingerprint).unwrap();
+    // Several large responses whose bodies nobody reads.
+    let mut stalled = Vec::new();
+    for _ in 0..4 {
+        let response = client.send(get(&peer, "/big")).await.unwrap();
+        assert_eq!(response.version(), hyper::Version::HTTP_2);
+        stalled.push(response);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let fetch = async {
+        use http_body_util::BodyExt;
+        let response = client.send(get(&peer, "/small")).await.unwrap();
+        response.into_body().collect().await.unwrap().to_bytes()
+    };
+    let body = tokio::time::timeout(Duration::from_secs(3), fetch)
+        .await
+        .expect("a small response arrives while others are stalled");
+    assert_eq!(&body[..], b"ok");
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+    drop(stalled);
+    task.abort();
+}
+
+/// Uploads an app is not reading must not stall other uploads to that
+/// machine: the agent's connection window is far above its per-request one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unread_upload_does_not_block_other_uploads() {
+    let (peer, _, task) = agent_fixture(8, 0, vec![b"h2".to_vec(), b"http/1.1".to_vec()]).await;
+    let client = relay_client(&peer.fingerprint).unwrap();
+    let post = |path: &str, size: usize| {
+        Request::post(proxy_uri(&peer, path))
+            .header(header::AUTHORIZATION, format!("Bearer {}", peer.token))
+            .body(Body::from(vec![b'u'; size]))
+            .unwrap()
+    };
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        let client = client.clone();
+        let request = post("/ignore-upload", 4 * 1024 * 1024);
+        held.push(tokio::spawn(async move { client.send(request).await }));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let upload = async {
+        use http_body_util::BodyExt;
+        let response = client.send(post("/upload", 512 * 1024)).await.unwrap();
+        response.into_body().collect().await.unwrap().to_bytes()
+    };
+    let body = tokio::time::timeout(Duration::from_secs(3), upload)
+        .await
+        .expect("an upload completes while others are unread");
+    assert_eq!(&body[..], b"524288");
+    for h in held {
+        h.abort();
+    }
+    task.abort();
+}
+
+/// Agents from before HTTP/2 keep working over HTTP/1.1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agents_without_http2_are_relayed_over_http1() {
+    let (peer, _, task) = agent_fixture(64, 0, vec![b"http/1.1".to_vec()]).await;
+    let client = relay_client(&peer.fingerprint).unwrap();
+    for _ in 0..2 {
+        let burst = (0..20).map(|i| {
+            let client = client.clone();
+            let request = get(&peer, &format!("/m{i}.js"));
+            async move {
+                client
+                    .send(request)
+                    .await
+                    .map(|r| (r.status(), r.version()))
+            }
+        });
+        for result in futures_util::future::join_all(burst).await {
+            assert_eq!(result.unwrap(), (StatusCode::OK, hyper::Version::HTTP_11));
+        }
+    }
+    task.abort();
+}
+
+/// A burst against a machine that is down fails together after one attempt,
+/// not one connection timeout per request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_against_an_unreachable_agent_fails_fast() {
+    // Accepts TCP but never answers TLS.
+    let (peer, hits, task) = silent_peer().await;
+    let client = relay_client(&"0".repeat(64)).unwrap();
+    let started = std::time::Instant::now();
+    let burst = (0..50).map(|i| {
+        let client = client.clone();
+        let request = get(&peer, &format!("/m{i}.js"));
+        async move { client.send(request).await }
+    });
+    let results = futures_util::future::join_all(burst).await;
+    assert!(results.iter().all(|r| r.is_err()));
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+    assert!(started.elapsed() < DIAL_TIMEOUT + Duration::from_secs(3));
+    // The machine's other address is still tried at once.
+    let (other, other_hits, other_task) = silent_peer().await;
+    let _ = tokio::time::timeout(
+        Duration::from_millis(500),
+        client.send(get(&other, "/m.js")),
+    )
+    .await;
+    assert_eq!(other_hits.load(Ordering::Relaxed), 1);
+    task.abort();
+    other_task.abort();
+}
+
+/// Redirects and cookies with UTF-8 bytes: the redirect is still checked (and
+/// rewritten), and the cookie keeps its value without its Domain attribute.
+#[tokio::test]
+async fn relay_handles_non_ascii_redirects_and_cookies() {
+    let (url, relay, backend) = relay_fixture().await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(
+            url.host_str().unwrap(),
+            SocketAddr::from(([127, 0, 0, 1], url.port().unwrap())),
+        )
+        .build()
+        .unwrap();
+    let response = client.get(url.join("/utf8").unwrap()).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(
+        response.headers()[header::LOCATION],
+        url.join("/caf%C3%A9?q=%E2%9C%93").unwrap().as_str()
+    );
+    assert_eq!(
+        response.headers()[header::SET_COOKIE].as_bytes(),
+        b"name=J\xc3\xbcrgen; Path=/"
+    );
+    // A loopback redirect is refused however it is spelled.
+    let response = client
+        .get(url.join("/utf8?loopback").unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    relay.abort();
+    backend.abort();
+}
+
+/// Another app on the same machine may call this one (the app sees that
+/// app's origin on its own machine); other origins stay refused.
+#[tokio::test]
+async fn relay_accepts_sibling_apps_of_the_same_machine_only() {
+    let (url, relay, backend) = relay_fixture().await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve(
+            url.host_str().unwrap(),
+            SocketAddr::from(([127, 0, 0, 1], url.port().unwrap())),
+        )
+        .build()
+        .unwrap();
+    let sibling = format!("http://api-machine-b.localhost:{}", url.port().unwrap());
+    let data: serde_json::Value = client
+        .get(url.join("/where").unwrap())
+        .header(header::ORIGIN, &sibling)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(data["app_origin"], "http://api.localhost:7462");
+    for foreign in [
+        format!("http://api-machine-c.localhost:{}", url.port().unwrap()),
+        format!("http://api-machine-b.localhost:{}", url.port().unwrap() + 1),
+        "https://evil.example".to_owned(),
+        "null".to_owned(),
+    ] {
+        let status = client
+            .get(url.clone())
+            .header(header::ORIGIN, &foreign)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{foreign}");
+    }
+    relay.abort();
+    backend.abort();
+}
+
+/// The response may start long after the request did, as long as the wait
+/// since the last upload data stays under the limit.
+#[tokio::test]
+async fn response_timeout_counts_from_the_last_upload_data() {
+    use http_body_util::BodyExt;
+    let idle = Duration::from_millis(300);
+    // No upload: a response after 100 ms arrives; one that never comes ends.
+    let (_, last) = Watched::new(Body::empty());
+    let quick = within_idle(tokio::time::sleep(Duration::from_millis(100)), &last, idle).await;
+    assert!(quick.is_some());
+    let (_, last) = Watched::new(Body::empty());
+    let started = tokio::time::Instant::now();
+    let never = within_idle(std::future::pending::<()>(), &last, idle).await;
+    assert!(never.is_none());
+    assert!(started.elapsed() >= idle);
+    // A slow upload keeps a slow response alive well past the idle limit.
+    let chunks = stream::iter(0..8).then(|_| async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Ok::<_, Infallible>(bytes::Bytes::from_static(b"x"))
+    });
+    let (mut body, last) = Watched::new(Body::from_stream(chunks));
+    let upload = async move {
+        while body.frame().await.is_some() {}
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let started = tokio::time::Instant::now();
+    assert!(within_idle(upload, &last, idle).await.is_some());
+    assert!(started.elapsed() > idle * 3);
+}
+
+#[test]
+fn stored_endpoints_are_normalized() {
+    let dir = temp_state();
+    let (pin, token) = ("0".repeat(64), "a".repeat(64));
+    let mut peer = fixture_peer("https://10.0.0.5:7463".into(), pin);
+    peer.token = token;
+    assert_eq!(
+        upsert_peer_in(&dir, peer.clone()).unwrap().endpoint,
+        "https://10.0.0.5:7463/"
+    );
+    // Files written before normalization are read in the canonical form.
+    let mut raw: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(dir.join(PEERS_FILE)).unwrap()).unwrap();
+    raw[0]["endpoint"] = "https://10.0.0.5".into();
+    fs::write(dir.join(PEERS_FILE), serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert_eq!(peers_in(&dir).unwrap()[0].endpoint, "https://10.0.0.5/");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The cached list follows every change to the peers file, including a
+/// re-pairing that only changes the token (same file length).
+#[test]
+fn cached_peers_follow_every_change_to_the_file() {
+    let dir = temp_state();
+    let mut peer = fixture_peer("https://10.0.0.5:7463/".into(), "0".repeat(64));
+    upsert_peer_in(&dir, peer.clone()).unwrap();
+    let first = shared_peers_in(dir.clone()).unwrap();
+    assert_eq!(first[0].token, "a".repeat(64));
+    assert!(Arc::ptr_eq(&first, &shared_peers_in(dir.clone()).unwrap()));
+    peer.token = "b".repeat(64);
+    upsert_peer_in(&dir, peer).unwrap();
+    assert_eq!(
+        shared_peers_in(dir.clone()).unwrap()[0].token,
+        "b".repeat(64)
+    );
+    remove_peer_in(&dir, "machine-b").unwrap();
+    assert!(shared_peers_in(dir.clone()).unwrap().is_empty());
     let _ = fs::remove_dir_all(&dir);
 }

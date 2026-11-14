@@ -729,16 +729,28 @@ async fn shown_codes_report_status_and_cancel_for_the_tray() {
 }
 /// A fake launchctl that actually runs the generated LaunchAgent, so the test
 /// proves the plist starts a working agent, not just that a file was written.
+/// Like launchd, `bootout` returns while the job is still going away, and
+/// `bootstrap` fails (error 5) until it is gone.
 #[cfg(unix)]
 fn fake_launchctl(bin: &Path) {
     let script = r#"#!/usr/bin/env python3
-import os, plistlib, signal, subprocess, sys
+import os, plistlib, signal, subprocess, sys, time
 log = os.environ["FAKE_LAUNCHCTL_LOG"]
 pidfile = log + ".pid"
+teardown = log + ".teardown"
 with open(log, "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\n")
 a = sys.argv[1:]
+def tearing_down():
+    try:
+        return time.time() < float(open(teardown).read())
+    except (FileNotFoundError, ValueError):
+        return False
+if a[0] == "print":
+    sys.exit(0 if os.path.exists(pidfile) or tearing_down() else 113)
 if a[0] == "bootstrap":
+    if tearing_down():
+        sys.exit(5)
     with open(a[2], "rb") as f:
         job = plistlib.load(f)
     env = dict(os.environ, **job.get("EnvironmentVariables", {}))
@@ -748,8 +760,10 @@ if a[0] == "bootstrap":
     open(pidfile, "w").write(str(p.pid))
 elif a[0] == "bootout":
     try:
-        os.kill(int(open(pidfile).read()), signal.SIGTERM)
+        pid = int(open(pidfile).read())
         os.remove(pidfile)
+        open(teardown, "w").write(str(time.time() + 1))
+        os.kill(pid, signal.SIGTERM)
     except (FileNotFoundError, ProcessLookupError, ValueError):
         sys.exit(3)
 "#;
@@ -838,6 +852,14 @@ async fn autostart_hands_sharing_to_a_login_agent_and_disable_keeps_it_running()
         run(&["discovery", "autostart", "status"]).1.trim(),
         "enabled"
     );
+
+    // Enabling again replaces the loaded job, waiting for the old one to go.
+    let (ok, out) = run(&["discovery", "autostart", "enable"]);
+    assert!(ok && out.contains("now starts at login."), "{}", evidence());
+    assert!(plist.exists());
+    let replaced = pid();
+    assert!(!replaced.is_empty() && replaced != supervised);
+    let supervised = replaced;
 
     // A second login-time start while the agent runs exits cleanly (no fail loop).
     let (ok, out) = run(&["discovery", "serve", "--autostart"]);
