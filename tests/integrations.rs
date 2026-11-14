@@ -523,6 +523,175 @@ fn clean_of_an_isolated_state_dir_keeps_another_installs_startup_service() {
         assert!(!loaded(&s), "{platform}: {}", s.log());
     }
 }
+/// What `porch clean` must do with the machine-wide startup unit
+/// (`PORCH_SYSTEM_SERVICE_FILE`): the root LaunchDaemon of Porch 0.5.2 and
+/// earlier, or a Linux system unit.
+#[test]
+fn clean_of_an_isolated_state_dir_keeps_another_installs_system_service() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // (platform, how the real install's system unit got there)
+    for (platform, install) in [
+        ("macos", "0.5.2"),
+        ("linux", "0.5.2"),
+        ("linux", "install --system"),
+    ] {
+        let what = format!("{platform} ({install})");
+        let s = Sandbox::new();
+        fake_service_managers(&s);
+        let system = s.dir.join("system-service");
+        let running = s.dir.join(match platform {
+            "macos" => "launchd-system_dev.porch.proxy",
+            _ => "systemd-system",
+        });
+        let real = s.dir.join("real-state");
+        fs::create_dir_all(&real).unwrap();
+        let run = |state: &Path, args: &[&str]| {
+            s.cmd()
+                .env("PORCH_STATE_DIR", state)
+                .env("PORCH_SERVICE_PLATFORM", platform)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let record = |state: &Path, scope: Option<&str>| {
+            fs::write(
+                state.join("service.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "platform": platform,
+                    "path": system,
+                    "state_dir": state,
+                    "settings": {"port": 80},
+                    "scope": scope,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        if install == "0.5.2" {
+            // Exactly what Porch 0.5.2 wrote (its Linux unit has no label).
+            let body = match platform {
+                "macos" => format!(
+                    "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>dev.porch.proxy</string><key>ProgramArguments</key><array><string>/usr/local/bin/porch</string><string>proxy</string><string>start</string><string>--foreground</string></array><key>EnvironmentVariables</key><dict><key>PORCH_STATE_DIR</key><string>{}</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>",
+                    real.display()
+                ),
+                _ => format!(
+                    "[Unit]\nDescription=Porch proxy\nAfter=network.target\n[Service]\nExecStart=\"/usr/local/bin/porch\" \"proxy\" \"start\" \"--foreground\"\nEnvironment=\"PORCH_STATE_DIR={}\"\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n",
+                    real.display()
+                ),
+            };
+            fs::write(&system, body).unwrap();
+            fs::write(&running, "1").unwrap();
+            record(&real, None);
+        } else {
+            let out = run(&real, &["service", "install", "--system", "--port", "80"]);
+            assert!(
+                out.status.success(),
+                "{what}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let body = fs::read_to_string(&system).unwrap();
+        assert!(running.exists(), "{what}: {}", s.log());
+        // An isolated state directory that once recorded a service of its own
+        // cleans without touching the real install's.
+        let isolated = s.dir.join("state");
+        record(&isolated, Some("system"));
+        let log_before = s.log();
+        let out = run(&isolated, &["clean"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{what}: {err}");
+        assert!(
+            err.contains("Left the system startup service in place"),
+            "{what}: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&system).unwrap(),
+            body,
+            "{what}: the other install's system unit survives"
+        );
+        assert!(running.exists(), "{what}: still loaded");
+        let log = s.log()[log_before.len()..].to_owned();
+        assert!(
+            !log.contains("bootout") && !log.contains("disable"),
+            "{what}: {log}"
+        );
+        if install != "0.5.2" {
+            assert!(
+                s.dir.join("porch-service-bin").exists(),
+                "{what}: the program it runs survives"
+            );
+        }
+        // Cleaning the state directory it serves still removes it.
+        let out = run(&real, &["clean"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{what}: {err}");
+        assert!(
+            !err.contains("Left the system startup service"),
+            "{what}: {err}"
+        );
+        assert!(!system.exists(), "{what}");
+        assert!(!running.exists(), "{what}: {}", s.log());
+        assert!(!s.dir.join("porch-service-bin").exists(), "{what}");
+    }
+}
+/// A system unit that names no state directory at all can't be shown to be
+/// this install's, so `porch clean` leaves it; `porch service uninstall`
+/// still removes it, as before.
+#[test]
+fn clean_leaves_a_system_service_naming_no_state_dir_for_service_uninstall() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for platform in ["macos", "linux"] {
+        let s = Sandbox::new();
+        fake_service_managers(&s);
+        let system = s.dir.join("system-service");
+        let running = s.dir.join(match platform {
+            "macos" => "launchd-system_dev.porch.proxy",
+            _ => "systemd-system",
+        });
+        let body = match platform {
+            "macos" => "<plist><string>dev.porch.proxy</string></plist>",
+            _ => "[Service]\nExecStart=/home/me/.cargo/bin/porch proxy start\n",
+        };
+        fs::write(&system, body).unwrap();
+        fs::write(&running, "1").unwrap();
+        fs::write(
+            s.dir.join("state/service.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "platform": platform,
+                "path": system,
+                "state_dir": s.dir.join("state"),
+                "settings": {"port": 80},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            let out = s
+                .cmd()
+                .env("PORCH_SERVICE_PLATFORM", platform)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{platform} {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        };
+        let err = run(&["clean"]);
+        assert!(
+            err.contains("Left the system startup service in place")
+                && err.contains("porch service uninstall"),
+            "{platform}: {err}"
+        );
+        assert_eq!(fs::read_to_string(&system).unwrap(), body, "{platform}");
+        assert!(running.exists(), "{platform}: {}", s.log());
+        run(&["service", "uninstall"]);
+        assert!(!system.exists(), "{platform}");
+        assert!(!running.exists(), "{platform}: {}", s.log());
+    }
+}
 #[test]
 fn hosts_manage_only_own_block_and_reject_symlinks() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

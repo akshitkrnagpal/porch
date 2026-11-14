@@ -1263,6 +1263,23 @@ fn forget_service_record(platform: &str) -> Result<()> {
     }
     Ok(())
 }
+/// The `PORCH_STATE_DIR` entry a macOS or Linux startup file has for this
+/// state directory, exactly as [`render_service`] writes it. Every Porch
+/// release wrote it this way, into the per-user file and into the system unit
+/// or root LaunchDaemon of Porch 0.5.2 and earlier alike.
+fn state_dir_entry(platform: &str) -> Option<String> {
+    let state = crate::state::dir();
+    Some(match platform {
+        "macos" => format!(
+            "<key>PORCH_STATE_DIR</key><string>{}</string>",
+            xml(&state.to_string_lossy())
+        ),
+        _ => format!(
+            "Environment={}",
+            systemd_quote(&format!("PORCH_STATE_DIR={}", state.display())).ok()?
+        ),
+    })
+}
 /// The per-user startup file, if there is one, starts the proxy for another
 /// state directory. On macOS and Linux that file is shared by every state
 /// directory of this user, so an isolated `PORCH_STATE_DIR` must never remove
@@ -1275,18 +1292,23 @@ fn user_service_elsewhere(platform: &str) -> Option<PathBuf> {
     }
     let path = user_service_path(platform).ok()?;
     let body = fs::read_to_string(&path).ok()?;
-    let state = crate::state::dir();
-    let marker = match platform {
-        "macos" => format!(
-            "<key>PORCH_STATE_DIR</key><string>{}</string>",
-            xml(&state.to_string_lossy())
-        ),
-        _ => format!(
-            "Environment={}",
-            systemd_quote(&format!("PORCH_STATE_DIR={}", state.display())).ok()?
-        ),
-    };
-    let ours = body.contains(SERVICE_LABEL) && body.contains(&marker);
+    let ours = body.contains(SERVICE_LABEL) && body.contains(&state_dir_entry(platform)?);
+    (!ours).then_some(path)
+}
+/// The system unit or root LaunchDaemon, if there is one and it isn't
+/// provably this state directory's. It is shared by the whole machine, so
+/// `porch clean` removes it only when it can read it and it names this state
+/// directory, as [`user_service_elsewhere`] decides for the per-user file. The
+/// label isn't required: Linux system units of Porch 0.5.2 and earlier have
+/// none. Windows keeps the legacy task's record in the state directory, so
+/// it is always this install's.
+fn system_service_elsewhere(platform: &str) -> Option<PathBuf> {
+    if platform == "windows" {
+        return None;
+    }
+    let path = system_service_path(platform).filter(|p| p.exists())?;
+    let ours = fs::read_to_string(&path)
+        .is_ok_and(|body| state_dir_entry(platform).is_some_and(|entry| body.contains(&entry)));
     (!ours).then_some(path)
 }
 /// Remove the per-user startup service, as the user, unless it belongs to
@@ -1313,19 +1335,33 @@ pub fn uninstall_user_service() -> Result<()> {
 fn service_uninstall(platform: &str) -> Result<()> {
     uninstall_scopes(platform, true)
 }
-/// Both startup scopes. Only with `any_user_file` is a per-user startup file
-/// that serves another state directory removed too (see
-/// [`user_service_elsewhere`]); `porch clean` leaves it alone.
-fn uninstall_scopes(platform: &str, any_user_file: bool) -> Result<()> {
+/// Both startup scopes. Only with `any_file` is a startup file that isn't
+/// this state directory's removed too (see [`user_service_elsewhere`] and
+/// [`system_service_elsewhere`]); `porch clean` leaves it alone.
+fn uninstall_scopes(platform: &str, any_file: bool) -> Result<()> {
     let mut errors = Vec::new();
-    if any_user_file || user_service_elsewhere(platform).is_none() {
+    if any_file || user_service_elsewhere(platform).is_none() {
         if let Err(e) = uninstall_user_scope(platform) {
             errors.push(e);
         }
     }
     if system_scope_present(platform) {
-        if let Err(e) = uninstall_system_scope(platform) {
-            errors.push(e);
+        let foreign = if any_file {
+            None
+        } else {
+            system_service_elsewhere(platform)
+        };
+        match foreign {
+            Some(path) => eprintln!(
+                "Left the system startup service in place: {} doesn't start Porch for {} (it names another state directory, or none). If it is this install's, `porch service uninstall` removes it.",
+                path.display(),
+                crate::state::dir().display()
+            ),
+            None => {
+                if let Err(e) = uninstall_system_scope(platform) {
+                    errors.push(e);
+                }
+            }
         }
     }
     forget_service_record(platform)?;
@@ -2241,7 +2277,8 @@ pub fn clean() -> Result<()> {
     prune_shares(true)?;
     untrust()?;
     if crate::state::dir().join("service.json").exists() {
-        // As `porch service uninstall`, but never another install's login item.
+        // As `porch service uninstall`, but never another install's login
+        // item, system unit or root LaunchDaemon.
         uninstall_scopes(&service_platform(), false)?;
     }
     if has_managed_hosts() {
