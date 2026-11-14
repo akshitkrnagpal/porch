@@ -19,8 +19,32 @@ use std::{
 /// the URI names (a DNS name or an IP literal). The TLS layer above it still
 /// sees the original URI, so the server name and certificate check follow the
 /// alias, while the connection can never leave this computer.
+///
+/// It tries [::1] only when 127.0.0.1 refuses the connection, that is when
+/// nothing listens there (an app bound to IPv6 loopback alone). A slow or
+/// overloaded app on 127.0.0.1 is never swapped for whatever another local
+/// user may have bound on [::1].
 #[derive(Clone)]
 pub struct ToLoopback(HttpConnector);
+
+/// The first I/O error kind in an error's source chain, looking through the
+/// `io::Error` wrappers that don't expose their inner error as a source.
+pub fn io_error_kind(e: &(dyn std::error::Error + 'static)) -> Option<std::io::ErrorKind> {
+    let mut source = Some(e);
+    while let Some(err) = source {
+        let mut io = err.downcast_ref::<std::io::Error>();
+        while let Some(e) = io {
+            match e.get_ref() {
+                Some(inner) if inner.downcast_ref::<std::io::Error>().is_some() => {
+                    io = inner.downcast_ref::<std::io::Error>();
+                }
+                _ => return Some(e.kind()),
+            }
+        }
+        source = err.source();
+    }
+    None
+}
 
 impl tower_service::Service<Uri> for ToLoopback {
     type Response = <HttpConnector as tower_service::Service<Uri>>::Response;
@@ -32,8 +56,8 @@ impl tower_service::Service<Uri> for ToLoopback {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let https = uri.scheme_str() == Some("https");
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-        // Plain TCP to loopback, IPv4 first and then IPv6 (an app may listen
-        // on only one); the TLS layer wraps this stream itself.
+        // Plain TCP to loopback, IPv4 first and then IPv6 if nothing listens
+        // on IPv4; the TLS layer wraps this stream itself.
         let v4: Uri = format!("http://127.0.0.1:{port}")
             .parse()
             .expect("loopback URI");
@@ -44,7 +68,12 @@ impl tower_service::Service<Uri> for ToLoopback {
         Box::pin(async move {
             match connector.call(v4).await {
                 Ok(stream) => Ok(stream),
-                Err(_) => connector.call(v6).await,
+                Err(e) if io_error_kind(&e) == Some(std::io::ErrorKind::ConnectionRefused) => {
+                    // Report the IPv4 refusal when IPv6 doesn't answer either,
+                    // so callers see "nothing is listening".
+                    connector.call(v6).await.map_err(|_| e)
+                }
+                Err(e) => Err(e),
             }
         })
     }
@@ -314,6 +343,35 @@ mod tests {
         assert_eq!(
             &resp.into_body().collect().await.unwrap().to_bytes()[..],
             b"v6"
+        );
+    }
+    #[tokio::test]
+    async fn nothing_listening_reports_the_ipv4_refusal() {
+        // A private port nothing is bound to, on either family.
+        let port = crate::test_support::free_port();
+        let c: LoopbackClient<http_body_util::Empty<bytes::Bytes>> = client(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth(),
+        );
+        let req = hyper::Request::builder()
+            .uri(format!("http://backend.internal:{port}/"))
+            .body(http_body_util::Empty::new())
+            .unwrap();
+        // Windows takes about two seconds to report each refused connection.
+        let e = tokio::time::timeout(Duration::from_secs(20), c.request(req))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(e.is_connect(), "{e:?}");
+        assert_eq!(
+            io_error_kind(&e),
+            Some(std::io::ErrorKind::ConnectionRefused),
+            "{e:?}"
         );
     }
     #[tokio::test]

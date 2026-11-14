@@ -631,29 +631,35 @@ pub fn group_matches(group: u32, started: Option<&str>) -> bool {
 /// The proxy used to re-read `state.json` and re-check every route's process on
 /// each request. This keeps the parsed state until the file changes and keeps
 /// the liveness answers for a short window, so a request costs one `stat`.
+///
+/// The cache lock is held only to copy an `Arc`: the `stat`, the file read and
+/// the process checks run outside it. One caller refreshes at a time; while it
+/// re-checks liveness of an unchanged file, other callers keep the previous
+/// answer instead of waiting.
 pub fn live_routes() -> Result<std::sync::Arc<State>> {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, TryLockError};
     use std::time::{Duration, Instant, SystemTime};
     #[derive(PartialEq, Clone)]
     struct Stamp {
-        path: PathBuf,
         modified: Option<SystemTime>,
         len: u64,
         #[cfg(unix)]
         ino: u64,
     }
     struct Cached {
+        path: PathBuf,
         stamp: Option<Stamp>,
         at: Instant,
-        state: Arc<State>,
+        /// Every route in the file, for liveness re-checks without a re-read.
+        parsed: Arc<State>,
+        live: Arc<State>,
     }
-    static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
+    static CACHE: Mutex<Option<Arc<Cached>>> = Mutex::new(None);
+    static REFRESH: Mutex<()> = Mutex::new(());
     const LIVENESS_TTL: Duration = Duration::from_millis(750);
     let path = dir().join("state.json");
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let stamp = match fs::metadata(&path) {
         Ok(m) => Some(Stamp {
-            path: path.clone(),
             modified: m.modified().ok(),
             len: m.len(),
             #[cfg(unix)]
@@ -662,31 +668,43 @@ pub fn live_routes() -> Result<std::sync::Arc<State>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
-    if let Some(c) = cache.as_ref() {
-        let same_file = match (&c.stamp, &stamp) {
-            (Some(a), Some(b)) => a == b,
-            (None, None) => c.state.routes.is_empty(),
-            _ => false,
-        };
-        if same_file && c.at.elapsed() < LIVENESS_TTL {
-            return Ok(c.state.clone());
-        }
+    let current = || CACHE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let same_file = |c: &Cached| c.path == path && c.stamp == stamp;
+    let fresh = |c: &Cached| same_file(c) && c.at.elapsed() < LIVENESS_TTL;
+    if let Some(c) = current().filter(|c| fresh(c)) {
+        return Ok(c.live.clone());
     }
-    let mut state = load()?;
-    let alive: Vec<Route> = state
-        .routes
-        .iter()
-        .filter(|r| route_alive(&state, r))
-        .cloned()
-        .collect();
-    state.routes = alive;
-    let state = Arc::new(state);
-    *cache = Some(Cached {
+    let _refreshing = match REFRESH.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            // Another caller is refreshing. Only a changed file is worth
+            // waiting for; slightly old liveness answers are not.
+            if let Some(c) = current().filter(|c| same_file(c)) {
+                return Ok(c.live.clone());
+            }
+            REFRESH.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    };
+    let cached = current();
+    if let Some(c) = cached.as_ref().filter(|c| fresh(c)) {
+        return Ok(c.live.clone());
+    }
+    let parsed = match cached.filter(|c| same_file(c)) {
+        Some(c) => c.parsed.clone(),
+        None => Arc::new(load()?),
+    };
+    let mut live = (*parsed).clone();
+    live.routes.retain(|r| route_alive(&parsed, r));
+    let live = Arc::new(live);
+    *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Cached {
+        path,
         stamp,
         at: Instant::now(),
-        state: state.clone(),
-    });
-    Ok(state)
+        parsed,
+        live: live.clone(),
+    }));
+    Ok(live)
 }
 
 #[cfg(test)]

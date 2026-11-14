@@ -1117,7 +1117,7 @@ async fn foreground(s: ProxySettings) -> Result<()> {
     crate::health::reconcile_quietly();
     let cleanup = tokio::spawn(crate::health::reconcile_forever(Duration::from_secs(5)));
     let _log_cap = cap_log_forever(state::dir().join("proxy.log"));
-    let result = tokio::select! {r=crate::proxy::serve_config(s)=>r,s=signals.recv()=>{s?;Ok(())}};
+    let result = crate::proxy::serve_until(s, signals.recv()).await;
     cleanup.abort();
     result
 }

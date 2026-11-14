@@ -67,9 +67,15 @@ If it says "The app listens on [::1]:4480 only", the app bound IPv6 loopback onl
 
 ### "Waiting for the app to start" page (502, `upstream_unavailable`)
 
-**Cause.** The route exists but nothing accepts connections on its port. The page reloads every two seconds, so if the app is compiling it will appear on its own.
+**Cause.** The route points at this computer, but nothing accepts connections on its port. The page reloads every two seconds, so if the app is compiling it will appear on its own.
 
 **Fix.** If it never loads, check the app's output in the terminal that ran `porch`. `porch list` shows the route as `not listening`. The usual causes are a crash, or the app ignoring `PORT` (see above).
+
+### 502 or 504 with `upstream_error`, `upstream_timeout` or `upstream_certificate`
+
+**Cause.** The backend was reached, or should have been, but the request failed for another reason, and the page says which: the app closed the connection before answering (often a crash mid-request), a remote alias's host couldn't be resolved or refused the connection, the backend didn't accept the connection in time (504, `upstream_timeout`), or its TLS certificate isn't trusted (`upstream_certificate`). These pages don't reload by themselves.
+
+**Fix.** For a local app, check its output. For a remote alias, check its URL with `porch list` and that the site is reachable from this computer. For a certificate error, trust the CA that issued it, or for a `--upstream` alias re-register it with `--insecure`.
 
 ### 404 "No app is registered for this hostname"
 

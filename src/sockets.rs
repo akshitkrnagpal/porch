@@ -221,6 +221,16 @@ impl Drop for Closer {
 /// reservation's. Windows sockets are never inherited, and Windows decides
 /// conflicts with listeners in mind, so the probe there is a reservation.
 pub fn probe(port: u16) -> io::Result<()> {
+    probe_with(port, false)
+}
+/// [`probe`] for a port where nothing listens but a bind failed: with
+/// `SO_REUSEADDR`, as [`bind`] retries, so a port held only by TIME_WAIT
+/// connections succeeds while one another socket has bound still fails.
+#[cfg(unix)]
+pub fn probe_time_wait(port: u16) -> io::Result<()> {
+    probe_with(port, true)
+}
+fn probe_with(port: u16, reuse: bool) -> io::Result<()> {
     #[cfg(unix)]
     {
         let socket = |addr: SocketAddr| -> io::Result<socket2::Socket> {
@@ -234,6 +244,9 @@ pub fn probe(port: u16) -> io::Result<()> {
             if addr.is_ipv6() {
                 socket.set_only_v6(true)?;
             }
+            if reuse {
+                socket.set_reuse_address(true)?;
+            }
             socket.bind(&addr.into())?;
             Ok(socket)
         };
@@ -246,6 +259,7 @@ pub fn probe(port: u16) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
+        let _ = reuse;
         reserve(port).map(drop)
     }
 }

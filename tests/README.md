@@ -5,7 +5,7 @@ Run `cargo test --all-targets`. Each test uses its own temporary state directory
 | File | What it covers | Platforms |
 | --- | --- | --- |
 | `cli.rs` | Aliases and URLs, human and JSON `list`, bad flags, concurrent route writers, forwarding to a real app over HTTP and verified HTTPS, proxy auto-start, concurrent launches, `NODE_EXTRA_CA_CERTS`, handing a route to a daemon, named and inferred launches, exit codes, `PORCH=0`, saved proxy settings, bind failures, orphan cleanup, `--private` and other launch options in every position, strict on/off variables, LAN mode that isn't saved by an app launch, fields from a newer Porch kept on rewrite, background logs across `--force` and with invalid UTF-8 | All; some cases macOS and Linux only |
-| `network.rs` | IPv4 and IPv6 sockets, HTTP, HTTPS and HTTP/2, the generated CA, WebSocket over HTTP and HTTPS, extended CONNECT, streamed responses, routing, TLDs, wildcards and aliases, redirects, error pages, proxy loops, authenticated hosts-file sync | All |
+| `network.rs` | IPv4 and IPv6 sockets, HTTP, HTTPS and HTTP/2, the generated CA, WebSocket over HTTP and HTTPS, extended CONNECT, streamed responses, routing, TLDs, wildcards and aliases, redirects, error pages, proxy loops, HTTP/2 split cookies, draining on stop, authenticated hosts-file sync | All |
 | `discovery.rs` | Two Porch instances pairing by code and by token, opening each other's apps (including WebSockets), wrong codes, rogue hosts, refusing the old pairing exchange, cancelling a shown code, discovery autostart | All; autostart on macOS and Linux only |
 | `relay_load.rs` | A Vite-like page through a paired machine's URL over HTTP and HTTPS: a burst of HTTP/2 module requests shares one agent connection, listing and opening apps warm that connection, and the proxy's peer list needs its local token. An ignored benchmark compares page loads with the local proxy at a simulated round-trip time | All |
 | `config.rs` | Configuration precedence, duplicate names, a real linked Git worktree, frameworks and package runners, which `node_modules/.bin` directories reach the child's PATH, real npm and shell command shapes, Expo LAN, Turbo at the root, launching two workspace packages, the Node preload, one worktree lookup per workspace launch | macOS, Linux |
@@ -14,7 +14,7 @@ Run `cargo test --all-targets`. Each test uses its own temporary state directory
 | `pty.rs` | Raw mode on a controlling terminal, Ctrl-C and TERM forwarding, descendant cleanup, the real Turbo 2 TUI with two live routes | macOS, Linux |
 | `integrations.rs` | Docker Compose with a fake `docker`, launchd, systemd and Task Scheduler entries, the hosts file, Tailscale, ngrok and Cloudflare, installing and removing trust, `porch clean` ending pairing and removing logs and leftovers | macOS, Linux |
 
-Unit tests in `src/` cover configuration validation, name shortening, route scoring, headers and error pages, PEM handling and certificate issuance, hosts-file authentication, service files, and MCP framing, profiles and arguments.
+Unit tests in `src/` cover configuration validation, name shortening, route scoring, headers and error pages, connection limits and timeouts, PEM handling and certificate issuance, hosts-file authentication, service files, and MCP framing, profiles and arguments.
 
 ## External tools
 
@@ -38,7 +38,7 @@ Tests run in parallel threads, and several test processes may run at once. Every
 
 CI installs Turbo 2.6.3 and sets `PORCH_TEST_TURBO_REQUIRED=1`, so the real Turbo TUI test must run. Locally, set `PORCH_TEST_TURBO=/absolute/path/to/turbo` if `turbo` isn't on your PATH. Without Turbo 2, the other terminal tests still run and the Turbo test reports a skip.
 
-Tests never run real sudo or bind privileged ports; the sudo flow uses a fake prompt attached to a terminal. Port-collision tests hold wildcard IPv4 and dual-stack IPv6 listeners, the accept-error test lowers the file descriptor limit of its own proxy only, and hosts-file permission tests use temporary read-only files.
+Tests never run real sudo or bind privileged ports; the sudo flow uses a fake prompt attached to a terminal. Port-collision tests hold wildcard IPv4 and dual-stack IPv6 listeners, the descriptor-limit test lowers the file descriptor limit of its own proxies only, and hosts-file permission tests use temporary read-only files.
 
 ## Real frameworks (`tests/e2e.rs`)
 
